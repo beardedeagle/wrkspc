@@ -1,0 +1,16 @@
+target
+.git
+.hermes
+*.db
+*.db-wal
+*.db-shm
+spikes
+.codegraph
+.tgrep
+.zvec-grep
+.claude
+.codex
+.DS_Store
+docs/book
+dist
+output

@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wrkspc-core",
+    "crates/wrkspc-acp",
+    "crates/wrkspc-mcp",
+    "crates/wrkspc-a2a",
+    "crates/wrkspc-dispatcher",
+    "crates/wrkspc-ui",
+    "crates/wrkspc-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/beardedeagle/wrkspc"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid", "migrate"] }
+
+# Error handling
+thiserror = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUIDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# ACP client (D-4b pin: 2.2.0)
+agent-client-protocol = "=2.2.0"
+
+# MCP server (D-3 pin moved 0.7.0 -> 1.8.0: RUSTSEC-2026-0189 DNS rebinding fix)
+# rmcp >= 2.1.0 carries the fixes for CVE-2026-63127, CVE-2026-63128
+# (Streamable HTTP session-table leak), CVE-2026-64684, and
+# GHSA-C9XM-49CP-XCR9 (OSV gate-enforced; see .github/security-exceptions.json).
+rmcp = "=2.1.0"
+
+# A2A SDK (D-4b pin set: keep the three crates pinned together)
+a2a-lf = "=0.4.1"
+a2a-server-lf = "=0.5.1"
+a2a-client-lf = "=0.2.7"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+future_incompatible = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused = { level = "warn", priority = -1 }
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+unimplemented = "warn"
+wildcard_dependencies = "deny"
+
+# Shipping artifacts must not leak builder paths (no /Users/... or
+# /home/... in panic locations, error chains, or debug sections).
+# The remapping itself lives in .cargo/config.toml (cargo's
+# `trim-paths` profile option is still unstable on the pinned
+# toolchain); strip drops the debug sections entirely. Enforced by
+# the `no-user-paths` gate recipe.
+[profile.release]
+strip = true

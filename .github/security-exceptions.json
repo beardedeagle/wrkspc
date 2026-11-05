@@ -1,0 +1,18 @@
+{
+  "exceptions": [
+    {
+      "id": "RUSTSEC-2023-0071",
+      "package": "rsa",
+      "reason": "Marvin attack timing side-channel (rsa 0.9.10); no fixed release exists. The crate is a lockfile-only entry with no reverse deps in the resolved build graph (cargo tree -i rsa is empty), so the advisory is unreachable in any artifact. Mirrors the cargo-audit disposition; re-check both when the lockfile next changes.",
+      "accepted_by": "Randy Thompson",
+      "expires_on": "2026-12-02"
+    },
+    {
+      "id": "RUSTSEC-2025-0134",
+      "package": "rustls-pemfile",
+      "reason": "rustls-pemfile 2.2.0 is unmaintained. wrkspc calls it directly in the hub/node TLS setup for PEM loading; it is stable, tiny, and widely used. Accepted until a maintained loader replaces it; re-check on every lockfile change.",
+      "accepted_by": "Randy Thompson",
+      "expires_on": "2026-12-02"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+[package]
+name = "wrkspc-mcp"
+description = "MCP tool surface exposing wrkspc mail, peers, and moderation to harness agents."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tracing.workspace = true
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+schemars = "1.0"
+axum = "0.8"
+wrkspc-core = { path = "../wrkspc-core" }
+
+[dev-dependencies]
+tokio.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+rmcp = { workspace = true, features = ["client"] }
+uuid.workspace = true

@@ -1,0 +1,1327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wrkspc</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #0d1117;
+    --surface: #161b22;
+    --surface-2: #1c2129;
+    --border: #21262d;
+    --border-strong: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --faint: #6e7681;
+    --accent: #4493f8;
+    --green: #3fb950;
+    --amber: #d29922;
+    --red: #f85149;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; display: flex; overflow: hidden; }
+
+  /* first-frame gate: an opaque, var-free cover that exists in the very
+     first paint (before JS or theme) and is removed only when the first
+     full render (login card or transcript) is on screen. */
+  #boot-gate {
+    position: fixed; inset: 0; z-index: 100;
+    display: flex; align-items: center; justify-content: center;
+    background: #0d1117; color: #6e7681;
+    font-size: 0.85rem; letter-spacing: 0.12em; text-transform: uppercase;
+  }
+
+  /* per-conversation loading state: the response area shows a loading
+     line while a conversation's content is fetched and rendered. */
+  #transcript-loading { display: none; }
+  #transcript-scroll.loading #transcript-loading {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; color: var(--faint);
+    font-size: 0.85rem; letter-spacing: 0.12em; text-transform: uppercase;
+  }
+  #transcript-scroll.loading #transcript { visibility: hidden; }
+
+  /* boot/login overlay: nothing but the login card (or the loading
+     line) paints until the first full render */
+  #boot {
+    position: fixed; inset: 0; z-index: 60;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--bg); color: var(--faint);
+    font-size: 0.85rem; letter-spacing: 0.12em; text-transform: uppercase;
+  }
+  #boot[hidden] { display: none; }
+  #boot-status { display: none; }
+  #boot.connecting #boot-status { display: block; }
+  #boot.connecting #login-card { display: none; }
+  #login-card {
+    width: min(24rem, 90vw);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    padding: 1.4rem 1.4rem 1.1rem;
+    text-align: left;
+    letter-spacing: normal;
+    text-transform: none;
+    color: var(--text);
+  }
+  #login-card h1 {
+    margin: 0 0 0.5rem;
+    font-size: 1.1rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+  }
+  #login-card .explain { margin-bottom: 0.8rem; }
+  #login-card code { font-size: 0.72rem; color: var(--muted); background: var(--surface-2); padding: 0.05rem 0.3rem; border-radius: 4px; }
+  #login-card input {
+    margin-bottom: 0.6rem;
+    font-family: ui-monospace, monospace;
+    letter-spacing: 0.05em;
+  }
+  #login-card button { width: 100%; }
+  #login-error { color: var(--red); font-size: 0.78rem; min-height: 1.1em; margin-top: 0.5rem; }
+
+  aside, #workspace { display: flex; flex-direction: column; }
+
+  /* ---- left rail ---- */
+  #conversations { width: 17rem; flex: none; border-right: 1px solid var(--border); background: var(--panel); }
+  #conversations .rail-body { flex: 1; overflow-y: auto; padding: 0.75rem; }
+  .rail-head { padding: 0.75rem 0.75rem 0.5rem; }
+
+  h2 {
+    margin: 0.9rem 0 0.4rem;
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--faint);
+  }
+  h2:first-child { margin-top: 0; }
+  .explain { color: var(--faint); font-size: 0.72rem; margin: 0.2rem 0 0.5rem; line-height: 1.4; }
+  .cohort-tools { display: flex; align-items: center; font-size: 0.72rem; color: var(--faint); margin: 0.2rem 0 0.4rem; }
+  .cohort-tools label { cursor: pointer; display: flex; align-items: center; gap: 0.3rem; }
+  .mod-stamp { color: var(--faint); font-size: 0.7rem; flex: none; }
+
+  .convo {
+    display: flex; flex-direction: column; gap: 0.1rem;
+    width: 100%; text-align: left; margin: 0.2rem 0;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 0.45rem 0.6rem;
+    color: var(--text);
+    cursor: pointer;
+  }
+  .convo:hover { border-color: var(--border-strong); background: var(--surface-2); }
+  .convo.selected { border-color: var(--accent); background: rgba(68, 147, 248, 0.09); }
+  .convo .cid { font-family: ui-monospace, monospace; font-size: 0.72rem; color: var(--faint); }
+  .convo .members { font-size: 0.82rem; }
+  .convo .when { font-size: 0.72rem; color: var(--muted); }
+
+  .peer-row { display: flex; align-items: center; gap: 0.45rem; margin: 0.25rem 0; font-size: 0.82rem; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .dot.connected { background: var(--green); box-shadow: 0 0 5px rgba(63, 185, 80, 0.6); }
+  .dot.disconnected { background: var(--faint); }
+  .dot.unknown { background: var(--amber); }
+  .peer-row .host { color: var(--faint); font-size: 0.72rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .peer-status { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; padding: 0.02rem 0.32rem; border-radius: 8px; flex: none; }
+  .peer-status.booted { color: var(--amber); border: 1px solid var(--amber); }
+  .peer-status.banned { color: var(--red); border: 1px solid var(--red); }
+  .peer-btn { border: none; background: none; color: var(--faint); font-size: 0.72rem; cursor: pointer; padding: 0.02rem 0.18rem; border-radius: 4px; flex: none; }
+  .peer-btn:hover { color: var(--text); background: var(--surface-2); }
+  .peer-rename-input { width: 7rem; font-size: 0.78rem; background: var(--surface-2); color: var(--text); border: 1px solid var(--border-strong); border-radius: 4px; padding: 0.05rem 0.3rem; }
+
+  input[type="text"], input[type="password"], textarea {
+    width: 100%;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 0.45rem 0.6rem;
+    font-family: inherit;
+    font-size: 0.85rem;
+    resize: vertical;
+  }
+  input[type="text"]:focus, textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(68, 147, 248, 0.18);
+  }
+
+  button {
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    padding: 0.28rem 0.6rem;
+    cursor: pointer;
+    font-size: 0.78rem;
+    font-family: inherit;
+  }
+  button:hover { border-color: var(--accent); color: #fff; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: #5aa4f9; }
+  button.danger { color: var(--red); }
+  button.danger:hover { border-color: var(--red); background: rgba(248, 81, 73, 0.1); }
+
+  /* ---- center ---- */
+  #workspace { flex: 1; min-width: 0; background: var(--bg); }
+  #workspace .topbar {
+    flex: none;
+    display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
+    padding: 0.7rem 1rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  #workspace .topbar .title { font-weight: 600; font-size: 0.95rem; }
+  #workspace .topbar .subtitle { color: var(--faint); font-size: 0.75rem; }
+
+  #moderation { flex: none; display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.5rem 1rem 0; align-items: center; }
+  #moderation .label { color: var(--faint); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; margin-right: 0.2rem; }
+  .peer-ctl {
+    display: flex; align-items: center; gap: 0.35rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.2rem 0.35rem 0.2rem 0.65rem;
+    font-size: 0.78rem;
+  }
+  .peer-ctl .name { color: var(--muted); }
+  .peer-ctl button { padding: 0.12rem 0.45rem; font-size: 0.7rem; }
+
+  #fences { flex: none; display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.4rem 1rem 0; }
+  .fence-chip {
+    display: flex; align-items: center; gap: 0.45rem;
+    background: rgba(210, 153, 34, 0.12);
+    border: 1px solid rgba(210, 153, 34, 0.5);
+    color: #e3b341;
+    border-radius: 999px;
+    padding: 0.2rem 0.4rem 0.2rem 0.7rem;
+    font-size: 0.75rem;
+  }
+  .fence-chip button { padding: 0.12rem 0.45rem; font-size: 0.7rem; }
+
+  #transcript-scroll { flex: 1; overflow-y: auto; padding: 1rem; }
+  #transcript { max-width: 52rem; margin: 0 auto; }
+
+  .msg {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 0.65rem 0.8rem;
+    margin: 0.6rem 0;
+  }
+  .msg .meta { display: flex; align-items: baseline; gap: 0.5rem; margin-bottom: 0.3rem; }
+  .msg .sender { font-weight: 600; font-size: 0.85rem; color: var(--accent); }
+  .msg .sender.operator { color: #d2a8ff; }
+  .msg .when { font-size: 0.72rem; color: var(--faint); }
+  .msg .content { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.9rem; }
+  .msg .deliveries { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.5rem; align-items: center; }
+  .msg .deliveries .label { color: var(--faint); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .badge {
+    font-size: 0.68rem; font-weight: 600;
+    border-radius: 999px; padding: 0.06rem 0.5rem;
+    border: 1px solid transparent;
+  }
+  .badge.delivered { background: rgba(63, 185, 80, 0.13); color: var(--green); border-color: rgba(63, 185, 80, 0.4); }
+  .badge.held { background: rgba(210, 153, 34, 0.13); color: #e3b341; border-color: rgba(210, 153, 34, 0.4); }
+  .badge.unknown { background: rgba(248, 81, 73, 0.13); color: var(--red); border-color: rgba(248, 81, 73, 0.4); }
+  .badge.stored, .badge.eligible { background: rgba(139, 148, 158, 0.12); color: var(--muted); border-color: var(--border-strong); }
+  .msg .deliveries button { padding: 0.1rem 0.4rem; font-size: 0.66rem; }
+
+  .event {
+    font-size: 0.75rem; color: var(--muted);
+    margin: 0.3rem 0; padding-left: 0.7rem;
+    border-left: 2px solid var(--border-strong);
+  }
+  .event .ekind { color: var(--faint); font-weight: 600; margin-right: 0.4rem; }
+  .event.turn .ekind { display: block; }
+  .event.turn .turn-body { color: var(--text); font-size: 0.85rem; margin-top: 0.15rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+  /* rendered markdown: message bodies and turn output */
+  .md p { margin: 0 0 0.5em; }
+  .md > :last-child { margin-bottom: 0; }
+  .md .md-heading { font-weight: 700; }
+  .md code { font-family: ui-monospace, monospace; font-size: 0.88em; background: var(--surface-2); padding: 0.05rem 0.3rem; border-radius: 4px; }
+  .md pre { margin: 0.4em 0 0.5em; padding: 0.5rem 0.65rem; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; overflow-x: auto; white-space: pre; }
+  .md pre code { background: none; padding: 0; }
+  .md blockquote { margin: 0.3em 0 0.5em; padding-left: 0.7rem; border-left: 2px solid var(--border-strong); color: var(--muted); }
+  .md ul, .md ol { margin: 0.3em 0 0.5em; padding-left: 1.4rem; }
+  .md a { color: var(--accent); }
+  .md hr { border: none; border-top: 1px solid var(--border); margin: 0.6em 0; }
+
+  /* transcript rows: the entry's real time in a left gutter, then the entry */
+  .tx-row { display: grid; grid-template-columns: 7.4rem minmax(0, 1fr); column-gap: 0.6rem; align-items: start; }
+  .tx-row > .ts { padding-top: 0.35rem; text-align: right; white-space: nowrap; font-size: 0.68rem; color: var(--faint); font-variant-numeric: tabular-nums; }
+  .tx-row.msg-row > .ts { padding-top: 1.4rem; }
+  .event.attention { border-left-color: var(--amber); color: #e3b341; }
+  .event.failure { border-left-color: var(--red); color: #f08880; }
+
+  #compose-panel {
+    flex: none; padding: 0.75rem 1rem 1rem;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  #compose-panel .inner { max-width: 52rem; margin: 0 auto; display: flex; flex-direction: column; gap: 0.45rem; }
+  #compose-panel .actions { display: flex; gap: 0.5rem; align-items: center; }
+  #compose-panel .hint { color: var(--faint); font-size: 0.72rem; }
+  .seg { display: inline-flex; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 2px; gap: 2px; align-self: flex-start; }
+  .seg button { border: none; background: transparent; padding: 0.3rem 0.85rem; border-radius: 6px; color: var(--muted); }
+  .seg button.active { background: var(--accent); color: #fff; }
+
+  /* ---- right rail ---- */
+  #unknown { width: 19rem; flex: none; border-left: 1px solid var(--border); background: var(--panel); overflow-y: auto; padding: 0.75rem; }
+  #unknown .empty { color: var(--faint); font-style: italic; font-size: 0.8rem; }
+  #unknown-banner {
+    background: rgba(248, 81, 73, 0.12);
+    border: 1px solid rgba(248, 81, 73, 0.5);
+    color: #f08880;
+    border-radius: 8px;
+    padding: 0.5rem 0.7rem;
+    margin-bottom: 0.6rem;
+    font-size: 0.8rem;
+  }
+
+  /* conversation membership strip: kick is room-scoped, unlike the
+     hub-wide boot/ban controls on the peer rows */
+  #convo-members { display: flex; flex-wrap: wrap; gap: 0.35rem; padding: 0 1rem 0.5rem; }
+  #convo-members:empty { display: none; }
+  #convo-members .member {
+    display: inline-flex; align-items: center; gap: 0.3rem;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 999px; padding: 0.1rem 0.5rem; font-size: 0.75rem; color: var(--muted);
+  }
+  #convo-members .member .kick {
+    border: none; background: none; color: var(--faint); cursor: pointer;
+    font-size: 0.8rem; padding: 0 0.1rem; line-height: 1;
+  }
+  #convo-members .member .kick:hover { color: var(--red); }
+  #unknown .attempt { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 0.55rem 0.65rem; margin: 0.4rem 0; }
+  #unknown .attempt .meta { font-size: 0.74rem; color: var(--muted); margin-bottom: 0.35rem; }
+  #unknown .attempt .row { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+
+  .empty-note { color: var(--faint); font-size: 0.85rem; padding: 1rem 0; text-align: center; }
+
+  /* ---- conversation-creation modal ---- */
+  #modal-backdrop {
+    position: fixed; inset: 0; z-index: 70;
+    background: rgba(1, 4, 9, 0.72);
+    display: flex; align-items: center; justify-content: center;
+  }
+  #modal-backdrop[hidden] { display: none; }
+  #modal {
+    width: min(30rem, 92vw);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    padding: 1rem;
+  }
+  #modal h2 { margin-top: 0; }
+  #modal-pick { display: flex; flex-wrap: wrap; gap: 0.45rem; margin: 0.6rem 0; }
+  .pick-chip {
+    border-radius: 999px; padding: 0.3rem 0.75rem;
+    background: var(--surface-2); border: 1px solid var(--border-strong);
+    color: var(--muted); cursor: pointer; font-size: 0.8rem;
+  }
+  .pick-chip:hover { border-color: var(--accent); color: var(--text); }
+  .pick-chip.on { background: rgba(68, 147, 248, 0.14); border-color: var(--accent); color: #fff; }
+  #modal-error { color: var(--red); font-size: 0.78rem; min-height: 1.1em; margin-top: 0.5rem; }
+  #modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 0.6rem; }
+</style>
+</head>
+<body>
+<div id="boot-gate">loading wrkspc…</div>
+<div id="boot" class="connecting">
+  <div id="login-card">
+    <h1>wrkspc</h1>
+    <p class="explain">operator console. run <code>wrkspc ui-token</code> in a terminal and paste the copied token — the clipboard clears itself after 30 seconds.</p>
+    <input id="login-token" type="password" autocomplete="off" spellcheck="false" placeholder="bearer token">
+    <button id="login-submit" class="primary">connect</button>
+    <div id="login-error"></div>
+  </div>
+  <span id="boot-status">connecting…</span>
+</div>
+<div id="modal-backdrop" hidden>
+  <div id="modal">
+    <h2>new room</h2>
+    <p class="explain">pick participants (operator is you — included by default). add ids not in the roster with the box below.</p>
+    <div id="modal-pick"></div>
+    <input id="modal-extra" type="text" placeholder="extra peer ids (comma-separated, optional)">
+    <div id="modal-error"></div>
+    <div id="modal-actions">
+      <button id="modal-cancel">cancel</button>
+      <button id="modal-create" class="primary">create</button>
+    </div>
+  </div>
+</div>
+<aside id="conversations">
+  <div class="rail-head"><h2 style="margin:0">conversations</h2></div>
+  <div class="rail-body">
+    <div id="convo-list"></div>
+    <h2>cohort</h2>
+    <div class="cohort-tools"><label><input type="checkbox" id="hide-ejected"> hide ejected</label></div>
+    <div id="peer-list"></div>
+    <h2>new room</h2>
+    <p class="explain">pick from the roster — no typing ids unless you want someone not listed.</p>
+    <div style="text-align:center"><button id="new-convo-open" class="primary">New Room</button></div>
+  </div>
+</aside>
+<section id="workspace">
+  <div class="topbar">
+    <span class="title" id="convo-title">wrkspc</span>
+    <span class="subtitle" id="convo-subtitle"></span>
+    <div id="unknown-banner" hidden style="margin-left:auto"></div>
+  </div>
+  <div id="convo-members"></div>
+  <div id="moderation"><span class="label">conversation gates</span></div>
+  <div id="fences"></div>
+  <div id="transcript-scroll"><div id="transcript-loading">loading…</div><div id="transcript"></div></div>
+  <div id="compose-panel">
+    <div class="inner">
+      <div class="seg">
+        <button id="compose-mode-msg" class="active">message</button>
+        <button id="compose-mode-guidance">guidance</button>
+      </div>
+      <textarea id="compose-text" rows="3" placeholder="post a message to the conversation"></textarea>
+      <div class="actions">
+        <button id="compose-send" class="primary">send</button>
+        <span class="hint" id="compose-hint"></span>
+      </div>
+    </div>
+  </div>
+</section>
+<aside id="unknown">
+  <h2>unknown attempts</h2>
+  <p class="explain">turns whose outcome the node can't determine (e.g. it restarted mid-turn). you decide: retry, or close as failed/completed.</p>
+  <div id="unknown-list"></div>
+</aside>
+<script>
+"use strict";
+let token = localStorage.getItem("wrkspc_token");
+let selected = null;
+let eventCursor = 0;
+// The selected conversation's events, accumulated across incremental
+// fetches (eventCursor is the highest seq held). viewGeneration bumps on
+// every select() so a fetch begun for an earlier view never renders.
+let transcriptEvents = [];
+let viewGeneration = 0;
+// The newest in-flight renderAll() fetch ({ startedAt }), or null. The 1 s
+// poll skips its refresh while one runs (a large backlog takes several
+// pages) unless it has outlived REFRESH_STALE_MS, so a hung request can
+// never freeze the transcript.
+let refresh = null;
+const REFRESH_STALE_MS = 15000;
+let seenHashes = {};
+// The peer_id whose inline rename editor is open. While set, loadPeers()
+// skips its re-render so the 1 s poll (whose payload changes every tick —
+// presence `updated_at`) cannot rebuild the rows and destroy the input.
+let editingPeer = null;
+// Cohort filters and the moderation audit feed (see loadModeration).
+let hideEjected = false;
+let moderationCache = [];
+let composeMode = "message";
+// The default compose hint ("as operator · to …"), restored when the
+// box holds no @ mention.
+let composeDefaultHint = "";
+
+function hash(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return h; }
+function renderIfChanged(key, h, fn) {
+  if (seenHashes[key] === h) return;
+  seenHashes[key] = h;
+  fn();
+}
+
+async function api(path, options = {}) {
+  const opts = { headers: { ...(options.headers || {}) }, ...options };
+  if (token) opts.headers["Authorization"] = "Bearer " + token;
+  const res = await fetch(path, opts);
+  if (res.status === 401) {
+    token = null;
+    localStorage.removeItem("wrkspc_token");
+    showLogin();
+    throw new Error("unauthorized");
+  }
+  if (!res.ok) {
+    let detail = "";
+    try { detail = (await res.json()).error || ""; } catch {}
+    throw new Error(res.status + " " + detail);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+const el = (id) => document.getElementById(id);
+const clear = (node) => { while (node.firstChild) node.removeChild(node.firstChild); };
+const btn = (label, onClick, cls, title) => {
+  const b = document.createElement("button");
+  b.textContent = label;
+  b.onclick = onClick;
+  if (cls) b.className = cls;
+  if (title) b.title = title;
+  return b;
+};
+const badge = (text, cls) => {
+  const s = document.createElement("span");
+  s.className = "badge " + (cls || "stored");
+  s.textContent = text;
+  return s;
+};
+
+function age(updatedAt) {
+  if (!updatedAt) return "—";
+  const seconds = Math.max(0, Math.round((Date.now() - Date.parse(updatedAt)) / 1000));
+  if (seconds < 60) return seconds + "s ago";
+  if (seconds < 3600) return Math.round(seconds / 60) + "m ago";
+  if (seconds < 86400) return Math.round(seconds / 3600) + "h ago";
+  return Math.round(seconds / 86400) + "d ago";
+}
+
+async function loadConversations() {
+  let conversations = [];
+  try { conversations = await api("/api/conversations"); } catch { return; }
+  renderIfChanged("convos", hash(JSON.stringify(conversations) + selected), () => {
+    const list = el("convo-list");
+    clear(list);
+    for (const c of conversations) {
+      const b = document.createElement("button");
+      b.className = "convo" + (c.id === selected ? " selected" : "");
+      const cid = document.createElement("span");
+      cid.className = "cid";
+      cid.textContent = c.id.slice(0, 8);
+      const members = document.createElement("span");
+      members.className = "members";
+      members.textContent = c.members.map(peerLabel).join(", ");
+      const when = document.createElement("span");
+      when.className = "when";
+      when.textContent = "created " + age(c.created_at);
+      b.appendChild(cid); b.appendChild(members); b.appendChild(when);
+      b.onclick = () => select(c.id);
+      list.appendChild(b);
+    }
+  });
+  if (selected) {
+    const meta = conversations.find((c) => c.id === selected);
+    if (meta) {
+      el("convo-title").textContent = meta.members.join(" · ");
+      el("convo-subtitle").textContent = meta.id.slice(0, 8);
+      composeDefaultHint = "as operator · to " + meta.members.join(", ");
+      el("compose-hint").textContent = composeDefaultHint;
+      renderMembers(meta);
+    }
+  }
+}
+
+// The conversation's membership strip. Kick is room-scoped: the peer stays
+// enrolled in the hub (and in other rooms) — the hub-wide boot/ban controls
+// live on the peer rows instead.
+function renderMembers(meta) {
+  const box = el("convo-members");
+  box.textContent = "";
+  for (const member of meta.members) {
+    if (member === "operator") continue;
+    const peer = rosterEntries.find((p) => p.peer_id === member);
+    const label = (peer && peer.alias) || member;
+    const chip = document.createElement("span");
+    chip.className = "member";
+    chip.textContent = label;
+    const kick = document.createElement("button");
+    kick.className = "kick";
+    kick.textContent = "✕";
+    kick.title = "kick " + label + " from this room (stays enrolled; other rooms unaffected)";
+    kick.onclick = async () => {
+      if (!confirm("kick " + label + " from this room?")) return;
+      try {
+        await api(
+          "/api/conversations/" + selected + "/members/" + encodeURIComponent(member),
+          { method: "DELETE" },
+        );
+      } catch (e) { alert("kick failed: " + e.message); }
+      await renderAll();
+    };
+    chip.appendChild(kick);
+    box.appendChild(chip);
+  }
+}
+
+async function loadPeers() {
+  let peers = [];
+  try { peers = await api("/api/peers"); rosterEntries = peers; } catch { return; }
+  if (editingPeer) return; // an inline rename is open: the section stays frozen until it commits
+  const visible = hideEjected
+    ? peers.filter((p) => (p.status || "enrolled") === "enrolled")
+    : peers;
+  renderIfChanged("peers", hash(JSON.stringify(peers) + JSON.stringify(moderationCache)), () => {
+    const list = el("peer-list");
+    clear(list);
+    if (!visible.length) {
+      const note = document.createElement("div");
+      note.className = "empty-note";
+      note.textContent = peers.length ? "no enrolled peers (ejected peers hidden)" : "no peers reported yet";
+      list.appendChild(note);
+      return;
+    }
+    for (const p of visible) {
+      const row = document.createElement("div");
+      row.className = "peer-row";
+      const dot = document.createElement("span");
+      dot.className = "dot " + (p.state || "unknown");
+      const name = document.createElement("span");
+      name.className = "peer-name";
+      name.textContent = p.alias || p.peer_id;
+      name.title = p.alias ? p.peer_id : "";
+      const host = document.createElement("span");
+      host.className = "host";
+      host.title = p.host_id || "";
+      host.textContent = (p.host_id || "").replace(/\.mtls\.devlocal\.home\.arpa$/, "");
+      row.appendChild(dot); row.appendChild(name); row.appendChild(host);
+      if ((p.status || "enrolled") !== "enrolled") {
+        const badge = document.createElement("span");
+        badge.className = "peer-status " + p.status;
+        badge.textContent = p.status;
+        row.appendChild(badge);
+      }
+      if (p.peer_id !== "operator") {
+        const rename = peerBtn("✎", "rename", () => {
+          editingPeer = p.peer_id;
+          const input = document.createElement("input");
+          input.type = "text";
+          input.value = p.alias || p.peer_id;
+          input.maxLength = 64;
+          input.className = "peer-rename-input";
+          name.replaceWith(input);
+          input.focus();
+          input.select();
+          const commit = async () => {
+            editingPeer = null;
+            const alias = input.value.trim();
+            const next = alias && alias !== p.peer_id ? alias : null;
+            try { await api("/api/peers/" + encodeURIComponent(p.peer_id), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ alias: next }) }); }
+            catch { /* surface the error on the next poll */ }
+            await refreshCohort();
+          };
+          let done = false;
+          input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") { done = true; commit(); }
+            else if (e.key === "Escape") { done = true; editingPeer = null; refreshCohort(); }
+          });
+          input.addEventListener("blur", () => { if (!done) commit(); });
+        });
+        row.appendChild(rename);
+        if ((p.status || "enrolled") === "enrolled") {
+          row.appendChild(peerBtn("⊘", "boot (eject from the hub)", () =>
+            setPeerStatus(p.peer_id, "booted", "boot " + (p.alias || p.peer_id) + " from the hub? their node stays enrolled-named but can't participate.")));
+          row.appendChild(peerBtn("⛔", "ban (eject + revoke certificate)", () =>
+            setPeerStatus(p.peer_id, "banned", "ban " + (p.alias || p.peer_id) + "? their certificate is revoked and they cannot reconnect.")));
+        } else {
+          row.appendChild(peerBtn("↺", "restore to enrolled", () =>
+            setPeerStatus(p.peer_id, "enrolled", "restore " + (p.alias || p.peer_id) + " to enrolled?")));
+          row.appendChild(peerBtn("✕", "forget (remove from the cohort)", () => {
+            if (!window.confirm("forget " + (p.alias || p.peer_id) + "? the cohort entry is removed; message history, certificate revocations, and the audit trail are preserved.")) return;
+            (async () => {
+              try { await api("/api/peers/" + encodeURIComponent(p.peer_id), { method: "DELETE" }); }
+              catch { /* the next poll surfaces the error */ }
+              await refreshCohort();
+            })();
+          }));
+        }
+      }
+      const lastMod = moderationCache.find((e) => e.peer_id === p.peer_id);
+      if (lastMod) {
+        const stamp = document.createElement("span");
+        stamp.className = "mod-stamp";
+        stamp.textContent = lastMod.action + " " + age(lastMod.at);
+        stamp.title = "last moderation action";
+        row.appendChild(stamp);
+      }
+      const when = document.createElement("span");
+      when.style.cssText = "margin-left:auto;color:var(--faint);font-size:0.7rem;flex:none;";
+      when.textContent = age(p.updated_at);
+      row.appendChild(when);
+      list.appendChild(row);
+    }
+  });
+}
+
+/* ---- peer cohort controls ---- */
+
+// A tiny per-peer action button.
+function peerBtn(label, title, onClick) {
+  const b = document.createElement("button");
+  b.className = "peer-btn";
+  b.textContent = label;
+  b.title = title;
+  b.onclick = onClick;
+  return b;
+}
+
+// Applies an operator status change after a destructive-action confirm.
+async function setPeerStatus(id, status, confirmText) {
+  if (!window.confirm(confirmText)) return;
+  try {
+    await api("/api/peers/" + encodeURIComponent(id), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) });
+  } catch { /* the next poll surfaces the error */ }
+  await refreshCohort();
+}
+
+// The cohort moderation audit feed (newest first) — drives each peer
+// row's last-action stamp.
+async function loadModeration() {
+  try { moderationCache = await api("/api/moderation?limit=200"); } catch { return; }
+}
+
+// One cohort refresh: audit feed + roster, in the order the render
+// hash expects.
+async function refreshCohort() {
+  await loadModeration();
+  await loadPeers();
+}
+
+// The display label for a peer id: its operator alias when set.
+function peerLabel(id) {
+  const p = (rosterEntries || []).find((x) => x.peer_id === id);
+  return p && p.alias ? p.alias : id;
+}
+
+/* ---- conversation-creation modal ---- */
+let pickedPeers = new Set();
+
+async function openConversationModal() {
+  pickedPeers = new Set();
+  el("modal-error").textContent = "";
+  el("modal-extra").value = "";
+  const grid = el("modal-pick");
+  clear(grid);
+  let peers = [];
+  try { peers = await api("/api/peers"); } catch { /* freeform ids still work */ }
+  const makeChip = (id) => {
+    const chip = document.createElement("span");
+    chip.className = "pick-chip" + (pickedPeers.has(id) ? " on" : "");
+    chip.textContent = id;
+    chip.onclick = () => {
+      if (pickedPeers.has(id)) pickedPeers.delete(id); else pickedPeers.add(id);
+      chip.classList.toggle("on");
+    };
+    return chip;
+  };
+  const op = makeChip("operator");
+  op.classList.add("on");
+  pickedPeers.add("operator");
+  grid.appendChild(op);
+  for (const p of peers) {
+    if (p.peer_id === "operator") continue;
+    grid.appendChild(makeChip(p.peer_id));
+  }
+  el("modal-backdrop").hidden = false;
+}
+
+function closeConversationModal() {
+  el("modal-backdrop").hidden = true;
+}
+
+async function createConversation() {
+  const extra = el("modal-extra").value.split(",").map((s) => s.trim()).filter(Boolean);
+  const members = [...pickedPeers];
+  for (const id of extra) if (!members.includes(id)) members.push(id);
+  if (members.length < 2) {
+    el("modal-error").textContent = "pick at least one participant besides the operator";
+    return;
+  }
+  try {
+    const res = await api("/api/conversations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ members }),
+    });
+    closeConversationModal();
+    await select(res.id);
+  } catch (e) {
+    el("modal-error").textContent = e.message;
+  }
+}
+
+/* ---- compose (message / guidance switch) ---- */
+function setComposeMode(mode) {
+  composeMode = mode;
+  el("compose-mode-msg").classList.toggle("active", mode === "message");
+  el("compose-mode-guidance").classList.toggle("active", mode === "guidance");
+  el("compose-text").placeholder = mode === "message"
+    ? "post a message to the conversation"
+    : "operator guidance — rides the next prompt in this conversation";
+  el("compose-send").textContent = mode === "message" ? "send" : "send guidance";
+}
+
+/* ---- @ mentions: directed posts (delivery-scoped; transcript stays shared) ---- */
+// Resolves "@name" tokens (alias first, then peer id) against the roster.
+// The message still lands in the shared transcript; only the resolved
+// targets receive a delivery and take a turn.
+function composeTargets(text) {
+  const targets = [];
+  const unknown = [];
+  for (const match of text.matchAll(/(^|\s)@([A-Za-z0-9._-]+)/g)) {
+    const token = match[2];
+    const peer = rosterEntries.find((p) => p.alias === token)
+      || rosterEntries.find((p) => p.peer_id === token);
+    if (!peer) {
+      if (!unknown.includes(token)) unknown.push(token);
+      continue;
+    }
+    if (!targets.includes(peer.peer_id)) targets.push(peer.peer_id);
+  }
+  return { targets, unknown };
+}
+
+function refreshComposeHint() {
+  const { targets, unknown } = composeTargets(el("compose-text").value);
+  if (unknown.length) {
+    el("compose-hint").textContent = "unknown @" + unknown.join(", @") + " — fix or remove to send";
+    return;
+  }
+  if (targets.length) {
+    const names = targets.map((id) => {
+      const peer = rosterEntries.find((p) => p.peer_id === id);
+      return "@" + ((peer && peer.alias) || id);
+    });
+    el("compose-hint").textContent = "directed to " + names.join(", ") + " — others read only, no turn";
+    return;
+  }
+  if (composeDefaultHint) el("compose-hint").textContent = composeDefaultHint;
+}
+
+async function sendComposed() {
+  const box = el("compose-text");
+  const text = box.value.trim();
+  if (!text || !selected) return;
+  try {
+    if (composeMode === "message") {
+      const { targets, unknown } = composeTargets(text);
+      if (unknown.length) { refreshComposeHint(); return; }
+      const body = { content: text };
+      if (targets.length) body.recipients = targets;
+      await api("/api/conversations/" + selected + "/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } else {
+      await api("/api/conversations/" + selected + "/guidance", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+    }
+    box.value = "";
+    refreshComposeHint();
+    await renderAll();
+  } catch (e) { alert("send failed: " + e.message); }
+}
+
+/* ---- markdown (safe subset) ---- */
+const MD_FENCE = /^\s*(```|~~~)/;
+const MD_HEADING = /^\s{0,3}#{1,6}\s+(.*?)(?:\s+#+)?\s*$/;
+const MD_RULE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
+const MD_QUOTE = /^\s*>/;
+const MD_ITEM = /^\s*(?:[-*+]|(\d{1,9})[.)])\s+/;
+// Inline spans, leftmost first: code, link, bare URL, bold, italic.
+const MD_INLINE = /`([^`\n]+)`|\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)|(https?:\/\/[^\s<>()]*[^\s<>().,;:!?'"])|\*\*([^*\n]+)\*\*|__([^_\n]+)__|\*([^*\n]+)\*|(?<!\w)_([^_\n]+)_(?!\w)/g;
+const MD_LINK_PROTOCOLS = ["http:", "https:", "mailto:"];
+
+// Renders message and turn text as markdown — fenced code, headings,
+// quotes, lists, rules and paragraphs; inline code, links, bare URLs, bold
+// and italic — building DOM with createElement/textContent, never
+// innerHTML, so the text can't inject markup. An unclosed fence (a turn
+// still streaming) runs to the end of the text.
+function renderMarkdown(source) {
+  const out = document.createDocumentFragment();
+  const lines = String(source ?? "").replace(/\r\n?/g, "\n").split("\n");
+  const isBlockStart = (line) =>
+    MD_FENCE.test(line) || MD_HEADING.test(line) || MD_RULE.test(line) || MD_QUOTE.test(line) || MD_ITEM.test(line);
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) { i++; continue; }
+    const fence = MD_FENCE.exec(line);
+    if (fence) {
+      const code = [];
+      for (i++; i < lines.length && !lines[i].trim().startsWith(fence[1]); i++) code.push(lines[i]);
+      i++; // the closing fence, when present
+      out.appendChild(document.createElement("pre")).appendChild(document.createElement("code")).textContent = code.join("\n");
+      continue;
+    }
+    const heading = MD_HEADING.exec(line);
+    if (heading) {
+      const p = out.appendChild(document.createElement("p"));
+      p.className = "md-heading";
+      appendInline(p, heading[1]);
+      i++;
+      continue;
+    }
+    if (MD_RULE.test(line)) { out.appendChild(document.createElement("hr")); i++; continue; }
+    if (MD_QUOTE.test(line)) {
+      const quoted = [];
+      for (; i < lines.length && MD_QUOTE.test(lines[i]); i++) quoted.push(lines[i].replace(/^\s*>\s?/, ""));
+      out.appendChild(document.createElement("blockquote")).appendChild(renderMarkdown(quoted.join("\n")));
+      continue;
+    }
+    const first = MD_ITEM.exec(line);
+    if (first) {
+      const ordered = first[1] !== undefined;
+      const list = out.appendChild(document.createElement(ordered ? "ol" : "ul"));
+      if (ordered && first[1] !== "1") list.start = Number(first[1]);
+      for (let m; i < lines.length && (m = MD_ITEM.exec(lines[i])) && (m[1] !== undefined) === ordered; i++) {
+        appendInline(list.appendChild(document.createElement("li")), lines[i].slice(m[0].length));
+      }
+      continue;
+    }
+    const para = [];
+    do { para.push(lines[i]); i++; } while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i]));
+    appendInline(out.appendChild(document.createElement("p")), para.join("\n").trim());
+  }
+  return out;
+}
+
+// Appends `text` to `parent` with inline markdown spans rendered.
+function appendInline(parent, text) {
+  let last = 0;
+  for (const m of text.matchAll(MD_INLINE)) {
+    if (m.index > last) parent.appendChild(document.createTextNode(text.slice(last, m.index)));
+    last = m.index + m[0].length;
+    const [, code, label, target, url, bold, bold2, em, em2] = m;
+    if (code !== undefined) parent.appendChild(document.createElement("code")).textContent = code;
+    else if (label !== undefined) parent.appendChild(mdLink(label, target));
+    else if (url !== undefined) parent.appendChild(mdLink(url, url));
+    else {
+      const strong = (bold ?? bold2) !== undefined;
+      appendInline(parent.appendChild(document.createElement(strong ? "strong" : "em")), bold ?? bold2 ?? em ?? em2);
+    }
+  }
+  if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)));
+}
+
+// A link to an http(s)/mailto target opens in a new tab; any other target
+// (a local file path, javascript:, a relative link) keeps only its label,
+// with the target as a tooltip.
+function mdLink(label, target) {
+  let url = null;
+  try { url = new URL(target); } catch { /* relative or malformed */ }
+  if (url && MD_LINK_PROTOCOLS.includes(url.protocol)) {
+    const a = document.createElement("a");
+    a.href = url.href;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = label;
+    return a;
+  }
+  const span = document.createElement("span");
+  span.title = target;
+  span.textContent = label;
+  return span;
+}
+
+/* ---- transcript rows ---- */
+// Gutter times use the viewer's local clock ("Nov 2, 03:00:00"); the
+// tooltip carries the full local date, time and zone.
+const TIME_SHORT = new Intl.DateTimeFormat(undefined, {
+  month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+});
+const TIME_FULL = new Intl.DateTimeFormat(undefined, { dateStyle: "full", timeStyle: "long" });
+
+// Appends `entry` to the transcript in a row with its real timestamp in the
+// left gutter. Store timestamps are RFC 3339 with microseconds; they are
+// cut to milliseconds before parsing, and an unparsable one leaves the
+// gutter blank rather than showing a wrong time.
+function appendRow(transcript, entry, createdAt) {
+  const row = document.createElement("div");
+  row.className = entry.classList.contains("msg") ? "tx-row msg-row" : "tx-row";
+  const time = row.appendChild(document.createElement("time"));
+  time.className = "ts";
+  const at = new Date(String(createdAt ?? "").replace(/(\.\d{3})\d+/, "$1"));
+  if (!Number.isNaN(at.getTime())) {
+    time.dateTime = at.toISOString();
+    time.textContent = TIME_SHORT.format(at);
+    time.title = TIME_FULL.format(at);
+  }
+  row.appendChild(entry);
+  transcript.appendChild(row);
+}
+
+/* ---- conversation view ---- */
+let rosterEntries = [];
+async function select(id) {
+  selected = id;
+  eventCursor = 0;
+  transcriptEvents = [];
+  viewGeneration += 1;
+  seenHashes = {};
+  el("transcript").textContent = "";
+  // Loading state in the response area while the conversation's
+  // content is fetched and rendered.
+  el("transcript-scroll").classList.add("loading");
+  try {
+    await renderAll();
+  } finally {
+    el("transcript-scroll").classList.remove("loading");
+  }
+  await loadConversations();
+}
+
+function eventSummary(e) {
+  const p = e.payload || {};
+  const kind = e.kind || "event";
+  // Known payload fields only — never dump raw JSON into the transcript.
+  const text = (p.text || p.content || p.summary || p.reason || p.sender_id || "");
+  if (kind === "turn.chunk" && text) return { text: text, cls: "" };
+  if (kind === "message.accepted") return { text: "accepted · sender " + (p.sender_id || "?") + (p.execution_requested ? " · execution requested" : ""), cls: "" };
+  if (kind === "work.report") return { text: "work report · " + (p.summary || ""), cls: "" };
+  if (kind === "dispatch.stopped") return { text: "dispatcher " + (p.state || "stopped") + (p.reason ? " · " + p.reason : ""), cls: p.state === "canceled" ? "attention" : "" };
+  if (kind === "dispatch.unknown" || kind === "dispatch.failed") return { text: "dispatcher " + kind.replace("dispatch.", "") + (p.reason ? " · " + p.reason : ""), cls: "failure" };
+  if (kind === "attempt.claimed" || kind === "dispatch.started") return { text: kind.replace("attempt.", "") + " · " + (p.recipient_id || ""), cls: "" };
+  if (kind === "delivery.acked") return { text: "delivery acked · " + (p.peer_id || ""), cls: "" };
+  if (text) return { text: text, cls: "" };
+  return { text: "", cls: "" };
+}
+
+// Page size for /events reads: a full page means more may follow.
+const EVENT_PAGE = 500;
+
+// Reads every event of conversation `id` after seq `after`, paging until a
+// short page, so a render holds the whole backlog rather than one page of
+// it. Stops early once the view changes (that result is discarded) or a
+// page fails to advance the seq (guards against an endless loop).
+async function fetchEventsAfter(id, after, generation) {
+  const pages = [];
+  for (;;) {
+    const page = await api("/api/conversations/" + id + "/events?after_seq=" + after + "&limit=" + EVENT_PAGE);
+    pages.push(page);
+    const last = page.length ? page[page.length - 1].seq : after;
+    if (page.length < EVENT_PAGE || last <= after || generation !== viewGeneration) return pages.flat();
+    after = last;
+  }
+}
+
+async function renderAll() {
+  if (!selected) return;
+  const generation = viewGeneration;
+  const current = { startedAt: Date.now() };
+  refresh = current;
+  let messages, events, fences, members;
+  try {
+    [messages, events, fences, members] = await Promise.all([
+      api("/api/conversations/" + selected + "/messages"),
+      fetchEventsAfter(selected, eventCursor, generation),
+      api("/api/conversations/" + selected + "/fences"),
+      api("/api/conversations/" + selected).then((c) => c.members),
+    ]);
+  } catch { return; } finally {
+    if (refresh === current) refresh = null;
+  }
+  // A fetch begun for an earlier view (another conversation, or before a
+  // re-select) must not render into the current one.
+  if (generation !== viewGeneration) return;
+  // The events endpoint is an incremental feed (seq-ordered, append-only):
+  // keep only what is new, since overlapping polls can return the same
+  // events, so the transcript shows the whole history, not the last batch.
+  for (const e of events) {
+    if (e.seq > eventCursor) {
+      transcriptEvents.push(e);
+      eventCursor = e.seq;
+    }
+  }
+
+  renderIfChanged("transcript", hash(JSON.stringify(messages) + "#" + eventCursor), () => {
+    const scroll = el("transcript-scroll");
+    const stick = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 60;
+    const transcript = el("transcript");
+    clear(transcript);
+    for (const m of messages) {
+      const box = document.createElement("div");
+      box.className = "msg";
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      const sender = document.createElement("span");
+      sender.className = "sender" + (m.sender_id === "operator" ? " operator" : "");
+      sender.textContent = peerLabel(m.sender_id);
+      const when = document.createElement("span");
+      when.className = "when";
+      when.textContent = age(m.created_at);
+      meta.appendChild(sender); meta.appendChild(when);
+      box.appendChild(meta);
+      const content = document.createElement("div");
+      content.className = "content md";
+      content.appendChild(renderMarkdown(m.content));
+      box.appendChild(content);
+      const harnessDeliveries = (m.deliveries || []).filter((d) => d.peer_id !== "operator");
+      if (harnessDeliveries.length) {
+        const row = document.createElement("div");
+        row.className = "deliveries";
+        const label = document.createElement("span");
+        label.className = "label";
+        label.textContent = "delivery to";
+        row.appendChild(label);
+        for (const d of harnessDeliveries) {
+          row.appendChild(badge(d.peer_id + " · " + d.state, d.state));
+          row.appendChild(btn("hold", () => act("/api/messages/" + m.id + "/deliveries/" + d.peer_id + "/hold", "POST"), "", "gate this delivery pending review"));
+          row.appendChild(btn("release", () => act("/api/messages/" + m.id + "/deliveries/" + d.peer_id + "/release", "POST"), "", "release the held delivery"));
+          row.appendChild(btn("cancel", () => act("/api/messages/" + m.id + "/deliveries/" + d.peer_id + "/cancel", "POST"), "danger", "cancel this delivery"));
+        }
+        box.appendChild(row);
+      }
+      appendRow(transcript, box, m.created_at);
+    }
+    if (!messages.length && !transcriptEvents.length) {
+      const note = document.createElement("div");
+      note.className = "empty-note";
+      note.textContent = "no messages yet — post one below";
+      transcript.appendChild(note);
+    }
+    // A turn streams as many turn.chunk events (token fragments) sharing an
+    // attempt_id. Each turn renders as one block at its first fragment: the
+    // fragments joined and rendered as markdown, growing as the turn
+    // streams, labelled with the agent named by its dispatch.started. A
+    // change of the chunks' message_id (a new agent message within the
+    // turn) starts a new paragraph.
+    const turns = new Map(); // attempt_id -> { kind, body, parts, messageId }
+    const agents = new Map(); // attempt_id -> recipient_id
+    for (const e of transcriptEvents) {
+      const p = e.payload || {};
+      if (e.kind === "dispatch.started" && p.attempt_id) agents.set(p.attempt_id, p.recipient_id);
+      if (e.kind === "turn.chunk" && p.attempt_id) {
+        let turn = turns.get(p.attempt_id);
+        if (!turn) {
+          const line = document.createElement("div");
+          line.className = "event turn";
+          const kind = document.createElement("span");
+          kind.className = "ekind";
+          const body = document.createElement("div");
+          body.className = "turn-body md";
+          line.appendChild(kind);
+          line.appendChild(body);
+          appendRow(transcript, line, e.created_at);
+          turn = { kind, body, parts: [], messageId: null };
+          turns.set(p.attempt_id, turn);
+        }
+        const messageId = p.message_id ?? null;
+        if (messageId !== null) {
+          if (turn.messageId !== null && messageId !== turn.messageId) turn.parts.push("\n\n");
+          turn.messageId = messageId;
+        }
+        turn.parts.push(eventSummary(e).text);
+        continue;
+      }
+      const s = eventSummary(e);
+      const line = document.createElement("div");
+      line.className = "event" + (s.cls ? " " + s.cls : "");
+      const kind = document.createElement("span");
+      kind.className = "ekind";
+      kind.textContent = e.kind;
+      line.appendChild(kind);
+      line.appendChild(document.createTextNode(s.text));
+      appendRow(transcript, line, e.created_at);
+    }
+    for (const [attemptId, turn] of turns) {
+      const agent = agents.get(attemptId);
+      turn.kind.textContent = "turn output" + (agent ? " · " + agent : "");
+      turn.body.appendChild(renderMarkdown(turn.parts.join("")));
+    }
+    if (stick) scroll.scrollTop = scroll.scrollHeight;
+  });
+
+  renderIfChanged("moderation", hash(JSON.stringify(members) + JSON.stringify(fences)), () => {
+    const box = el("moderation");
+    clear(box);
+    const label = document.createElement("span");
+    label.className = "label";
+    label.textContent = "conversation gates";
+    box.appendChild(label);
+    for (const peer of members) {
+      const chip = document.createElement("span");
+      chip.className = "peer-ctl";
+      const name = document.createElement("span");
+      name.className = "name";
+      name.textContent = peer;
+      chip.appendChild(name);
+      chip.appendChild(btn("pause", () => fence("pause", peer), "", "no NEW deliveries to " + peer + "; in-flight turns may finish"));
+      chip.appendChild(btn("block", () => fence("block", peer), "danger", "no delivery to " + peer + " at all"));
+      box.appendChild(chip);
+    }
+    const fenceBox = el("fences");
+    clear(fenceBox);
+    for (const f of fences) {
+      const chip = document.createElement("span");
+      chip.className = "fence-chip";
+      chip.appendChild(document.createTextNode(f.kind + " on " + f.peer_id + " by " + f.set_by));
+      chip.appendChild(btn("clear", () => act("/api/fences/" + f.id, "DELETE"), "danger", "remove this gate"));
+      fenceBox.appendChild(chip);
+    }
+  });
+}
+
+async function fence(kind, peerId) {
+  await api("/api/conversations/" + selected + "/fences", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ peer_id: peerId, kind }),
+  });
+  await renderAll();
+}
+
+async function act(path, method) {
+  await api(path, { method });
+  await renderAll();
+}
+
+async function renderUnknown() {
+  let attempts = [];
+  try { attempts = await api("/api/attempts/unknown"); } catch { return; }
+  renderIfChanged("unknown", hash(JSON.stringify(attempts)), () => {
+    const list = el("unknown-list");
+    const banner = el("unknown-banner");
+    clear(list);
+    if (attempts.length === 0) {
+      banner.hidden = true;
+      const note = document.createElement("div");
+      note.className = "empty";
+      note.textContent = "none — nothing is silently stuck";
+      list.appendChild(note);
+      return;
+    }
+    banner.hidden = false;
+    banner.textContent = attempts.length + " attempt(s) with undeterminable outcomes — operator decision required";
+    for (const a of attempts) {
+      const box = document.createElement("div");
+      box.className = "attempt";
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = "attempt " + a.attempt_id.slice(0, 8) + " → " + a.recipient_id + (a.stop_reason ? " · " + a.stop_reason : "");
+      box.appendChild(meta);
+      const row = document.createElement("div");
+      row.className = "row";
+      row.appendChild(btn("retry", () => reconcile(a.attempt_id, { decision: "retry" }), "primary", "re-queue the turn"));
+      row.appendChild(btn("close failed", () => reconcile(a.attempt_id, { decision: "close", state: "failed" }), "", "record the turn as failed"));
+      row.appendChild(btn("close completed", () => reconcile(a.attempt_id, { decision: "close", state: "completed" }), "", "record the turn as completed"));
+      box.appendChild(row);
+      list.appendChild(box);
+    }
+  });
+}
+
+async function reconcile(attemptId, body) {
+  await api("/api/attempts/" + attemptId + "/reconcile", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  await renderUnknown();
+  if (selected) await renderAll();
+}
+
+el("compose-send").onclick = sendComposed;
+el("compose-text").addEventListener("input", refreshComposeHint);
+el("compose-mode-msg").onclick = () => setComposeMode("message");
+el("compose-mode-guidance").onclick = () => setComposeMode("guidance");
+el("new-convo-open").onclick = openConversationModal;
+el("hide-ejected").onchange = (e) => { hideEjected = e.target.checked; loadPeers(); };
+el("modal-cancel").onclick = closeConversationModal;
+el("modal-create").onclick = createConversation;
+
+setInterval(async () => {
+  try {
+    await loadConversations();
+    await loadModeration();
+    await loadPeers();
+    const refreshing = refresh !== null && Date.now() - refresh.startedAt < REFRESH_STALE_MS;
+    if (selected && !refreshing) await renderAll();
+    await renderUnknown();
+  } catch (e) { /* transient — the next tick retries */ }
+}, 1000);
+
+async function bestConversation(conversations) {
+  let best = null, bestAt = -1, bestHasMessages = false;
+  for (const c of conversations) {
+    let hasMessages = false;
+    let activity = Date.parse(c.created_at) || 0;
+    try {
+      const msgs = await api("/api/conversations/" + c.id + "/messages");
+      if (msgs.length) {
+        hasMessages = true;
+        // Messages are ordered oldest-first; the newest one decides.
+        const last = Date.parse(msgs[msgs.length - 1].created_at);
+        if (last > activity) activity = last;
+      }
+    } catch { /* keep created_at */ }
+    // A conversation with real traffic always outranks an empty one,
+    // no matter how recently the empty one was created.
+    if (hasMessages && !bestHasMessages) { best = c; bestAt = activity; bestHasMessages = true; continue; }
+    if (hasMessages !== bestHasMessages) continue;
+    if (activity > bestAt) { bestAt = activity; best = c; }
+  }
+  return best || conversations[conversations.length - 1] || null;
+}
+
+(async function boot() {
+  if (token) {
+    el("boot").classList.add("connecting");
+    try { await startApp(); } catch { showLogin(); }
+  } else {
+    showLogin();
+  }
+})();
+
+function showLogin() {
+  dropGate();
+  el("boot").hidden = false;
+  el("boot").classList.remove("connecting");
+  el("login-error").textContent = "";
+  el("login-token").focus();
+}
+
+// Removes the first-frame loading gate once a full render is on screen.
+function dropGate() {
+  const gate = document.getElementById("boot-gate");
+  if (gate) gate.remove();
+}
+
+async function connectWith(value) {
+  const candidate = value.trim();
+  if (!candidate) return;
+  el("login-error").textContent = "";
+  el("boot").classList.add("connecting");
+  token = candidate;
+  try {
+    await api("/api/conversations");
+    localStorage.setItem("wrkspc_token", token);
+  } catch (e) {
+    token = null;
+    el("boot").classList.remove("connecting");
+    el("login-error").textContent = "rejected — check the token";
+    return;
+  }
+  await startApp();
+}
+
+async function startApp() {
+  el("boot").classList.add("connecting");
+  await loadConversations();
+  await loadModeration();
+  await loadPeers();
+  await renderUnknown();
+  const conversations = await api("/api/conversations");
+  const best = await bestConversation(conversations);
+  if (best) await select(best.id);
+  dropGate();
+  el("boot").hidden = true;
+}
+
+el("login-submit").onclick = () => connectWith(el("login-token").value);
+el("login-token").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") connectWith(el("login-token").value);
+});
+</script>
+</body>
+</html>

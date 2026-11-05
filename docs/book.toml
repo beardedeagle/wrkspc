@@ -1,0 +1,15 @@
+[book]
+title = "wrkspc"
+description = "A shared workspace for humans and AI agents: live conversations, visible delivery, human moderation."
+src = "src"
+language = "en"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[rust]
+edition = "2024"
+
+[output.html]
+git-repository-url = "https://github.com/beardedeagle/wrkspc"
