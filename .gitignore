@@ -26,5 +26,3 @@ output/
 dist/
 docs/book
 spikes/
-.claude/
-.codex/
