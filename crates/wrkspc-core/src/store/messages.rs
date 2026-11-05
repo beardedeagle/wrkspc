@@ -47,6 +47,41 @@ impl Store {
             let existing_id: String = row.get("id");
             let existing_content: String = row.get("content");
             if existing_content == content {
+                // A replay means the message is already stored, not that this
+                // recipient's work is done. The delivery loop feeds one
+                // delivery per recipient under the same idempotency key, so
+                // every recipient after the first reaches this branch: enrol it
+                // and raise its intent here, or the peer silently never runs.
+                self.assert_member(&mut tx, conversation_id, sender_id)
+                    .await?;
+                for recipient in recipients {
+                    self.assert_member(&mut tx, conversation_id, &recipient.peer_id)
+                        .await?;
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO message_recipients
+                           (message_id, peer_id, delivery_state)
+                         VALUES (?, ?, ?)",
+                    )
+                    .bind(&existing_id)
+                    .bind(&recipient.peer_id)
+                    .bind(DeliveryState::Stored.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                    if recipient.execution_requested {
+                        sqlx::query(
+                            "INSERT OR IGNORE INTO execution_intents
+                               (id, message_id, recipient_id, state, created_at)
+                             VALUES (?, ?, ?, 'queued', ?)",
+                        )
+                        .bind(Uuid::new_v4().to_string())
+                        .bind(&existing_id)
+                        .bind(&recipient.peer_id)
+                        .bind(&now)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+                tx.commit().await?;
                 return Ok(AcceptOutcome::Replay {
                     message_id: existing_id,
                 });

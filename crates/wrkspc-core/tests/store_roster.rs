@@ -111,3 +111,51 @@ async fn roster_mirror_replaces_fully() {
     assert_eq!(roster[0].peer_id, "codex");
     assert!(store.roster_entry("operator").await.unwrap().is_none());
 }
+
+/// Removing a cohort entry hides it immediately, and the peer comes back with
+/// a clean identity on its next turn.
+///
+/// The operator's complaint that motivated this: with several peers sharing a
+/// harness name and stale aliases, they could not tell the entries apart and
+/// could not remove them. Delete must work on an enrolled peer (not only an
+/// ejected one), clear the alias, and let the peer re-enrol itself with its
+/// plain binding name.
+#[tokio::test]
+async fn deleted_cohort_entry_returns_clean_on_next_presence() {
+    let store = Store::open_in_memory("cohort-delete").await.unwrap();
+    store
+        .upsert_roster_presence("claude-1", "claude", "harness", "node-test-1", "connected")
+        .await
+        .unwrap();
+    store
+        .set_peer_alias("claude-1", Some("claude-eh"), "operator")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.roster().await.unwrap()[0].alias.as_deref(),
+        Some("claude-eh")
+    );
+
+    // Delete works on an enrolled peer, not just an ejected one.
+    assert!(
+        store.forget_peer("claude-1", "operator").await.unwrap(),
+        "an enrolled peer must be removable"
+    );
+    assert!(
+        store.roster().await.unwrap().is_empty(),
+        "the entry disappears from the cohort immediately"
+    );
+
+    // Its next turn re-enrols it, with no alias carried over.
+    store
+        .upsert_roster_presence("claude-1", "claude", "harness", "node-test-1", "connected")
+        .await
+        .unwrap();
+    let roster = store.roster().await.unwrap();
+    let entry = roster
+        .iter()
+        .find(|row| row.peer_id == "claude-1")
+        .expect("the peer re-enrols on its next presence");
+    assert_eq!(entry.alias, None, "the stale alias must not come back");
+    assert_eq!(entry.name, "claude", "the plain binding name is restored");
+}

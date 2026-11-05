@@ -124,6 +124,8 @@
   .convo .cid { font-family: ui-monospace, monospace; font-size: 0.72rem; color: var(--faint); }
   .convo .members { font-size: 0.82rem; }
   .convo .when { font-size: 0.72rem; color: var(--muted); }
+  .convo .convo-del { margin-left: auto; padding: 0 6px; color: var(--faint); cursor: pointer; }
+  .convo .convo-del:hover { color: var(--red, #f85149); }
 
   .peer-row { display: flex; align-items: center; gap: 0.45rem; margin: 0.25rem 0; font-size: 0.82rem; }
   .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
@@ -501,7 +503,20 @@ async function loadConversations() {
       const when = document.createElement("span");
       when.className = "when";
       when.textContent = "created " + age(c.created_at);
-      b.appendChild(cid); b.appendChild(members); b.appendChild(when);
+      const del = document.createElement("span");
+      del.className = "convo-del";
+      del.textContent = "✕";
+      del.title = "delete this room";
+      del.onclick = async (event) => {
+        // Deleting a room is the only way to stop agents that keep waking in
+        // it; make it one click, but never silent.
+        event.stopPropagation();
+        if (!window.confirm("delete room " + c.id.slice(0, 8) + " (" + c.members.map(peerLabel).join(", ") + ")? its messages leave this store.")) return;
+        try { await api("/api/conversations/" + encodeURIComponent(c.id), { method: "DELETE" }); } catch { return; }
+        if (selected === c.id) selected = null;
+        await loadConversations();
+      };
+      b.appendChild(cid); b.appendChild(members); b.appendChild(when); b.appendChild(del);
       b.onclick = () => select(c.id);
       list.appendChild(b);
     }
@@ -622,8 +637,10 @@ async function loadPeers() {
         } else {
           row.appendChild(peerBtn("↺", "restore to enrolled", () =>
             setPeerStatus(p.peer_id, "enrolled", "restore " + (p.alias || p.peer_id) + " to enrolled?")));
-          row.appendChild(peerBtn("✕", "forget (remove from the cohort)", () => {
-            if (!window.confirm("forget " + (p.alias || p.peer_id) + "? the cohort entry is removed; message history, certificate revocations, and the audit trail are preserved.")) return;
+        }
+        {
+          row.appendChild(peerBtn("✕", p.status === "enrolled" ? "delete from the cohort" : "forget (remove from the cohort)", () => {
+            if (!window.confirm("delete " + (p.alias || p.peer_id) + " from the cohort? it disappears now and comes back with its plain name the next time it runs. message history and the audit trail are kept.")) return;
             (async () => {
               try { await api("/api/peers/" + encodeURIComponent(p.peer_id), { method: "DELETE" }); }
               catch { /* the next poll surfaces the error */ }

@@ -255,3 +255,113 @@ async fn terminal_state_is_immutable_but_idempotent() {
     let err = store.claim_intent(&message_id, &agent).await.unwrap_err();
     assert!(matches!(err, StoreError::IntentTerminal { .. }));
 }
+
+/// A second recipient's delivery replays the message but must still raise that
+/// recipient's intent.
+///
+/// The node's delivery loop feeds one delivery per recipient under the same
+/// idempotency key, so everyone after the first arrives as a replay. A bare
+/// replay dropped the recipient and its intent, leaving every peer but the
+/// first silently un-dispatched — visible in the UI as a peer that never runs
+/// and never goes green.
+#[tokio::test]
+async fn replay_raises_the_second_recipients_intent() {
+    let store = Store::open_in_memory("test").await.unwrap();
+    let (operator, agent, conversation) = seeded(&store).await;
+    store
+        .ensure_peer("claude-2", "claude-2", "harness")
+        .await
+        .unwrap();
+    store
+        .ensure_conversation(&conversation, &[&operator, &agent, "claude-2"])
+        .await
+        .unwrap();
+    let idem = key();
+
+    let first = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &idem,
+            "roll call",
+            true,
+            &[RecipientRequest {
+                peer_id: agent.clone(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap();
+    let message_id = match first {
+        AcceptOutcome::Accepted { message_id } => message_id,
+        AcceptOutcome::Replay { .. } => panic!("expected Accepted"),
+    };
+
+    let second = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &idem,
+            "roll call",
+            true,
+            &[RecipientRequest {
+                peer_id: "claude-2".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap();
+    match second {
+        AcceptOutcome::Replay {
+            message_id: replayed,
+        } => assert_eq!(replayed, message_id, "replay must reuse the stored message"),
+        AcceptOutcome::Accepted { .. } => panic!("expected Replay"),
+    }
+
+    // The regression: without the fix this claim fails and the peer never runs.
+    let attempt = store
+        .claim_intent(&message_id, "claude-2")
+        .await
+        .expect("replay must raise the second recipient's intent");
+    assert!(!attempt.is_empty(), "second recipient must be claimable");
+}
+
+/// Deleting a conversation removes it and everything scoped to it, so an
+/// abandoned room cannot keep waking peers on every poll.
+#[tokio::test]
+async fn delete_conversation_removes_room_and_its_rows() {
+    let store = Store::open_in_memory("test").await.unwrap();
+    let (operator, agent, conversation) = seeded(&store).await;
+    let outcome = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &key(),
+            "into the doomed room",
+            true,
+            &[RecipientRequest {
+                peer_id: agent.clone(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, AcceptOutcome::Accepted { .. }));
+
+    assert!(
+        store.delete_conversation(&conversation).await.unwrap(),
+        "existing conversation reports deleted"
+    );
+    assert!(
+        !store.delete_conversation(&conversation).await.unwrap(),
+        "second delete reports nothing removed"
+    );
+    assert!(
+        store
+            .conversation_members(&conversation)
+            .await
+            .unwrap()
+            .is_empty(),
+        "membership is gone"
+    );
+}

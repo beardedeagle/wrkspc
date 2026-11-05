@@ -165,11 +165,19 @@ async fn forget_is_soft_hidden_and_preserves_revocations() {
         .record_peer_cert_serial("codex", "aa11")
         .await
         .unwrap();
-    // Only ejected peers may be forgotten.
-    assert!(!store.forget_peer("codex", "operator").await.unwrap());
+    // Deleting works whatever the peer's status: the operator's problem was
+    // not being able to remove a cohort entry at all, not ejection.
+    assert!(store.forget_peer("codex", "operator").await.unwrap());
+    assert!(store.roster_entry("codex").await.unwrap().is_none());
     // Unknown peers report no change.
     assert!(!store.forget_peer("ghost", "operator").await.unwrap());
 
+    // It re-enrols on its next presence, then the ban path is exercised from
+    // a live entry.
+    store
+        .upsert_roster_presence("codex", "codex", "harness", PILOT_HOST_ID, "connected")
+        .await
+        .unwrap();
     // Ban, then forget: the revocation must survive.
     store
         .set_peer_status("codex", wrkspc_core::PeerStatus::Banned, "operator")

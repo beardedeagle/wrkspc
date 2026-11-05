@@ -32,16 +32,32 @@ impl Store {
             }
             // Ejected peers may not re-enter through presence; only the
             // operator's restore action returns them to `enrolled`.
-            // Soft-forgotten peers are refused the same way.
+            //
+            // A removed cohort entry is different: the delete was about not
+            // being able to tell entries apart, so the peer re-enrols cleanly
+            // on its next turn with no alias, instead of being locked out
+            // until someone finds it and restores it.
             if let Some((status, forgotten_at)) = sqlx::query_as::<_, (String, Option<String>)>(
                 "SELECT status, forgotten_at FROM peers WHERE id = ?",
             )
             .bind(peer_id)
             .fetch_optional(&mut *tx)
             .await?
-                && (forgotten_at.is_some() || status_is_ejected(&status))
             {
-                return Ok(PresenceOutcome::Ejected { status });
+                if status_is_ejected(&status) {
+                    return Ok(PresenceOutcome::Ejected { status });
+                }
+                if forgotten_at.is_some() {
+                    sqlx::query(
+                        "UPDATE peers SET forgotten_at = NULL, alias = NULL, name = ? WHERE id = ?",
+                    )
+                    .bind(name)
+                    .bind(peer_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    Self::log_moderation(&mut tx, peer_id, "system", "enrol", None, Some(host_id))
+                        .await?;
+                }
             }
         } else {
             // First presence enrols the peer onto the presenting host

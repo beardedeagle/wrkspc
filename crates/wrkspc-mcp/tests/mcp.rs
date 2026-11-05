@@ -135,9 +135,14 @@ async fn post_message_accepts_and_replays_idempotently() {
     );
 }
 
-/// With no explicit recipients, the post defaults to the conversation's other members.
+/// With no explicit recipients, the post wakes nobody.
+///
+/// Fan-out by default turned four agents in one room into a broadcast storm:
+/// every reply woke every peer, every peer replied, and nothing terminated.
+/// A harness post names its recipients explicitly; unaddressed posts are
+/// room-visible and dispatch nothing.
 #[tokio::test]
-async fn post_message_defaults_recipients_to_other_members() {
+async fn post_message_without_recipients_wakes_nobody() {
     let (store, operator, _agent, conversation, server) = seeded().await;
     let client = connect(server).await;
 
@@ -146,8 +151,8 @@ async fn post_message_defaults_recipients_to_other_members() {
         "post-message",
         serde_json::json!({
             "conversation_id": conversation,
-            "idempotency_key": "key-2",
-            "content": "with execution",
+            "idempotency_key": "key-unaddressed",
+            "content": "into the room, addressed to nobody",
             "execution_requested": true,
         }),
     )
@@ -157,17 +162,10 @@ async fn post_message_defaults_recipients_to_other_members() {
         .expect("accepted prefix")
         .to_string();
 
-    // Default recipients exclude the caller (the agent) and include the
-    // other member (the operator), so the execution intent belongs to the
-    // operator and is claimable from the store.
-    let attempt = store
-        .claim_intent(&message_id, &operator)
-        .await
-        .expect("default recipients must create an intent for the other member");
-    store
-        .mark_terminal(&attempt, AttemptState::Completed, Some("end_turn"), None)
-        .await
-        .unwrap();
+    assert!(
+        store.claim_intent(&message_id, &operator).await.is_err(),
+        "an unaddressed post must not raise an intent for any member"
+    );
 }
 
 /// Posts and reads outside the caller's membership are rejected with a clean error result.

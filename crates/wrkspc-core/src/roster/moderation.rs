@@ -227,14 +227,17 @@ impl Store {
         let Some((status,)) = row else {
             return Ok(false);
         };
-        // Only ejected peers may be forgotten; an enrolled peer must be
-        // booted or banned first.
-        if !status_is_ejected(&status) {
-            return Ok(false);
-        }
+        // A cohort entry may be removed whatever its status: the operator's
+        // problem is not ejection, it is not being able to tell the entries
+        // apart. Removal clears the alias too, so the peer returns with its
+        // plain binding name on its next turn.
         let now = chrono::Utc::now().to_rfc3339();
-        sqlx::query("UPDATE peers SET forgotten_at = ? WHERE id = ?")
+        sqlx::query("UPDATE peers SET forgotten_at = ?, alias = NULL WHERE id = ?")
             .bind(&now)
+            .bind(peer_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM presence WHERE peer_id = ?")
             .bind(peer_id)
             .execute(&mut *tx)
             .await?;

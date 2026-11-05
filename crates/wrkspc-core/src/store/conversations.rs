@@ -167,4 +167,95 @@ impl Store {
         tx.commit().await?;
         Ok(())
     }
+
+    /// Deletes a conversation and everything scoped to it.
+    ///
+    /// A room the operator cannot remove is a room they cannot escape: every
+    /// agent that can see it keeps posting into it, and abandoned rooms keep
+    /// waking peers on every poll. Removal is transactional and ordered
+    /// children-first so the foreign keys hold.
+    ///
+    /// # Arguments
+    ///
+    /// * `conversation_id` — the conversation to delete.
+    ///
+    /// # Returns
+    ///
+    /// `true` when a conversation was removed, `false` when it did not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    pub async fn delete_conversation(&self, conversation_id: &str) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        // attempts -> intents -> recipients -> messages -> events/fences/members
+        sqlx::query(
+            "DELETE FROM attempts WHERE intent_id IN
+               (SELECT id FROM execution_intents WHERE message_id IN
+                  (SELECT id FROM messages WHERE conversation_id = ?))",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM execution_intents WHERE message_id IN
+               (SELECT id FROM messages WHERE conversation_id = ?)",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM message_recipients WHERE message_id IN
+               (SELECT id FROM messages WHERE conversation_id = ?)",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        // The outbound ledger points at messages, and guidance / A2A tasks
+        // are scoped by conversation even without a foreign key.
+        sqlx::query(
+            "DELETE FROM hub_outbound WHERE message_id IN
+               (SELECT id FROM messages WHERE conversation_id = ?)",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM guidance WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM delivery_claims WHERE task_id IN
+               (SELECT task_id FROM a2a_tasks WHERE context_id = ?)",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM a2a_tasks WHERE context_id = ?")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM messages WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM events WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM fences WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM conversation_members WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM conversations WHERE id = ?")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(deleted.rows_affected() > 0)
+    }
 }

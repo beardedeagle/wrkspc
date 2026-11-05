@@ -143,3 +143,28 @@ pub(crate) async fn create_conversation(
         .map_err(store_error)?;
     Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
 }
+
+/// `DELETE /api/conversations/{id}` — removes the room and everything scoped
+/// to it. Works on whichever role the operator is driving: the hub deletes the
+/// authoritative copy, a node deletes its mirror.
+///
+/// # Errors
+///
+/// Returns 404 when the conversation does not exist.
+pub(crate) async fn delete_conversation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match state
+        .store
+        .delete_conversation(&id)
+        .await
+        .map_err(store_error)?
+    {
+        true => Ok(Json(json!({ "deleted": id }))),
+        false => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "conversation not found" })),
+        )),
+    }
+}

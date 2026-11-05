@@ -175,19 +175,12 @@ impl McpServer {
         params: Parameters<PostMessageParams>,
     ) -> Result<String, ErrorData> {
         let Parameters(params) = params;
-        let recipients = match params.recipients {
-            Some(explicit) if !explicit.is_empty() => explicit,
-            _ => {
-                // Default: every member except the caller.
-                self.store
-                    .conversation_members(&params.conversation_id)
-                    .await
-                    .map_err(store_error)?
-                    .into_iter()
-                    .filter(|member| member != &self.peer_id)
-                    .collect::<Vec<_>>()
-            }
-        };
+        // Deliveries are opt-in. A harness post names its recipients
+        // explicitly; a post that names nobody is visible in the room and
+        // wakes no one. Fan-out by default turns four agents in one room
+        // into a broadcast storm: every reply wakes every peer, every peer
+        // replies, and nothing terminates.
+        let recipients = params.recipients.unwrap_or_default();
         let recipient_requests = recipients
             .into_iter()
             .map(|peer_id| wrkspc_core::RecipientRequest {

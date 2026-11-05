@@ -239,8 +239,27 @@ where
             )
             .await;
         match record {
-            Ok(wrkspc_core::AcceptOutcome::Accepted { .. })
-            | Ok(wrkspc_core::AcceptOutcome::Replay { .. }) => {}
+            Ok(wrkspc_core::AcceptOutcome::Accepted { message_id })
+            | Ok(wrkspc_core::AcceptOutcome::Replay { message_id }) => {
+                // A mirrored message is not outbound work. Ledger it under its
+                // LOCAL id so `hub_pending_outbound` never re-sends it: the
+                // outbound query selects messages whose sender is enrolled on
+                // this host, and a mirrored row keeps the original sender — so
+                // without this a local peer's own message returns from the hub
+                // and re-qualifies as outbound, looping once per poll tick.
+                //
+                // The id must be the local one. The hub id is only the
+                // idempotency key; `hub_outbound.message_id` references
+                // `messages(id)`, so ledgering the hub id fails the foreign key
+                // and leaves the row eligible — the loop survives, silently.
+                if let Err(error) = store.mark_hub_sent(&message_id).await {
+                    tracing::warn!(
+                        %error,
+                        task_id = %delivery.task_id,
+                        "hub-sent ledger write failed"
+                    );
+                }
+            }
             Err(error) => {
                 tracing::error!(%error, task_id = %delivery.task_id, "local record failed");
                 outcome.failed += 1;
