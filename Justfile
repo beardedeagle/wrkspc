@@ -53,8 +53,20 @@ clippy-release:
 # the `targets` entry in rust-toolchain.toml; the bundled sqlite builds
 # through scripts/zig-cc-shim.sh (plain cargo has no zigbuild's internal
 # cc shim). Clippy only type-checks, so no cross linker is needed.
+# On a native x86_64-linux host (the CI runners) target == host: skip
+# the zig shim and use the system cc. Zig-compiled C objects can carry
+# UBSan runtime references that the host's gcc dylib links (sqlx's proc
+# macros) cannot resolve, so the shim is for genuine cross-compiles only.
 clippy-linux:
-    CC_x86_64_unknown_linux_gnu="{{justfile_directory()}}/scripts/zig-cc-shim.sh" cargo +{{toolchain}} clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+    #!/usr/bin/env bash
+    set -euo pipefail
+    host="$(rustc +{{toolchain}} -vV | grep '^host' | cut -d' ' -f2)"
+    if [[ "$host" == "x86_64-unknown-linux-gnu" ]]; then
+        cargo +{{toolchain}} clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+    else
+        CC_x86_64_unknown_linux_gnu="{{justfile_directory()}}/scripts/zig-cc-shim.sh" \
+            cargo +{{toolchain}} clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+    fi
 
 build:
     cargo +{{toolchain}} build --locked --workspace
