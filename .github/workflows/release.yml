@@ -49,13 +49,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: ./.github/actions/setup-rust
+        with:
+          # Linux legs cross-build: their target's std must be installed
+          # (the toolchain file only self-installs x86_64-unknown-linux-gnu),
+          # and the zig/cargo-zigbuild provisioning in the action covers the
+          # `just release-tarball` zigbuild call.
+          targets: ${{ matrix.target == 'native' && '' || matrix.target }}
       - name: build + tarball
         run: just release-tarball ${{ matrix.target }}
       # v7.0.2
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: wrkspc-${{ matrix.name }}
-          path: dist/wrkspc-*.tar.gz
+          # The per-target checksum fragments ride with the tarballs:
+          # the release job's `just release-checksum` concatenates
+          # SHA256SUMS-*, and fragments that never upload make that
+          # recipe fail (cat of missing files under pipefail).
+          path: |
+            dist/wrkspc-*.tar.gz
+            dist/SHA256SUMS-*
           if-no-files-found: error
 
   release:
@@ -123,5 +135,9 @@ jobs:
       # The version is a maintainer-pushed tag or a workflow_dispatch
       # input (write-access-only), never an untrusted event payload;
       # publish-image.sh still shape-checks it before touching the shell.
+      # GITHUB_TOKEN is not exported by Actions by default; the publish
+      # script requires it for the GHCR login.
       - name: publish image to ghcr
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: just release-image ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
