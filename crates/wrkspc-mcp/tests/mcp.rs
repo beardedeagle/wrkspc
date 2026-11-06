@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use uuid::Uuid;
-use wrkspc_core::{AttemptState, Store};
+use wrkspc_core::Store;
 use wrkspc_mcp::{HttpListener, HttpListenerConfig, McpServer};
 
 /// Minimal MCP client handler for in-process tests.
@@ -157,14 +157,54 @@ async fn post_message_without_recipients_wakes_nobody() {
         }),
     )
     .await;
-    let message_id = text_of(&result)
-        .strip_prefix("accepted ")
-        .expect("accepted prefix")
+    let text = text_of(&result);
+    assert!(
+        text.contains("no deliveries raised"),
+        "the sender must be told that nothing was addressed: {text}"
+    );
+    let message_id = text
+        .trim_start_matches("accepted ")
+        .split(';')
+        .next()
+        .expect("message id")
+        .trim()
         .to_string();
 
     assert!(
         store.claim_intent(&message_id, &operator).await.is_err(),
         "an unaddressed post must not raise an intent for any member"
+    );
+}
+
+/// A post that names its recipient in prose reaches it, and the tool says so.
+/// The reply is the only feedback a harness gets, so silence there meant a
+/// message that looked delivered and woke nobody.
+#[tokio::test]
+async fn post_message_resolves_a_prose_mention_and_reports_it() {
+    // Post as the operator: a peer that names itself wakes nobody, by design.
+    let (store, operator, agent, conversation, _server) = seeded().await;
+    let client = connect(McpServer::new(store.clone(), operator.clone())).await;
+
+    let result = call(
+        &client,
+        "post-message",
+        serde_json::json!({
+            "conversation_id": conversation,
+            "idempotency_key": "key-mention",
+            "content": format!("@{agent} take a look at this"),
+            "execution_requested": true,
+        }),
+    )
+    .await;
+
+    let text = text_of(&result);
+    assert!(
+        text.contains(&format!("delivered to {agent}")),
+        "the resolved recipient must be named in the reply: {text}"
+    );
+    assert!(
+        text.contains("execution starts for"),
+        "a harness recipient must be told execution starts: {text}"
     );
 }
 
@@ -345,7 +385,8 @@ async fn list_peers_returns_the_mirrored_roster() {
             host_id: "node-test-1".to_string(),
             status: "enrolled".to_string(),
             state: "connected".to_string(),
-            updated_at: "2026-10-23T00:00:00Z".to_string(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            enrolled_at: "2026-01-01T00:00:00Z".to_string(),
         }])
         .await
         .unwrap();

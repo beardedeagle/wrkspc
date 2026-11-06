@@ -123,7 +123,9 @@ async fn moderation_surface_renames_boots_forgets_and_audits() {
         .unwrap();
     assert!(peers.iter().all(|p| p["peer_id"] != "codex"));
 
-    // Forget is ejected-only: an enrolled peer is refused, unknown 404s.
+    // Deleting works on an enrolled peer: the operator's complaint was not
+    // being able to remove an entry at all, whatever its status. Unknown
+    // peers still 404.
     ui.store
         .upsert_roster_presence("claude", "claude", "harness", "node-test-1", "connected")
         .await
@@ -134,7 +136,11 @@ async fn moderation_surface_renames_boots_forgets_and_audits() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(res.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(
+        ui.store.roster_entry("claude").await.unwrap().is_none(),
+        "the entry is gone after delete"
+    );
     let res = client
         .delete(url("/api/peers/ghost"))
         .bearer_auth(TOKEN)
@@ -158,7 +164,7 @@ async fn moderation_surface_renames_boots_forgets_and_audits() {
         .filter(|e| e["peer_id"] == "codex")
         .map(|e| e["action"].as_str().unwrap())
         .collect();
-    assert_eq!(agent_actions, ["forget", "boot", "alias", "enrol"]);
+    assert_eq!(agent_actions, ["forget", "boot", "alias", "enroll"]);
     assert_eq!(
         log.iter().find(|e| e["action"] == "forget").unwrap()["actor"],
         "operator"

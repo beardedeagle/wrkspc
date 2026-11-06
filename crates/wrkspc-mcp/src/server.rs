@@ -159,6 +159,58 @@ fn store_error(error: StoreError) -> ErrorData {
     ErrorData::invalid_request(error.to_string(), None)
 }
 
+/// Describes who an accepted post actually reached.
+///
+/// A post that wakes nobody used to answer with a bare `accepted <id>`, so a
+/// harness that addressed a peer in prose saw success while the room stayed
+/// silent. The summary names the recipients, says plainly when there are none,
+/// and separates the peers that will take a harness turn from those that never
+/// will.
+///
+/// # Arguments
+///
+/// * `store` — the node's store, read for peer classes.
+/// * `verb` — `accepted` or `replay`.
+/// * `message_id` — the committed message.
+/// * `delivered` — the peers the message was delivered to.
+/// * `execution_requested` — whether the caller asked for execution.
+async fn routing_summary(
+    store: &wrkspc_core::Store,
+    verb: &str,
+    message_id: &str,
+    delivered: &[String],
+    execution_requested: bool,
+) -> Result<String, ErrorData> {
+    if delivered.is_empty() {
+        return Ok(format!(
+            "{verb} {message_id}; no deliveries raised — nobody was addressed. \
+             Pass the recipients parameter or write @peer in the text."
+        ));
+    }
+    let mut summary = format!("{verb} {message_id}; delivered to {}", delivered.join(", "));
+    if execution_requested {
+        let mut harness: Vec<String> = Vec::new();
+        let mut other: Vec<String> = Vec::new();
+        for peer in delivered {
+            match store.peer_class_of(peer).await.ok().flatten().as_deref() {
+                Some("harness") => harness.push(peer.clone()),
+                Some(class) => other.push(format!("{peer} ({class})")),
+                None => other.push(peer.clone()),
+            }
+        }
+        if !harness.is_empty() {
+            summary.push_str(&format!("; execution starts for {}", harness.join(", ")));
+        }
+        if !other.is_empty() {
+            summary.push_str(&format!(
+                "; no execution for {} — those peers take no harness turn",
+                other.join(", ")
+            ));
+        }
+    }
+    Ok(summary)
+}
+
 #[tool_router(server_handler)]
 impl McpServer {
     /// Posts a message into a conversation under this peer's identity.
@@ -200,10 +252,23 @@ impl McpServer {
             )
             .await
             .map_err(store_error)?;
-        match outcome {
-            AcceptOutcome::Accepted { message_id } => Ok(format!("accepted {message_id}")),
-            AcceptOutcome::Replay { message_id } => Ok(format!("replay {message_id}")),
-        }
+        let (verb, message_id) = match outcome {
+            AcceptOutcome::Accepted { message_id } => ("accepted", message_id),
+            AcceptOutcome::Replay { message_id } => ("replay", message_id),
+        };
+        let delivered = self
+            .store
+            .message_recipients(&message_id)
+            .await
+            .map_err(store_error)?;
+        routing_summary(
+            &self.store,
+            verb,
+            &message_id,
+            &delivered,
+            params.execution_requested,
+        )
+        .await
     }
 
     /// Reads committed events from a conversation after a cursor.

@@ -47,16 +47,20 @@ impl Store {
                 if status_is_ejected(&status) {
                     return Ok(PresenceOutcome::Ejected { status });
                 }
+                // A deleted cohort entry stays deleted. The node re-reports
+                // its bindings every few seconds, so re-materialising on
+                // presence made delete look broken: the entry came back
+                // immediately. Keep the peer row (messages reference it) but
+                // leave it out of the cohort until the operator restores it.
                 if forgotten_at.is_some() {
-                    sqlx::query(
-                        "UPDATE peers SET forgotten_at = NULL, alias = NULL, name = ? WHERE id = ?",
-                    )
-                    .bind(name)
-                    .bind(peer_id)
-                    .execute(&mut *tx)
-                    .await?;
-                    Self::log_moderation(&mut tx, peer_id, "system", "enrol", None, Some(host_id))
+                    sqlx::query("DELETE FROM roster WHERE peer_id = ?")
+                        .bind(peer_id)
+                        .execute(&mut *tx)
                         .await?;
+                    tx.commit().await?;
+                    return Ok(PresenceOutcome::Ejected {
+                        status: "removed".to_string(),
+                    });
                 }
             }
         } else {
@@ -85,7 +89,7 @@ impl Store {
             .await?;
             // First enrolment is an audit event (system actor — the
             // operator approved the topology, the presence leg enrolled).
-            Self::log_moderation(&mut tx, peer_id, "system", "enrol", None, Some(host_id)).await?;
+            Self::log_moderation(&mut tx, peer_id, "system", "enroll", None, Some(host_id)).await?;
         }
         sqlx::query(
             "INSERT INTO presence (peer_id, state, updated_at)
@@ -136,9 +140,10 @@ impl Store {
     /// Returns [`StoreError::Db`](StoreError::Db) on failure.
     pub async fn roster(&self) -> Result<Vec<RosterEntry>> {
         let rows = sqlx::query(
-            "SELECT peer_id, name, alias, class, host_id, status, state, updated_at
-             FROM roster
-             ORDER BY peer_id",
+            "SELECT r.peer_id, r.name, r.alias, r.class, r.host_id, r.status, r.state,
+                    r.updated_at, p.enrolled_at
+             FROM roster r LEFT JOIN peers p ON p.id = r.peer_id
+             ORDER BY r.peer_id",
         )
         .fetch_all(self.pool())
         .await?;
@@ -160,9 +165,10 @@ impl Store {
     /// Returns [`StoreError::Db`](StoreError::Db) on failure.
     pub async fn roster_entry(&self, peer_id: &str) -> Result<Option<RosterEntry>> {
         let row = sqlx::query(
-            "SELECT peer_id, name, alias, class, host_id, status, state, updated_at
-             FROM roster
-             WHERE peer_id = ?",
+            "SELECT r.peer_id, r.name, r.alias, r.class, r.host_id, r.status, r.state,
+                    r.updated_at, p.enrolled_at
+             FROM roster r LEFT JOIN peers p ON p.id = r.peer_id
+             WHERE r.peer_id = ?",
         )
         .bind(peer_id)
         .fetch_optional(self.pool())

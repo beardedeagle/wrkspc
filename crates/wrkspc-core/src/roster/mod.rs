@@ -61,6 +61,10 @@ pub struct RosterEntry {
     pub state: String,
     /// When the row last changed (RFC 3339).
     pub updated_at: String,
+    /// When the peer was enrolled — how long this entry has existed
+    /// (RFC 3339). Joined from `peers`, which owns the value; the roster
+    /// mirror never duplicates it.
+    pub enrolled_at: String,
 }
 
 /// The operator-moderated hub lifecycle of a peer.
@@ -155,16 +159,53 @@ pub enum PresenceOutcome {
     Ejected { status: String },
 }
 
-/// Maps a roster query row onto its struct.
+/// How long a presence report stays authoritative, in seconds.
+///
+/// The node reports every five seconds, so a report older than this means the
+/// peer stopped reporting — it is not connected, whatever its last message
+/// said. Without this every peer that ever ran stays green forever and the
+/// cohort fills with entries that look live but are long gone.
+const PRESENCE_STALE_SECS: i64 = 30;
+
+/// Maps a roster query row onto its struct, ageing the state.
 pub(crate) fn roster_entry(row: sqlx::sqlite::SqliteRow) -> RosterEntry {
+    let updated_at: String = row.get("updated_at");
+    let class: String = row.get("class");
     RosterEntry {
         peer_id: row.get("peer_id"),
         name: row.get("name"),
         alias: row.get("alias"),
-        class: row.get("class"),
+        class: class.clone(),
         host_id: row.get("host_id"),
         status: row.get("status"),
-        state: row.get("state"),
-        updated_at: row.get("updated_at"),
+        // The operator is the human at this console, not a reporting harness:
+        // it never uploads presence, so ageing must not grey it out.
+        enrolled_at: row
+            .try_get::<Option<String>, _>("enrolled_at")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        state: if class == "human" {
+            row.get("state")
+        } else {
+            fresh_state(row.get("state"), &updated_at)
+        },
+        updated_at,
+    }
+}
+
+/// Ages a reported state: a report older than [`PRESENCE_STALE_SECS`] reads
+/// as disconnected even if its last report said connected.
+fn fresh_state(state: String, updated_at: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(updated_at) {
+        Ok(at) => {
+            let age = chrono::Utc::now().signed_duration_since(at.with_timezone(&chrono::Utc));
+            if age.num_seconds() > PRESENCE_STALE_SECS {
+                "disconnected".to_string()
+            } else {
+                state
+            }
+        }
+        Err(_) => state,
     }
 }

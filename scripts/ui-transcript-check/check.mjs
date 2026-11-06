@@ -495,11 +495,21 @@ async function runPeerModerationScenario() {
       WATCH_MS,
       "the booted badge to render",
     );
-    // The audit feed stamps the row.
+    // The audit feed shows as a bare duration in the row counter, with the
+    // action itself kept in the tooltip rather than printed on the row.
     const stamp = await page.evaluate(
-      "(() => { const row = [...document.querySelectorAll('#peer-list .peer-row')].find((r) => r.querySelector('.peer-name').textContent === 'codex'); return row?.querySelector('.mod-stamp')?.textContent ?? ''; })()",
+      "(() => { const row = [...document.querySelectorAll('#peer-list .peer-row')].find((r) => r.querySelector('.peer-name').textContent === 'codex'); const c = row?.querySelector('.peer-counter'); return JSON.stringify({ text: c?.textContent ?? '', title: c?.title ?? '' }); })()",
     );
-    if (!stamp.startsWith("boot ")) failures.push(`moderation stamp after boot: got ${JSON.stringify(stamp)}`);
+    const counter = JSON.parse(stamp);
+    if (!/^(\d+d \d+h \d{2}m \d{2}s|\d+h \d{2}m \d{2}s|\d+m \d{2}s|—)$/.test(counter.text)) {
+      failures.push(`row counter after boot: got ${JSON.stringify(counter.text)}`);
+    }
+    if (!counter.title.includes("boot")) {
+      failures.push(`row counter tooltip must name the action: got ${JSON.stringify(counter.title)}`);
+    }
+    if (/\bago\b/.test(counter.text) || /enrol\b/.test(counter.text)) {
+      failures.push(`row counter must carry no words: got ${JSON.stringify(counter.text)}`);
+    }
 
     // Restore (ejected row: rename, restore, forget).
     if (!(await codexBtn(1))) failures.push("restore button not found");
@@ -544,8 +554,15 @@ async function runPeerModerationScenario() {
       "the ejected row to return",
     );
 
-    // Forget (ejected row: rename, restore, forget).
+    // Forget (ejected row: rename, restore, forget). Deleting is a two-click
+    // confirm: the first click arms the button, the second commits the DELETE,
+    // because a suppressed window.confirm used to make one click look dead.
     if (!(await codexBtn(2))) failures.push("forget button not found");
+    const armed = await page.evaluate(
+      `(() => { const row = [...document.querySelectorAll('#peer-list .peer-row')].find((r) => r.querySelector('.peer-name').textContent === 'codex'); return row?.querySelectorAll('.peer-btn')[2]?.textContent === '✓'; })()`,
+    );
+    if (!armed) failures.push("the delete button did not arm on the first click");
+    await codexBtn(2);
     const del = await waitFor(
       async () => (await stats()).last_delete?.path ? (await stats()).last_delete : null,
       WATCH_MS,

@@ -51,6 +51,13 @@ pub(crate) async fn delivery_claim(
                         &serde_json::json!({
                             "task_id": body.task_id,
                             "host": host,
+                            // Which peer's delivery this is. Every agent on a
+                            // host presents the same client certificate, so the
+                            // host alone cannot say whose mail was consumed.
+                            "recipient_peer": payload["metadata"]["delivery"]
+                                ["recipient_peer"]
+                                .as_str()
+                                .unwrap_or_default(),
                         }),
                     )
                     .await;

@@ -91,9 +91,17 @@
   aside, #workspace { display: flex; flex-direction: column; }
 
   /* ---- left rail ---- */
-  #conversations { width: 17rem; flex: none; border-right: 1px solid var(--border); background: var(--panel); }
-  #conversations .rail-body { flex: 1; overflow-y: auto; padding: 0.75rem; }
-  .rail-head { padding: 0.75rem 0.75rem 0.5rem; }
+  #conversations { width: 22rem; flex: none; border-right: 1px solid var(--border); background: var(--panel); }
+  /* Two fixed halves: each section owns its vertical space and scrolls on
+     its own, so a long roster can never push the conversation list off the
+     rail and neither list has to fight the other for height. */
+  .rail-slot { flex: 1 1 50%; min-height: 0; display: flex; flex-direction: column; padding: 0 0.75rem 0.5rem; }
+  .rail-slot + .rail-slot { border-top: 1px solid var(--border); }
+  .rail-slot > h2:first-child, .rail-slot > .rail-row:first-child h2 { margin-top: 0.75rem; }
+  .rail-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+  .rail-row { display: flex; align-items: center; gap: 0.5rem; }
+  .rail-row h2 { margin: 0.9rem 0 0.4rem; }
+  .rail-action { margin-left: auto; padding: 0.15rem 0.5rem; font-size: 0.66rem; }
 
   h2 {
     margin: 0.9rem 0 0.4rem;
@@ -105,9 +113,8 @@
   }
   h2:first-child { margin-top: 0; }
   .explain { color: var(--faint); font-size: 0.72rem; margin: 0.2rem 0 0.5rem; line-height: 1.4; }
-  .cohort-tools { display: flex; align-items: center; font-size: 0.72rem; color: var(--faint); margin: 0.2rem 0 0.4rem; }
+  .cohort-tools { display: flex; align-items: center; font-size: 0.72rem; color: var(--faint); margin: 0 0 0 auto; }
   .cohort-tools label { cursor: pointer; display: flex; align-items: center; gap: 0.3rem; }
-  .mod-stamp { color: var(--faint); font-size: 0.7rem; flex: none; }
 
   .convo {
     display: flex; flex-direction: column; gap: 0.1rem;
@@ -124,15 +131,25 @@
   .convo .cid { font-family: ui-monospace, monospace; font-size: 0.72rem; color: var(--faint); }
   .convo .members { font-size: 0.82rem; }
   .convo .when { font-size: 0.72rem; color: var(--muted); }
-  .convo .convo-del { margin-left: auto; padding: 0 6px; color: var(--faint); cursor: pointer; }
+  .convo { position: relative; padding-right: 1.6rem; }
+  .convo .members { white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
+  .convo .convo-del { position: absolute; top: 0.35rem; right: 0.45rem;
+    padding: 0 4px; color: var(--faint); cursor: pointer; }
   .convo .convo-del:hover { color: var(--red, #f85149); }
 
-  .peer-row { display: flex; align-items: center; gap: 0.45rem; margin: 0.25rem 0; font-size: 0.82rem; }
+  .peer-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem 0.45rem;
+    margin: 0.25rem 0; padding-bottom: 0.2rem; font-size: 0.82rem;
+    border-bottom: 1px solid var(--border); }
+  .peer-row .peer-name { flex: 1 1 auto; min-width: 6ch; overflow-wrap: anywhere; }
   .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
   .dot.connected { background: var(--green); box-shadow: 0 0 5px rgba(63, 185, 80, 0.6); }
   .dot.disconnected { background: var(--faint); }
   .dot.unknown { background: var(--amber); }
-  .peer-row .host { color: var(--faint); font-size: 0.72rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .peer-actions { margin-left: auto; display: flex; align-items: center; gap: 0.1rem; flex: none; }
+  .peer-meta { flex: 1 1 100%; display: flex; align-items: center; gap: 0.45rem; min-width: 0; }
+  .peer-row .host { min-width: 0; color: var(--faint);
+    font-size: 0.7rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .peer-counter { color: var(--faint); font-size: 0.68rem; white-space: nowrap; flex: none; }
   .peer-status { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; padding: 0.02rem 0.32rem; border-radius: 8px; flex: none; }
   .peer-status.booted { color: var(--amber); border: 1px solid var(--amber); }
   .peer-status.banned { color: var(--red); border: 1px solid var(--red); }
@@ -364,16 +381,20 @@
   </div>
 </div>
 <aside id="conversations">
-  <div class="rail-head"><h2 style="margin:0">conversations</h2></div>
-  <div class="rail-body">
-    <div id="convo-list"></div>
-    <h2>cohort</h2>
-    <div class="cohort-tools"><label><input type="checkbox" id="hide-ejected"> hide ejected</label></div>
-    <div id="peer-list"></div>
-    <h2>new room</h2>
-    <p class="explain">pick from the roster — no typing ids unless you want someone not listed.</p>
-    <div style="text-align:center"><button id="new-convo-open" class="primary">New Room</button></div>
-  </div>
+  <section class="rail-slot">
+    <div class="rail-row">
+      <h2>cohort</h2>
+      <label class="cohort-tools"><input type="checkbox" id="hide-ejected"> hide ejected</label>
+    </div>
+    <div id="peer-list" class="rail-scroll"></div>
+  </section>
+  <section class="rail-slot">
+    <div class="rail-row">
+      <h2>conversations</h2>
+      <button id="new-convo-open" class="primary rail-action">New Room</button>
+    </div>
+    <div id="convo-list" class="rail-scroll"></div>
+  </section>
 </aside>
 <section id="workspace">
   <div class="topbar">
@@ -475,6 +496,60 @@ const badge = (text, cls) => {
   s.textContent = text;
   return s;
 };
+
+// A duration with no words: hours and seconds, nothing else. The cohort row
+// shows two of these side by side, so "enrol 20h ago · 1s ago" becomes "20h 1s".
+function span(updatedAt) {
+  if (!updatedAt) return null;
+  const seconds = Math.max(0, Math.round((Date.now() - Date.parse(updatedAt)) / 1000));
+  if (seconds < 60) return seconds + "s";
+  if (seconds < 3600) return Math.round(seconds / 60) + "m";
+  if (seconds < 86400) return Math.round(seconds / 3600) + "h";
+  return Math.round(seconds / 86400) + "d";
+}
+
+// How long an entry has existed, with every unit that matters: days and hours,
+// or hours and minutes, or minutes. It is measured from enrolment, so it only
+// ever grows — the earlier version measured presence, which reset every five
+// seconds and read as a clock running backwards.
+function elapsed(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const total = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  if (days > 0) return days + "d " + hours + "h " + pad(minutes) + "m " + pad(seconds) + "s";
+  if (hours > 0) return hours + "h " + pad(minutes) + "m " + pad(seconds) + "s";
+  return minutes + "m " + pad(seconds) + "s";
+}
+
+// Ticks the counters every second without re-rendering the roster: a full
+// render rides the five-second presence poll, so seconds would otherwise
+// advance in fives. Each counter carries the enrolment stamp it measures.
+function startCounterTicker() {
+  setInterval(() => {
+    for (const node of document.querySelectorAll(".peer-counter[data-enrolled]")) {
+      node.textContent = elapsed(node.dataset.enrolled);
+    }
+  }, 1000);
+}
+
+// The absolute time of a report, in the operator's own clock. A relative age
+// recomputed on every render bounced between 0s and the poll interval, which
+// reads as a clock running backwards. A timestamp only ever moves forward.
+function clock(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const pad = (n) => String(n).padStart(2, "0");
+  const hms = pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+  if (d.toDateString() === new Date().toDateString()) return hms;
+  return d.toLocaleString(undefined, { month: "short" }) + " " + d.getDate() + " " + hms;
+}
 
 function age(updatedAt) {
   if (!updatedAt) return "—";
@@ -595,13 +670,18 @@ async function loadPeers() {
       host.className = "host";
       host.title = p.host_id || "";
       host.textContent = (p.host_id || "").replace(/\.mtls\.devlocal\.home\.arpa$/, "");
-      row.appendChild(dot); row.appendChild(name); row.appendChild(host);
+      row.appendChild(dot); row.appendChild(name);
       if ((p.status || "enrolled") !== "enrolled") {
         const badge = document.createElement("span");
         badge.className = "peer-status " + p.status;
         badge.textContent = p.status;
         row.appendChild(badge);
       }
+      // Every control pins to the right edge of the column, so the name keeps
+      // the left of the row to itself however many buttons a row carries.
+      const actions = document.createElement("div");
+      actions.className = "peer-actions";
+      row.appendChild(actions);
       if (p.peer_id !== "operator") {
         const rename = peerBtn("✎", "rename", () => {
           editingPeer = p.peer_id;
@@ -628,39 +708,67 @@ async function loadPeers() {
           });
           input.addEventListener("blur", () => { if (!done) commit(); });
         });
-        row.appendChild(rename);
+        actions.appendChild(rename);
         if ((p.status || "enrolled") === "enrolled") {
-          row.appendChild(peerBtn("⊘", "boot (eject from the hub)", () =>
+          actions.appendChild(peerBtn("⊘", "boot (eject from the hub)", () =>
             setPeerStatus(p.peer_id, "booted", "boot " + (p.alias || p.peer_id) + " from the hub? their node stays enrolled-named but can't participate.")));
-          row.appendChild(peerBtn("⛔", "ban (eject + revoke certificate)", () =>
+          actions.appendChild(peerBtn("⛔", "ban (eject + revoke certificate)", () =>
             setPeerStatus(p.peer_id, "banned", "ban " + (p.alias || p.peer_id) + "? their certificate is revoked and they cannot reconnect.")));
         } else {
-          row.appendChild(peerBtn("↺", "restore to enrolled", () =>
+          actions.appendChild(peerBtn("↺", "restore to enrolled", () =>
             setPeerStatus(p.peer_id, "enrolled", "restore " + (p.alias || p.peer_id) + " to enrolled?")));
         }
         {
-          row.appendChild(peerBtn("✕", p.status === "enrolled" ? "delete from the cohort" : "forget (remove from the cohort)", () => {
-            if (!window.confirm("delete " + (p.alias || p.peer_id) + " from the cohort? it disappears now and comes back with its plain name the next time it runs. message history and the audit trail are kept.")) return;
+          // Two-click confirm: a blocked window.confirm returns false silently
+          // and the click looks dead.
+          let armed = false, armTimer = null;
+          const del = peerBtn("✕", "delete from the cohort (click again to confirm)", () => {
+            if (!armed) {
+              armed = true;
+              del.textContent = "✓";
+              del.title = "click again to delete " + (p.alias || p.peer_id);
+              armTimer = setTimeout(() => { armed = false; del.textContent = "✕"; del.title = "delete from the cohort (click again to confirm)"; }, 4000);
+              return;
+            }
+            clearTimeout(armTimer);
+            del.disabled = true;
             (async () => {
               try { await api("/api/peers/" + encodeURIComponent(p.peer_id), { method: "DELETE" }); }
-              catch { /* the next poll surfaces the error */ }
+              catch { del.title = "delete failed"; del.disabled = false; del.textContent = "✕"; return; }
               await refreshCohort();
             })();
-          }));
+          });
+          actions.appendChild(del);
         }
       }
       const lastMod = moderationCache.find((e) => e.peer_id === p.peer_id);
-      if (lastMod) {
-        const stamp = document.createElement("span");
-        stamp.className = "mod-stamp";
-        stamp.textContent = lastMod.action + " " + age(lastMod.at);
-        stamp.title = "last moderation action";
-        row.appendChild(stamp);
-      }
-      const when = document.createElement("span");
-      when.style.cssText = "margin-left:auto;color:var(--faint);font-size:0.7rem;flex:none;";
-      when.textContent = age(p.updated_at);
-      row.appendChild(when);
+      const meta = document.createElement("div");
+      meta.className = "peer-meta";
+      meta.appendChild(host);
+      const counter = document.createElement("span");
+      counter.className = "peer-counter";
+      // One number: how long since this peer last reported. Pairing it with
+      // the cohort-action age produced lines like "20h · 16h" and "20h · 2s" —
+      // two different clocks on one line read as a broken single duration. The
+      // action stays in the tooltip, where it cannot be misread.
+      // The operator is this console, not a reporting peer: a last-seen timer
+      // on it would only climb forever.
+      const isHuman = (p.class || "") === "human";
+      // How long this entry has been in the cohort, which is what the row is
+      // for. Presence and the last action stay in the tooltip.
+      counter.textContent = isHuman ? "—" : elapsed(p.enrolled_at);
+      if (!isHuman && p.enrolled_at) counter.dataset.enrolled = p.enrolled_at;
+      counter.title = isHuman
+        ? "you, at this console"
+        : [
+            "in the cohort since " + clock(p.enrolled_at),
+            "last presence " + clock(p.updated_at),
+            lastMod ? "last cohort action: " + lastMod.action + " " + age(lastMod.at) : null,
+          ]
+            .filter(Boolean)
+            .join(" · ");
+      meta.appendChild(counter);
+      row.appendChild(meta);
       list.appendChild(row);
     }
   });
@@ -1324,6 +1432,7 @@ async function connectWith(value) {
 
 async function startApp() {
   el("boot").classList.add("connecting");
+  startCounterTicker();
   await loadConversations();
   await loadModeration();
   await loadPeers();

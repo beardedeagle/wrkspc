@@ -133,9 +133,9 @@ async fn moderation_audit_logs_every_transition() {
     let log = store.moderation_log(100).await.unwrap();
     // Newest first: restore, ban, boot, alias, enrol.
     let actions: Vec<&str> = log.iter().map(|e| e.action.as_str()).collect();
-    assert_eq!(actions, ["restore", "ban", "boot", "alias", "enrol"]);
+    assert_eq!(actions, ["restore", "ban", "boot", "alias", "enroll"]);
 
-    let enrol = log.iter().find(|e| e.action == "enrol").unwrap();
+    let enrol = log.iter().find(|e| e.action == "enroll").unwrap();
     assert_eq!(enrol.actor, "system");
     assert_eq!(enrol.after.as_deref(), Some(PILOT_HOST_ID));
 

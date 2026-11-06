@@ -365,3 +365,155 @@ async fn delete_conversation_removes_room_and_its_rows() {
         "membership is gone"
     );
 }
+
+/// Builds a room with a human operator, a harness peer, and a native peer,
+/// each with a single-token name so prose mentions are unambiguous.
+async fn room(store: &Store) -> (String, String, String, String) {
+    let operator = format!("human-{}", Uuid::new_v4());
+    store
+        .ensure_peer(&operator, "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("kestrel", "kestrel", "a2a_native")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&[&operator, "codex", "kestrel"])
+        .await
+        .unwrap();
+    (
+        operator,
+        "codex".to_string(),
+        "kestrel".to_string(),
+        conversation,
+    )
+}
+
+/// A harness post that only names its recipient in prose still reaches it.
+/// Deliveries are opt-in, so before this a ping by name woke nobody while the
+/// sender was told the post was accepted.
+#[tokio::test]
+async fn mentions_in_prose_deliver_to_the_named_member() {
+    let store = Store::open_in_memory("mention").await.unwrap();
+    let (operator, codex, kestrel, conversation) = room(&store).await;
+
+    let outcome = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &key(),
+            "@kestrel please review, and @codex-2 is not in this room",
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
+    let message_id = match outcome {
+        AcceptOutcome::Accepted { message_id } | AcceptOutcome::Replay { message_id } => message_id,
+    };
+
+    let delivered = store.message_recipients(&message_id).await.unwrap();
+    assert_eq!(
+        delivered,
+        vec![kestrel],
+        "only the member named in the text is woken"
+    );
+    assert!(!delivered.contains(&codex));
+}
+
+/// Mention resolution is not fan-out: a post that names nobody still wakes
+/// nobody, which is what keeps a busy room from turning into a broadcast.
+#[tokio::test]
+async fn a_post_that_names_nobody_wakes_nobody() {
+    let store = Store::open_in_memory("nobody").await.unwrap();
+    let (operator, _, _, conversation) = room(&store).await;
+
+    let outcome = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &key(),
+            "status update with no addressee",
+            true,
+            &[],
+        )
+        .await
+        .unwrap();
+    let message_id = match outcome {
+        AcceptOutcome::Accepted { message_id } | AcceptOutcome::Replay { message_id } => message_id,
+    };
+
+    assert!(
+        store
+            .message_recipients(&message_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "no recipients, no deliveries"
+    );
+}
+
+/// A peer renamed with an alias stays addressable under the name the room
+/// already knows, so an identity change does not orphan the thread.
+#[tokio::test]
+async fn an_alias_keeps_a_renamed_peer_addressable() {
+    let store = Store::open_in_memory("alias").await.unwrap();
+    let (operator, _, _, conversation) = room(&store).await;
+    store
+        .set_peer_alias("codex", Some("codex-veritas-plugins"), "operator")
+        .await
+        .unwrap();
+
+    let outcome = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &key(),
+            "@codex-veritas-plugins status?",
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
+    let message_id = match outcome {
+        AcceptOutcome::Accepted { message_id } | AcceptOutcome::Replay { message_id } => message_id,
+    };
+
+    assert_eq!(
+        store.message_recipients(&message_id).await.unwrap(),
+        vec!["codex".to_string()],
+        "the alias resolves to the live peer"
+    );
+}
+
+/// The operator reads the room in the UI and has no claim loop, so addressing
+/// it must not create a delivery that can never be acked.
+#[tokio::test]
+async fn the_operator_takes_no_delivery() {
+    let store = Store::open_in_memory("human").await.unwrap();
+    let (operator, codex, _, conversation) = room(&store).await;
+
+    let outcome = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &key(),
+            "@operator and @codex, looks good",
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
+    let message_id = match outcome {
+        AcceptOutcome::Accepted { message_id } | AcceptOutcome::Replay { message_id } => message_id,
+    };
+
+    let delivered = store.message_recipients(&message_id).await.unwrap();
+    assert_eq!(delivered, vec![codex]);
+    assert!(!delivered.contains(&operator));
+}

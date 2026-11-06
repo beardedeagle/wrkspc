@@ -89,7 +89,8 @@ async fn roster_mirror_replaces_fully() {
             host_id: "node-test-1".to_string(),
             status: "booted".to_string(),
             state: "connected".to_string(),
-            updated_at: "2026-10-23T00:00:00Z".to_string(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            enrolled_at: "2026-01-01T00:00:00Z".to_string(),
         },
         wrkspc_core::RosterEntry {
             peer_id: "operator".to_string(),
@@ -99,11 +100,26 @@ async fn roster_mirror_replaces_fully() {
             host_id: wrkspc_core::PILOT_HOST_ID.to_string(),
             status: "enrolled".to_string(),
             state: "connected".to_string(),
-            updated_at: "2026-10-23T00:00:00Z".to_string(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            enrolled_at: "2026-01-01T00:00:00Z".to_string(),
         },
     ];
     store.replace_roster(&entries).await.unwrap();
-    assert_eq!(store.roster().await.unwrap(), entries);
+    // The mirror stores presence only; the enrolment stamp is joined from
+    // `peers`, so these unenrolled test ids read back empty.
+    let read_back = store.roster().await.unwrap();
+    assert_eq!(read_back.len(), entries.len());
+    for (row, want) in read_back.iter().zip(&entries) {
+        assert_eq!(row.peer_id, want.peer_id);
+        assert_eq!(row.name, want.name);
+        assert_eq!(row.alias, want.alias);
+        assert_eq!(row.status, want.status);
+        assert_eq!(row.state, want.state);
+        assert!(
+            row.enrolled_at.is_empty(),
+            "no peers row, no enrolment stamp"
+        );
+    }
     // A smaller mirror fully replaces — nothing lingers.
     store.replace_roster(&entries[..1]).await.unwrap();
     let roster = store.roster().await.unwrap();
@@ -146,16 +162,59 @@ async fn deleted_cohort_entry_returns_clean_on_next_presence() {
         "the entry disappears from the cohort immediately"
     );
 
-    // Its next turn re-enrols it, with no alias carried over.
-    store
+    // Its next presence must NOT bring it back: the node re-reports its
+    // bindings every few seconds, so re-materialising made delete look broken.
+    let outcome = store
         .upsert_roster_presence("claude-1", "claude", "harness", "node-test-1", "connected")
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, wrkspc_core::PresenceOutcome::Ejected { .. }),
+        "a removed entry stays removed while the peer keeps reporting"
+    );
+    assert!(
+        store.roster_entry("claude-1").await.unwrap().is_none(),
+        "the cohort entry must not come back on its own"
+    );
+
+    // The operator's restore is the only way back, and it returns the peer
+    // with its plain binding name and no stale alias.
+    store
+        .set_peer_status("claude-1", wrkspc_core::PeerStatus::Enrolled, "operator")
         .await
         .unwrap();
     let roster = store.roster().await.unwrap();
     let entry = roster
         .iter()
         .find(|row| row.peer_id == "claude-1")
-        .expect("the peer re-enrols on its next presence");
+        .expect("restore re-materialises the entry");
     assert_eq!(entry.alias, None, "the stale alias must not come back");
     assert_eq!(entry.name, "claude", "the plain binding name is restored");
+}
+
+/// A peer that stopped reporting reads as disconnected, however green its last
+/// report was. Without ageing, every peer that ever ran stays live-looking
+/// forever and the cohort fills with entries nobody can account for.
+#[tokio::test]
+async fn stale_presence_reads_as_disconnected() {
+    let store = Store::open_in_memory("stale-presence").await.unwrap();
+    store
+        .replace_roster(&[wrkspc_core::RosterEntry {
+            peer_id: "codex".to_string(),
+            name: "codex".to_string(),
+            alias: None,
+            class: "harness".to_string(),
+            host_id: "node-test-1".to_string(),
+            status: "enrolled".to_string(),
+            state: "connected".to_string(),
+            updated_at: "2020-01-01T00:00:00Z".to_string(),
+            enrolled_at: "2026-01-01T00:00:00Z".to_string(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.roster().await.unwrap()[0].state,
+        "disconnected",
+        "a report from years ago is not a live peer"
+    );
 }

@@ -17,6 +17,7 @@ axum = "0.8"
 wrkspc-core = { path = "../wrkspc-core" }
 
 [dev-dependencies]
+chrono.workspace = true
 tokio.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 rmcp = { workspace = true, features = ["client"] }

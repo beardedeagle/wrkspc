@@ -6,7 +6,8 @@ use super::Store;
 use crate::error::{Result, StoreError};
 use crate::model::DeliveryState;
 use chrono::Utc;
-use sqlx::Row;
+use sqlx::Transaction;
+use sqlx::{Row, Sqlite};
 use uuid::Uuid;
 
 impl Store {
@@ -32,6 +33,22 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin().await?;
 
+        // Resolve who this post actually wakes before anything is written: the
+        // caller may have named its recipients, or it may only have written
+        // `@name` in prose. Both branches below use the same set, so a replay
+        // cannot quietly change the routing.
+        let recipients = self
+            .resolve_recipients(
+                &mut tx,
+                conversation_id,
+                sender_id,
+                content,
+                execution_requested,
+                recipients,
+            )
+            .await?;
+        let recipients = recipients.as_slice();
+
         // Idempotency: same key + same content = replay, same key + different
         // content = conflict.
         if let Some(row) = sqlx::query(
@@ -55,8 +72,6 @@ impl Store {
                 self.assert_member(&mut tx, conversation_id, sender_id)
                     .await?;
                 for recipient in recipients {
-                    self.assert_member(&mut tx, conversation_id, &recipient.peer_id)
-                        .await?;
                     sqlx::query(
                         "INSERT OR IGNORE INTO message_recipients
                            (message_id, peer_id, delivery_state)
@@ -93,10 +108,6 @@ impl Store {
 
         self.assert_member(&mut tx, conversation_id, sender_id)
             .await?;
-        for recipient in recipients {
-            self.assert_member(&mut tx, conversation_id, &recipient.peer_id)
-                .await?;
-        }
 
         let message_id = Uuid::new_v4().to_string();
         sqlx::query(
@@ -151,5 +162,239 @@ impl Store {
 
         tx.commit().await?;
         Ok(AcceptOutcome::Accepted { message_id })
+    }
+}
+
+/// A peer class that never polls for deliveries.
+///
+/// The operator reads the room in the UI; it has no claim loop, so a delivery
+/// row for it can never reach a terminal state and sits `stored` forever.
+const HUMAN_CLASS: &str = "human";
+
+/// A conversation member as mention resolution sees it.
+struct Candidate {
+    peer_id: String,
+    alias: Option<String>,
+    name: String,
+}
+
+impl Store {
+    /// Resolves who a post actually wakes.
+    ///
+    /// Explicit recipients win. When a post names none, `@name` tokens in the
+    /// body are resolved against the conversation's members by peer id, alias,
+    /// or display name. A post that names nobody still wakes nobody: this is
+    /// mention resolution, not fan-out, and fan-out is what turned one room
+    /// into a broadcast storm.
+    ///
+    /// Human peers never take a delivery.
+    ///
+    /// # Arguments
+    ///
+    /// * `tx` — the acceptance transaction.
+    /// * `conversation_id` — the room the post lands in.
+    /// * `sender_id` — the author, never a recipient of its own post.
+    /// * `content` — the post body, scanned for `@name` tokens when the caller
+    ///   named no recipients.
+    /// * `execution_requested` — the flag carried onto every resolved
+    ///   recipient.
+    /// * `requested` — the caller's explicit recipients, possibly empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] when an explicit recipient is not a
+    /// conversation member.
+    async fn resolve_recipients(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        conversation_id: &str,
+        sender_id: &str,
+        content: &str,
+        execution_requested: bool,
+        requested: &[RecipientRequest],
+    ) -> Result<Vec<RecipientRequest>> {
+        let candidates = if requested.is_empty() {
+            self.mentioned_members(tx, conversation_id, content)
+                .await?
+                .into_iter()
+                .map(|peer_id| RecipientRequest {
+                    peer_id,
+                    execution_requested,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            requested.to_vec()
+        };
+
+        let mut resolved: Vec<RecipientRequest> = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            // An explicit recipient must be a member; the check stays so a
+            // typo fails loudly instead of silently reaching nobody.
+            self.assert_member(tx, conversation_id, &candidate.peer_id)
+                .await?;
+            if candidate.peer_id == sender_id
+                || resolved.iter().any(|row| row.peer_id == candidate.peer_id)
+            {
+                continue;
+            }
+            if self.peer_class(tx, &candidate.peer_id).await?.as_deref() == Some(HUMAN_CLASS) {
+                continue;
+            }
+            resolved.push(candidate);
+        }
+        Ok(resolved)
+    }
+
+    /// Maps the `@name` tokens in a post onto conversation members.
+    ///
+    /// A token matches a member's peer id, alias, or display name,
+    /// case-insensitively, so a peer renamed with an alias stays addressable
+    /// under the old name.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the membership query fails.
+    async fn mentioned_members(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        conversation_id: &str,
+        content: &str,
+    ) -> Result<Vec<String>> {
+        let names = mentioned_names(content);
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT p.id, p.alias, p.name
+             FROM conversation_members m JOIN peers p ON p.id = m.peer_id
+             WHERE m.conversation_id = ?",
+        )
+        .bind(conversation_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        let members = rows
+            .iter()
+            .map(|row| Candidate {
+                peer_id: row.get("id"),
+                alias: row.get("alias"),
+                name: row.get("name"),
+            })
+            .collect::<Vec<_>>();
+
+        let mut matched: Vec<String> = Vec::new();
+        for name in names {
+            let hit = members.iter().find(|member| {
+                member.peer_id.eq_ignore_ascii_case(&name)
+                    || member
+                        .alias
+                        .as_deref()
+                        .is_some_and(|alias| alias.eq_ignore_ascii_case(&name))
+                    || member.name.eq_ignore_ascii_case(&name)
+            });
+            if let Some(member) = hit
+                && !matched.contains(&member.peer_id)
+            {
+                matched.push(member.peer_id.clone());
+            }
+        }
+        Ok(matched)
+    }
+
+    /// Reads a peer's class inside a transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the query fails.
+    async fn peer_class(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        peer_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT class FROM peers WHERE id = ?")
+                .bind(peer_id)
+                .fetch_optional(&mut **tx)
+                .await?,
+        )
+    }
+
+    /// Lists the peers a message was delivered to.
+    ///
+    /// This is the post-hoc view of routing: the acceptance path resolves
+    /// recipients (including `@name` mentions in prose), and the commit is the
+    /// only record of who that turned out to be.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the query fails.
+    pub async fn message_recipients(&self, message_id: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT peer_id FROM message_recipients WHERE message_id = ? ORDER BY rowid",
+        )
+        .bind(message_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|row| row.get::<String, _>(0)).collect())
+    }
+
+    /// Reads a peer's class.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query fails.
+    pub async fn peer_class_of(&self, peer_id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT class FROM peers WHERE id = ?")
+                .bind(peer_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+}
+
+/// Extracts the `@name` tokens written in a post body.
+///
+/// A token addresses a peer only when nothing alphanumeric precedes the `@`, so
+/// an address such as `user@example.com` is not mistaken for a mention.
+fn mentioned_names(content: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for token in content.split_whitespace() {
+        let Some(at) = token.find('@') else {
+            continue;
+        };
+        let boundary = token[..at].chars().last();
+        if boundary.is_some_and(|c| c.is_alphanumeric()) {
+            continue;
+        }
+        let rest = &token[at + 1..];
+        let name = rest
+            .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_' && c != '.');
+        // A trailing dot belongs to the sentence, never to a peer id.
+        let name = name.trim_end_matches('.');
+        if name.is_empty() || names.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        names.push(name.to_string());
+    }
+    names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mentioned_names;
+
+    /// Mentions are names, not addresses, and duplicates collapse.
+    #[test]
+    fn mentions_are_extracted_from_prose() {
+        assert_eq!(
+            mentioned_names("@codex please review, cc @kestrel."),
+            vec!["codex".to_string(), "kestrel".to_string()]
+        );
+        assert_eq!(
+            mentioned_names("(@codex-2) and @CODEX-2 again"),
+            vec!["codex-2".to_string()]
+        );
+        assert!(mentioned_names("mail me at user@example.com").is_empty());
+        assert!(mentioned_names("nobody is addressed here").is_empty());
     }
 }

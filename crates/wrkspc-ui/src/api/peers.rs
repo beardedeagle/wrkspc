@@ -123,17 +123,18 @@ pub(crate) async fn forget_peer(
             Json(json!({ "error": "the operator peer cannot be forgotten" })),
         ));
     }
-    let entry = state.store.roster_entry(&id).await.map_err(store_error)?;
-    let Some(entry) = entry else {
+    // An entry is deletable whatever its status: refusing an enrolled peer is
+    // what made the ✕ look broken.
+    if state
+        .store
+        .roster_entry(&id)
+        .await
+        .map_err(store_error)?
+        .is_none()
+    {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "unknown peer" })),
-        ));
-    };
-    if !wrkspc_core::status_is_ejected(&entry.status) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "only booted or banned peers can be forgotten" })),
         ));
     }
     let forgotten = state

@@ -200,7 +200,17 @@ async fn claim_is_first_wins_idempotent_and_visible() {
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
     let events = store.events_since(&conversation_id, 0, 100).await.unwrap();
-    assert!(events.iter().any(|event| event.kind == "delivery.claimed"));
+    let claimed = events
+        .iter()
+        .find(|event| event.kind == "delivery.claimed")
+        .expect("claim lands a feed event");
+    // Every agent on a host presents the same client certificate, so the host
+    // in the event cannot say whose mail was consumed. The recipient can.
+    assert!(
+        claimed.payload.get("recipient_peer").is_some(),
+        "the claim event must name the recipient: {}",
+        claimed.payload
+    );
 
     // A second INSTANCE with the same cert (the double-attach
     // shape) gets 409 with the claimant.

@@ -1,7 +1,7 @@
 //! Peer lifecycle moderation: alias, status (boot/ban/restore), forget,
 //! the audit log, and certificate revocation persistence.
 
-use super::{ModerationEvent, PeerStatus, status_is_ejected};
+use super::{ModerationEvent, PeerStatus};
 use crate::Result;
 use crate::error::StoreError;
 use crate::store::Store;
