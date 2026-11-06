@@ -1,0 +1,41 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+    # RUSTSEC-2025-0134 (rustls-pemfile 2.2.0, unmaintained): we call it
+    # directly in the hub/node TLS setup for PEM loading. Stable, tiny,
+    # widely used; the unmaintained flag is a project-lifecycle note,
+    # not a vulnerability. Accepted until a maintained loader replaces
+    # it (candidate: hand-rolled parsing via rustls-pki-types).
+    "RUSTSEC-2025-0134",
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

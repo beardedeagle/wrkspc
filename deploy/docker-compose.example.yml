@@ -1,0 +1,52 @@
+# Example compose for a containerized wrkspc hub.
+#
+# The hub terminates TLS itself — publish only the mTLS surface (8443)
+# to the network. The operator UI stays loopback on the host; reach it
+# over ssh or by exec'ing into the container. Mount your own TLS
+# material in place of ./tls, ./ca, ./ops before `docker compose up`.
+
+services:
+  wrkspc-hub:
+    image: wrkspc-hub:local
+    build: ..
+    # Hardened runtime: no capabilities, no privilege escalation, and a
+    # read-only rootfs — only /data (the database volume) is writable.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    ports:
+      # External TLS port -> the container's A2A/TLS listener (--a2a).
+      - "${HUB_PUBLIC_PORT:-8443}:${HUB_A2A_PORT:-8082}"
+      # Operator UI stays loopback on the host.
+      - "127.0.0.1:${HUB_UI_PORT:-8083}:${HUB_UI_PORT:-8083}"
+    volumes:
+      - hub-data:/data
+      - ./tls:/tls:ro
+      - ./ca:/ca:ro
+      - ./ops:/ops:ro
+    command:
+      - hub
+      - run
+      - --db
+      - /data/wrkspc-hub.db
+      - --a2a
+      - 0.0.0.0:${HUB_A2A_PORT:-8082}
+      - --ui
+      - 0.0.0.0:${HUB_UI_PORT:-8083}
+      - --tls-cert
+      - /tls/server.crt
+      - --tls-key
+      - /tls/server.key
+      - --tls-ca
+      - /ca/ca.pem
+      - --revoke-list
+      - /ops/revoke.txt
+      - --card-url
+      - https://${HUB_FQDN:?set HUB_FQDN to your hub hostname}:${HUB_PUBLIC_PORT:-8443}
+
+volumes:
+  hub-data:

@@ -1,0 +1,15 @@
+# cargo-audit configuration (separate from cargo-deny's deny.toml).
+[advisories]
+# RUSTSEC-2023-0071 (rsa 0.9.10, Marvin timing attack): no patched
+# release exists. cargo audit scans the whole Cargo.lock, where the rsa
+# entry still appears, but it has no reverse deps in the resolved build
+# graph (`cargo tree -i rsa` is empty), so it is unreachable in any
+# artifact. NOTE: cargo-deny checks the resolved graph, not the lockfile,
+# so this ignore is deliberately absent from deny.toml (there it would be
+# an unmatched "advisory-not-detected" warning).
+#
+# RUSTSEC-2025-0134 (rustls-pemfile 2.2.0, unmaintained): called
+# directly in the hub/node TLS setup for PEM loading. Stable, tiny,
+# widely used; the flag is a project-lifecycle note, not a
+# vulnerability. Accepted until a maintained loader replaces it.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2025-0134"]
