@@ -46,15 +46,34 @@ pub async fn stable_token(db: &Path, tag: &str) -> Result<String, String> {
         Ok(token) if !token.trim().is_empty() => Ok(token.trim().to_string()),
         _ => {
             let token = uuid::Uuid::new_v4().to_string();
-            tokio::fs::write(&path, &token)
-                .await
-                .map_err(|e| format!("cannot write token to {}: {e}", path.display()))?;
+            // Mode 0600 AT OPEN: the credential must never exist in a
+            // world-readable state (the write-then-chmod pattern left a
+            // copyable window, and a crash before the chmod left the
+            // file exposed indefinitely).
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            let mut file = {
+                tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&path)
                     .await
-                    .map_err(|e| format!("cannot restrict token file {}: {e}", path.display()))?;
+                    .map_err(|e| format!("cannot open token file {}: {e}", path.display()))?
+            };
+            #[cfg(not(unix))]
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .await
+                .map_err(|e| format!("cannot open token file {}: {e}", path.display()))?;
+            {
+                use tokio::io::AsyncWriteExt;
+                file.write_all(token.as_bytes())
+                    .await
+                    .map_err(|e| format!("cannot write token to {}: {e}", path.display()))?;
             }
             Ok(token)
         }

@@ -194,15 +194,24 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                             };
                             // Remember the presented serial so a later
                             // operator ban can revoke the certificate the
-                            // hub has actually seen (first serial wins).
+                            // hub has actually seen. The connection is
+                            // host-stamped (one cert serves every peer the
+                            // node hosts), so the serial is recorded under
+                            // the host the handshake knows; latest wins so
+                            // short-TTL renewals keep the ban working.
                             if let Some(serial) = certs.first().and_then(cert_serial_hex) {
                                 let store = store_for_serial.clone();
+                                let host_for_serial =
+                                    crate::acceptance::host_from_identity(&identity);
                                 let identity_for_serial = identity.clone();
                                 tokio::spawn(async move {
-                                    if let Err(error) = store
-                                        .record_peer_cert_serial(&identity_for_serial, &serial)
-                                        .await
-                                    {
+                                    let result = match host_for_serial {
+                                        Some(host) => {
+                                            store.record_host_cert_serial(&host, &serial).await
+                                        }
+                                        None => Ok(()),
+                                    };
+                                    if let Err(error) = result {
                                         tracing::warn!(%error, %identity_for_serial, "cert serial recording failed");
                                     }
                                 });

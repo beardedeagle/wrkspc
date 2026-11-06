@@ -25,6 +25,12 @@ pub struct OutboundMessage {
     pub sender_peer: String,
     /// The message content.
     pub content: String,
+    /// Whether the message requested a harness turn.
+    pub execution_requested: bool,
+    /// The locally committed recipients (mention-resolved at acceptance).
+    /// Carried verbatim so the hub does not re-resolve routing; an empty
+    /// list means the post addressed nobody and must wake nobody.
+    pub recipients: Vec<String>,
 }
 
 impl Store {
@@ -48,7 +54,7 @@ impl Store {
     /// Returns [`StoreError::Db`](StoreError::Db) on failure.
     pub async fn hub_pending_outbound(&self, host_id: &str) -> Result<Vec<OutboundMessage>> {
         let rows = sqlx::query(
-            "SELECT m.id, m.conversation_id, m.sender_id, m.content
+            "SELECT m.id, m.conversation_id, m.sender_id, m.content, m.execution_requested
              FROM messages m
              JOIN peers p ON p.id = m.sender_id
              WHERE p.host_id = ?
@@ -58,15 +64,32 @@ impl Store {
         .bind(host_id)
         .fetch_all(self.pool())
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| OutboundMessage {
-                message_id: row.get("id"),
+        let mut messages = Vec::with_capacity(rows.len());
+        for row in rows {
+            let message_id: String = row.get("id");
+            // The committed recipient list is the routing the hub must
+            // preserve: it was resolved once at local acceptance
+            // (explicit recipients, then @mentions; a post that named
+            // nobody committed no rows and wakes nobody at the hub).
+            let recipient_rows = sqlx::query(
+                "SELECT peer_id FROM message_recipients WHERE message_id = ? ORDER BY rowid",
+            )
+            .bind(&message_id)
+            .fetch_all(self.pool())
+            .await?;
+            messages.push(OutboundMessage {
+                message_id,
                 conversation_id: row.get("conversation_id"),
                 sender_peer: row.get("sender_id"),
                 content: row.get("content"),
-            })
-            .collect())
+                execution_requested: row.get("execution_requested"),
+                recipients: recipient_rows
+                    .into_iter()
+                    .map(|r| r.get("peer_id"))
+                    .collect(),
+            });
+        }
+        Ok(messages)
     }
 
     /// Records a message as delivered to the hub. Idempotent: a second

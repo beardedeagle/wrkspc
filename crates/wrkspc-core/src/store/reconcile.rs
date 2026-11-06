@@ -27,22 +27,34 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin().await?;
 
-        let row = sqlx::query("SELECT intent_id, state FROM attempts WHERE id = ?")
-            .bind(attempt_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "attempt",
-                id: attempt_id.to_string(),
-            })?;
+        let row = sqlx::query(
+            "SELECT a.intent_id, a.state, m.conversation_id
+             FROM attempts a
+             JOIN execution_intents ei ON ei.id = a.intent_id
+             JOIN messages m ON m.id = ei.message_id
+             WHERE a.id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "attempt",
+            id: attempt_id.to_string(),
+        })?;
         let intent_id: String = row.get("intent_id");
         let current: String = row.get("state");
+        let conversation_id: String = row.get("conversation_id");
         if current != "unknown" {
             return Err(StoreError::NotFound {
                 entity: "unknown attempt",
                 id: attempt_id.to_string(),
             });
         }
+
+        let decision_label = match &decision {
+            Reconciliation::Retry => "retry".to_string(),
+            Reconciliation::Close { state } => format!("close:{}", state.as_str()),
+        };
 
         match decision {
             Reconciliation::Retry => {
@@ -85,6 +97,21 @@ impl Store {
                     .await?;
             }
         }
+        // The recovery action is committed into the feed in the same
+        // transaction: closing a visible unknown without a record would
+        // leave the resumable history with a gap exactly where the
+        // operator's authority was exercised.
+        self.append_event_in(
+            &mut tx,
+            &conversation_id,
+            "attempt.reconciled",
+            &serde_json::json!({
+                "attempt_id": attempt_id,
+                "decision": decision_label,
+                "by": "operator",
+            }),
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }

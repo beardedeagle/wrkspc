@@ -81,6 +81,26 @@ fn install_is_idempotent_and_refresh_updates_stale_skill() {
     assert_eq!(skill::status(&home, entry("codex")), SkillStatus::Installed);
 }
 
+/// An unreadable pointer file is an error, never an empty file: the
+/// installer must not truncate a user-owned AGENTS.md it could not
+/// read (e.g. invalid UTF-8).
+#[test]
+fn install_refuses_to_truncate_an_unreadable_pointer() {
+    let home = temp_home("codex-unreadable");
+    std::fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let pointer = home.join(".codex/AGENTS.md");
+    let original = b"# My notes\n\nkeep this\xff\xfe\n";
+    std::fs::write(&pointer, original).expect("seed file");
+
+    let error = skill::install(&home, entry("codex")).expect_err("must refuse");
+    assert!(error.to_string().contains("cannot read"), "got: {error}");
+
+    // The user's file is untouched, byte for byte.
+    assert_eq!(std::fs::read(&pointer).expect("read back"), original);
+    // And nothing else was written.
+    assert!(!home.join(".codex/skills/wrkspc/SKILL.md").exists());
+}
+
 /// Uninstall removes the skill and pointer section and restores the original file contents.
 #[test]
 fn uninstall_removes_exactly_what_install_added() {

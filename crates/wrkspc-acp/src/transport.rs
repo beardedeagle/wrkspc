@@ -13,7 +13,7 @@ use crate::error::AcpError;
 use crate::session::SessionEvent;
 use agent_client_protocol::schema::v1::{
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification,
+    SessionNotification,
 };
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo};
 use std::future::Future;
@@ -107,18 +107,24 @@ impl AcpTransport for StdioTransport {
                     agent_client_protocol::on_receive_notification!(),
                 )
                 .on_receive_request(
-                    async move |request: RequestPermissionRequest, responder, _connection| {
-                        // Auto-approve the first option. This is the spike's
-                        // placeholder policy; the moderation unit replaces it
-                        // with enrolment-scoped permission routing.
-                        let option_id = request.options.first().map(|o| o.option_id.clone());
-                        let outcome = match option_id {
-                            Some(id) => RequestPermissionOutcome::Selected(
-                                SelectedPermissionOutcome::new(id),
-                            ),
-                            None => RequestPermissionOutcome::Cancelled,
-                        };
-                        responder.respond(RequestPermissionResponse::new(outcome))
+                    async move |request: RequestPermissionRequest, responder, connection| {
+                        // No permission policy exists yet, and the first
+                        // adapter-controlled option can carry a persistent
+                        // grant — auto-selecting it lets a harness escalate
+                        // itself to always-allow. Conservative default:
+                        // refuse, loudly. Operator-routed permission
+                        // requests are the tracked follow-up; the refusal
+                        // is visible to the harness, which can retry with
+                        // an operator-approved path.
+                        tracing::warn!(
+                            session = %request.session_id,
+                            options = ?request.options.iter().map(|option| &option.option_id).collect::<Vec<_>>(),
+                            "ACP permission request refused (no permission policy configured)"
+                        );
+                        let _ = connection;
+                        responder.respond(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Cancelled,
+                        ))
                     },
                     agent_client_protocol::on_receive_request!(),
                 )

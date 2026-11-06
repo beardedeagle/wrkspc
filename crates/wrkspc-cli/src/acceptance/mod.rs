@@ -202,23 +202,12 @@ pub(crate) async fn accept_translation(
         return response;
     }
 
-    let recipients = match parsed_send.recipients {
-        Some(explicit) if !explicit.is_empty() => explicit,
-        _ => {
-            let Ok(members) = state
-                .store
-                .conversation_members(&parsed_send.conversation_id)
-                .await
-            else {
-                tracing::error!(conversation = %parsed_send.conversation_id, "member lookup failed after acceptance");
-                return response;
-            };
-            members
-                .into_iter()
-                .filter(|member| member != &parsed_send.sender_peer)
-                .collect()
-        }
-    };
+    // Routing is resolved by the store, never guessed here: explicit
+    // recipients win, @mentions in the body fall back in, and a post
+    // that names nobody wakes nobody. Pre-filling "all other members"
+    // here would silently re-broadcast a directed or unaddressed send
+    // (the storm this replaced).
+    let recipients = parsed_send.recipients.unwrap_or_default();
     let recipient_requests: Vec<RecipientRequest> = recipients
         .iter()
         .cloned()
@@ -241,9 +230,17 @@ pub(crate) async fn accept_translation(
         .await
     {
         Ok(AcceptOutcome::Accepted { message_id }) => {
-            // Fan the commit out to every recipient enrolled on a
-            // remote host (core-owned queueing, shared with the hub
-            // UI's operator post).
+            // Fan the commit out to every resolved recipient enrolled on
+            // a remote host (core-owned queueing, shared with the hub
+            // UI's operator post). The committed recipient rows are the
+            // mention-resolved authority; the raw request list is not.
+            let resolved_recipients = match state.store.message_recipients(&message_id).await {
+                Ok(recipients) => recipients,
+                Err(error) => {
+                    tracing::error!(%error, message_id = %message_id, "resolved recipient lookup failed after acceptance");
+                    return response;
+                }
+            };
             if let Err(error) = state
                 .store
                 .queue_remote_deliveries(RemoteFanoutRequest {
@@ -253,7 +250,7 @@ pub(crate) async fn accept_translation(
                     sender_peer: &parsed_send.sender_peer,
                     content: &parsed_send.content,
                     execution_requested: parsed_send.execution_requested,
-                    recipients: &recipients,
+                    recipients: &resolved_recipients,
                 })
                 .await
             {

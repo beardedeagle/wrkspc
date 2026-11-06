@@ -127,6 +127,13 @@ fn parse_selection_rejects_unknown_and_out_of_range() {
             .unwrap_err()
             .contains("out of range")
     );
+    // Zero is out of range: choices number from 1, and an invalid
+    // selection must not silently install into the first harness.
+    assert!(
+        parse_selection("0", &detected)
+            .unwrap_err()
+            .contains("out of range")
+    );
     assert!(
         parse_selection("codex, nope", &detected)
             .unwrap_err()

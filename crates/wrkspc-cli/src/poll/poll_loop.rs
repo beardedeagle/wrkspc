@@ -61,89 +61,110 @@ pub async fn run_poll_loop(
                 continue;
             }
         }
-        let request = a2a::ListTasksRequest {
-            context_id: Some(host_id.clone()),
-            status: None,
-            page_size: None,
-            page_token: None,
-            status_timestamp_after: None,
-            history_length: None,
-            include_artifacts: None,
-            tenant: None,
-        };
-        match a2a.list_tasks(&request).await {
-            Ok(response) => {
-                let rows: Vec<TaskRow> = response
-                    .tasks
-                    .iter()
-                    .map(|task| TaskRow {
-                        task_id: task.id.clone(),
-                        context_id: task.context_id.clone(),
-                        state: wrkspc_a2a::state_mapping::task_state_literal(&task.status.state)
+        let mut tasks: Vec<TaskRow> = Vec::new();
+        let mut page_token = String::new();
+        // The hub pages the queue (50 tasks newest-first by default) and
+        // keeps terminal rows, so a queue deeper than one page must be
+        // walked or older pending deliveries stay unreachable forever.
+        // Walk until the hub stops returning a page token.
+        loop {
+            let request = a2a::ListTasksRequest {
+                context_id: Some(host_id.clone()),
+                status: None,
+                page_size: None,
+                page_token: (!page_token.is_empty()).then(|| page_token.clone()),
+                status_timestamp_after: None,
+                history_length: None,
+                include_artifacts: None,
+                tenant: None,
+            };
+            match a2a.list_tasks(&request).await {
+                Ok(response) => {
+                    let rows: Vec<TaskRow> = response
+                        .tasks
+                        .iter()
+                        .map(|task| TaskRow {
+                            task_id: task.id.clone(),
+                            context_id: task.context_id.clone(),
+                            state: wrkspc_a2a::state_mapping::task_state_literal(
+                                &task.status.state,
+                            )
                             .to_string(),
-                        terminal: task.status.state.is_terminal(),
-                        task_json: serde_json::to_string(task).unwrap_or_default(),
-                        version: 0,
-                        created_at: String::new(),
-                        updated_at: String::new(),
-                    })
-                    .collect();
-                let outcome = process_deliveries(
-                    &store,
-                    &host_id,
-                    &rows,
-                    |task_id| {
-                        let task_id = task_id.to_string();
-                        let client = client.clone();
-                        let claim_url = claim_url.clone();
-                        let instance_id = instance_id.clone();
-                        async move {
-                            client
-                                .post(&claim_url)
-                                .json(&serde_json::json!({
-                                    "taskId": task_id,
-                                    "instanceId": instance_id,
-                                }))
-                                .send()
-                                .await
-                                .is_ok_and(|response| response.status().is_success())
-                        }
-                    },
-                    |task_id| {
-                        let task_id = task_id.to_string();
-                        let client = client.clone();
-                        let ack_url = ack_url.clone();
-                        let instance_id = instance_id.clone();
-                        async move {
-                            client
-                                .post(&ack_url)
-                                .json(&serde_json::json!({
-                                    "taskId": task_id,
-                                    "instanceId": instance_id,
-                                }))
-                                .send()
-                                .await
-                                .is_ok_and(|response| response.status().is_success())
-                        }
-                    },
-                )
-                .await;
-                if outcome.processed > 0 || outcome.failed > 0 {
-                    tracing::info!(
-                        processed = outcome.processed,
-                        failed = outcome.failed,
-                        "hub poll pass",
-                    );
+                            terminal: task.status.state.is_terminal(),
+                            task_json: serde_json::to_string(task).unwrap_or_default(),
+                            version: 0,
+                            created_at: String::new(),
+                            updated_at: String::new(),
+                        })
+                        .collect();
+                    tasks.extend(rows);
+                    if response.next_page_token.is_empty() {
+                        break;
+                    }
+                    page_token = response.next_page_token;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "hub poll failed; retrying");
+                    break;
                 }
             }
-            Err(error) => tracing::warn!(%error, "hub poll failed; retrying"),
+        }
+        if !tasks.is_empty() {
+            let outcome = process_deliveries(
+                &store,
+                &host_id,
+                &tasks,
+                |task_id| {
+                    let task_id = task_id.to_string();
+                    let client = client.clone();
+                    let claim_url = claim_url.clone();
+                    let instance_id = instance_id.clone();
+                    async move {
+                        client
+                            .post(&claim_url)
+                            .json(&serde_json::json!({
+                                "taskId": task_id,
+                                "instanceId": instance_id,
+                            }))
+                            .send()
+                            .await
+                            .is_ok_and(|response| response.status().is_success())
+                    }
+                },
+                |task_id| {
+                    let task_id = task_id.to_string();
+                    let client = client.clone();
+                    let ack_url = ack_url.clone();
+                    let instance_id = instance_id.clone();
+                    async move {
+                        client
+                            .post(&ack_url)
+                            .json(&serde_json::json!({
+                                "taskId": task_id,
+                                "instanceId": instance_id,
+                            }))
+                            .send()
+                            .await
+                            .is_ok_and(|response| response.status().is_success())
+                    }
+                },
+            )
+            .await;
+            if outcome.processed > 0 || outcome.failed > 0 {
+                tracing::info!(
+                    processed = outcome.processed,
+                    failed = outcome.failed,
+                    "hub poll pass",
+                );
+            }
         }
 
         // Node → hub propagation: messages originated by this node's
         // harness peers ride a stamped `message/send` back to the hub,
-        // which fans them out to every other member (operator and the
-        // other host's peers). Idempotent on both ends: the hub dedups
-        // on the message id, the local ledger prevents re-sends.
+        // which fans them out to their committed recipients (routing and
+        // execution intent now travel with the message). Idempotent on
+        // both ends: the hub dedups on the message id, the local ledger
+        // prevents re-sends.
         let _sent = sync_outbound(&a2a, &store, &host_id).await;
 
         // A2A-first discovery (HLD rev0.9): upload this node's peer

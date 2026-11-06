@@ -272,24 +272,33 @@ impl Store {
         Ok(rows)
     }
 
-    /// Records the certificate serial a peer presented on a stamped
-    /// connection. Idempotent; the first serial wins so a ban always
-    /// revokes the identity the hub has seen.
+    /// Records the certificate serial a host presented on a stamped
+    /// connection, onto every peer enrolled on that host. The handshake
+    /// knows only the host identity (one client certificate serves every
+    /// peer a node hosts), so the recording keys on `host_id`; the ban
+    /// path then finds the serial through the banned peer's own row.
+    /// The latest presented serial wins: PKI with short-TTL certs renews
+    /// the leaf, and a ban must revoke the serial the peer presents now,
+    /// not the first one the hub ever saw.
     ///
     /// # Arguments
     ///
-    /// * `peer_id` — the peer the certificate belongs to.
+    /// * `host_id` — the presenting host (the certificate's first SAN).
     /// * `serial` — the lowercase hex certificate serial.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Db`](StoreError::Db) on failure.
-    pub async fn record_peer_cert_serial(&self, peer_id: &str, serial: &str) -> Result<()> {
-        sqlx::query("UPDATE peers SET cert_serial = ? WHERE id = ? AND cert_serial IS NULL")
-            .bind(serial)
-            .bind(peer_id)
-            .execute(self.pool())
-            .await?;
+    pub async fn record_host_cert_serial(&self, host_id: &str, serial: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE peers SET cert_serial = ?
+             WHERE host_id = ? AND cert_serial IS NOT ?",
+        )
+        .bind(serial)
+        .bind(host_id)
+        .bind(serial)
+        .execute(self.pool())
+        .await?;
         Ok(())
     }
 

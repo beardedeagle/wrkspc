@@ -70,6 +70,29 @@ async fn fence_set_ack_clear_lifecycle() {
             .unwrap()
             .is_empty()
     );
+
+    // The clear is committed into the feed: the fence no longer reads
+    // as applied forever, and the release names who performed it.
+    let events = store.events_since(&conversation, 0, 100).await.unwrap();
+    let cleared: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == "fence.cleared")
+        .collect();
+    assert_eq!(cleared.len(), 1, "one fence.cleared event: {events:?}");
+    assert_eq!(cleared[0].payload["fence_id"], fence);
+    assert_eq!(cleared[0].payload["cleared_by"], operator);
+
+    // Clearing again is idempotent and emits no second event.
+    store.clear_fence(&fence, &operator).await.unwrap();
+    let events = store.events_since(&conversation, 0, 100).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "fence.cleared")
+            .count(),
+        1,
+        "re-clearing must not duplicate the event"
+    );
 }
 
 /// A fresh database seeds the pilot host row.

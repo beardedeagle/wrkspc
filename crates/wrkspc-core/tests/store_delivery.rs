@@ -319,8 +319,14 @@ async fn hub_outbound_tracks_only_local_harness_messages() {
         .ensure_peer_on_host("operator", "operator", "human", "hub-real-host")
         .await
         .unwrap();
+    // A second harness peer gives the reply a directed, non-human
+    // recipient to carry routing for.
+    store
+        .ensure_peer_on_host("agy", "agy", "harness", "node-other")
+        .await
+        .unwrap();
     let conversation = store
-        .create_conversation(&["codex", "operator"])
+        .create_conversation(&["codex", "operator", "agy"])
         .await
         .unwrap();
 
@@ -331,10 +337,10 @@ async fn hub_outbound_tracks_only_local_harness_messages() {
             "codex",
             "k-1",
             "harness reply",
-            false,
+            true,
             &[wrkspc_core::RecipientRequest {
-                peer_id: "operator".to_string(),
-                execution_requested: false,
+                peer_id: "agy".to_string(),
+                execution_requested: true,
             }],
         )
         .await
@@ -356,6 +362,14 @@ async fn hub_outbound_tracks_only_local_harness_messages() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].sender_peer, "codex");
     assert_eq!(pending[0].content, "harness reply");
+    // Routing and execution intent survive to the hub leg: a directed
+    // execution request must never degrade into an unaddressed,
+    // non-executing broadcast.
+    assert!(
+        pending[0].execution_requested,
+        "execution request must be carried"
+    );
+    assert_eq!(pending[0].recipients, vec!["agy".to_string()]);
 
     // The ledger is idempotent and clears the pending set.
     store.mark_hub_sent(&pending[0].message_id).await.unwrap();

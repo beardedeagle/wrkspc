@@ -32,10 +32,28 @@ pub(crate) async fn sync_outbound(
     };
     let mut sent = 0;
     for message in pending {
-        let metadata = std::collections::HashMap::from([(
+        let mut metadata = std::collections::HashMap::from([(
             "peerId".to_string(),
             serde_json::Value::String(message.sender_peer.clone()),
         )]);
+        // The node committed routing and execution intent at local
+        // acceptance; both must survive the hop or a directed execution
+        // request silently becomes an unaddressed, non-executing post.
+        metadata.insert(
+            "executionRequested".to_string(),
+            serde_json::Value::Bool(message.execution_requested),
+        );
+        metadata.insert(
+            "recipients".to_string(),
+            serde_json::Value::Array(
+                message
+                    .recipients
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
         let request = a2a::SendMessageRequest {
             message: a2a::Message {
                 message_id: message.message_id.clone(),

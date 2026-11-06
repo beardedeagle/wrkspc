@@ -106,7 +106,7 @@ pub async fn resolve_ui_token(identity: &str, db: &Path) -> Result<String, Strin
     {
         return Ok(token);
     }
-    let account = ui_token_account(identity);
+    let account = token_account(identity, db);
     if let Some(token) =
         bounded_store_op("keychain read", move || platform_store().load(&account)).await?
     {
@@ -119,7 +119,7 @@ pub async fn resolve_ui_token(identity: &str, db: &Path) -> Result<String, Strin
         let token = contents.trim().to_string();
         if !token.is_empty() {
             let stored = token.clone();
-            let account = ui_token_account(identity);
+            let account = token_account(identity, db);
             bounded_store_op("keychain write", move || {
                 platform_store().store(&account, &stored)
             })
@@ -159,12 +159,38 @@ pub async fn resolve_ui_token(identity: &str, db: &Path) -> Result<String, Strin
     }
     let token = uuid::Uuid::new_v4().to_string();
     let stored = token.clone();
-    let account = ui_token_account(identity);
+    let account = token_account(identity, db);
     bounded_store_op("keychain write", move || {
         platform_store().store(&account, &stored)
     })
     .await?;
     Ok(token)
+}
+
+/// The account `resolve_ui_token` reads and writes.
+///
+/// macOS: the Keychain account named for the node (`wrkspc.<node>`).
+/// Non-macOS: the 0600 token file next to the database, keyed by its
+/// CANONICAL path — the same key `wrkspc ui-token` reads. Keying the
+/// node side by another string (the node identity) split the two, and
+/// `wrkspc ui-token` reported no token for a node that just stored one.
+///
+/// # Arguments
+///
+/// * `identity` — the node's stable name (macOS account).
+/// * `db` — the canonical database path (non-macOS file key).
+fn token_account(identity: &str, db: &Path) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = db;
+        ui_token_account(identity)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = identity;
+        let canonical = crate::util::canonical_db_path(db).unwrap_or_else(|_| db.to_path_buf());
+        ui_token_account(&canonical.display().to_string())
+    }
 }
 
 /// The platform-store account key for a node's UI token. macOS: the
@@ -418,12 +444,30 @@ impl TokenStore for FileStore {
 
     fn store(&self, account: &str, token: &str) -> Result<(), String> {
         let path = std::path::PathBuf::from(account);
-        std::fs::write(&path, token).map_err(|error| format!("cannot write {path:?}: {error}"))?;
+        // Mode 0600 at open: the credential must never exist world-
+        // readable, not even between a write and a later chmod.
         #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(|error| format!("cannot open {path:?}: {error}"))?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|error| format!("cannot open {path:?}: {error}"))?;
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|error| format!("cannot restrict {path:?}: {error}"))?;
+            use std::io::Write;
+            file.write_all(token.as_bytes())
+                .map_err(|error| format!("cannot write {path:?}: {error}"))?;
         }
         Ok(())
     }

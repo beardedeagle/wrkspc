@@ -44,7 +44,7 @@ async fn peer_status_transitions_and_ban_records_revocation() {
         .await
         .unwrap();
     store
-        .record_peer_cert_serial("codex", "aa11")
+        .record_host_cert_serial(PILOT_HOST_ID, "aa11")
         .await
         .unwrap();
     // Boot.
@@ -162,7 +162,7 @@ async fn forget_is_soft_hidden_and_preserves_revocations() {
         .await
         .unwrap();
     store
-        .record_peer_cert_serial("codex", "aa11")
+        .record_host_cert_serial(PILOT_HOST_ID, "aa11")
         .await
         .unwrap();
     // Deleting works whatever the peer's status: the operator's problem was
@@ -220,24 +220,36 @@ async fn forget_is_soft_hidden_and_preserves_revocations() {
     assert!(store.cert_revocations().await.unwrap().is_empty());
 }
 
-/// The first presented cert serial wins; later serials are ignored.
+/// The latest presented cert serial wins, so a ban after a short-TTL
+/// renewal revokes the certificate the peer presents NOW.
 #[tokio::test]
-async fn first_presented_serial_wins() {
+async fn latest_presented_serial_wins() {
     let store = Store::open_in_memory("test").await.unwrap();
     store
         .ensure_peer("codex", "codex", "harness")
         .await
         .unwrap();
     store
-        .record_peer_cert_serial("codex", "aa11")
+        .record_host_cert_serial(PILOT_HOST_ID, "aa11")
         .await
         .unwrap();
     store
-        .record_peer_cert_serial("codex", "bb22")
+        .record_host_cert_serial(PILOT_HOST_ID, "bb22")
         .await
         .unwrap();
     assert_eq!(
         store.peer_cert_serial("codex").await.unwrap().as_deref(),
-        Some("aa11")
+        Some("bb22")
+    );
+    // A peer enrolled on the SAME host sees the same serial: the
+    // certificate is per host, and any of its peers' bans must revoke it.
+    store.ensure_peer("agy", "agy", "harness").await.unwrap();
+    store
+        .record_host_cert_serial(PILOT_HOST_ID, "cc33")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.peer_cert_serial("agy").await.unwrap().as_deref(),
+        Some("cc33")
     );
 }

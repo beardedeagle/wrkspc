@@ -204,6 +204,21 @@ async fn unknown_blocks_new_work_until_reconciled() {
         .reconcile_unknown(&attempt, Reconciliation::Retry)
         .await
         .unwrap();
+    // The reconciliation itself is a committed feed event: closing a
+    // visible unknown must not vanish without a record.
+    let events = store.events_since(&conversation, 0, 100).await.unwrap();
+    let reconciled: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == "attempt.reconciled")
+        .collect();
+    assert_eq!(
+        reconciled.len(),
+        1,
+        "one attempt.reconciled event: {events:?}"
+    );
+    assert_eq!(reconciled[0].payload["attempt_id"], attempt);
+    assert_eq!(reconciled[0].payload["decision"], "retry");
+    assert_eq!(reconciled[0].payload["by"], "operator");
     let fresh = store.claim_intent(&message_id, &agent).await.unwrap();
     assert_ne!(fresh, attempt, "retry must produce a new attempt");
 }

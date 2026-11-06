@@ -24,10 +24,16 @@ pub fn parse_selection(
         .filter(|token| !token.is_empty())
     {
         let entry = if let Ok(index) = token.parse::<usize>() {
+            // Choices are numbered from 1; a bare 0 must not silently
+            // resolve to the first harness (an invalid selection is not
+            // authorization to modify that harness's files).
+            let index = index
+                .checked_sub(1)
+                .ok_or_else(|| format!("selection {index} is out of range (choices start at 1)"))?;
             detected
-                .get(index.saturating_sub(1))
+                .get(index)
                 .copied()
-                .ok_or_else(|| format!("selection {index} is out of range"))?
+                .ok_or_else(|| format!("selection {} is out of range", index + 1))?
         } else {
             parse(token).ok_or_else(|| format!("unknown harness `{token}`"))?
         };

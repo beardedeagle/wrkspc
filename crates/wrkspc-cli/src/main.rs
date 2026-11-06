@@ -9,6 +9,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "wrkspc=info".into()),
         )
+        // Diagnostics belong on stderr: `mcp-bridge` speaks JSON-RPC on
+        // stdout, and a log line there corrupts MCP initialization in any
+        // harness that parses stdout strictly.
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();

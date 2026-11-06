@@ -215,6 +215,49 @@ async fn attributed_send_commits_and_queues_remote_delivery() {
     assert_eq!(total, 1);
 }
 
+/// An unaddressed send commits but wakes nobody: the pre-fill that
+/// used to fan a recipient-less `message/send` out to every other
+/// member is gone — routing is mention/explicit only, and a room must
+/// not re-broadcast because the node simply didn't say who.
+#[tokio::test]
+async fn unaddressed_send_commits_and_wakes_nobody() {
+    let store = Store::open_in_memory("acceptance-test").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer_on_host("codex", "codex", "harness", "node-test-1")
+        .await
+        .unwrap();
+    store
+        .ensure_peer_on_host("agy", "agy", "harness", "node-other")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "codex", "agy"])
+        .await
+        .unwrap();
+    let router = router_under_test(store.clone()).await;
+
+    let (status, _) = post(
+        router,
+        Some("CN=node-test-1 SAN=node-test-1"),
+        &send_body("m-nobody", &conversation, "codex", &[]),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(accepted_events(&store, &conversation).await, 1);
+    // The message committed, but no host got a delivery task: agy
+    // (node-other) is a member and would have received one under the
+    // retired all-members fallback.
+    let (_, total) = store
+        .task_list(Some("node-other"), None, None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(total, 0, "an unaddressed post must not fan out");
+}
+
 #[tokio::test]
 async fn jsonrpc_error_envelope_is_not_translated() {
     let (store, conversation) = seeded().await;

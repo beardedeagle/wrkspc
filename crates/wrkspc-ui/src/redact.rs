@@ -25,11 +25,19 @@ pub fn redact(text: &str) -> String {
     .expect("static regex compiles");
     let bearer =
         regex::Regex::new(r"(?i)\b(bearer)\s+[a-z0-9._~+/=-]{8,}").expect("static regex compiles");
+    // Key=value secrets. Quote-aware on both sides of the separator so
+    // JSON forms (`{"password":"hunter2"}`, `"password": "hunter 2"`)
+    // mask fully: an optional quote may sit between the key and the
+    // `:`/`=`, and a quoted value (which may contain spaces) is matched
+    // as a unit instead of leaking at the first whitespace.
     let secret_assign = regex::Regex::new(
-        r"(?i)\b(api[_-]?key|access[_-]?token|secret|password)\s*[:=]\s*[^\s,;}\]]+",
+        r#"(?i)\b(api[_-]?key|access[_-]?token|secret|password)"?\s*[:=]\s*("[^"]*"|[^\s,;}\]"']+)"#,
     )
     .expect("static regex compiles");
-    let api_key = regex::Regex::new(r"(?i)\bsk-[a-z0-9]{8,}").expect("static regex compiles");
+    // API keys carry hyphens and underscores inside the key material
+    // (`sk-ant-api03-...`, `sk-proj-...`); an alphabet without them
+    // stops at the first separator and leaves the suffix exposed.
+    let api_key = regex::Regex::new(r"(?i)\bsk-[a-z0-9_-]{8,}").expect("static regex compiles");
 
     let redacted = pem.replace_all(text, "[REDACTED private key]");
     let redacted = bearer.replace_all(&redacted, "$1 [REDACTED]");
@@ -97,8 +105,38 @@ mod tests {
     }
 
     #[test]
+    fn masks_quoted_json_secrets() {
+        // The quote between key and separator must not defeat the mask,
+        // and a quoted value may contain spaces.
+        let out = redact(r#"{"password":"hunter2"}"#);
+        assert!(!out.contains("hunter2"), "got: {out}");
+        let out = redact(r#"{"password": "hunter two zero"}"#);
+        assert!(!out.contains("hunter"), "got: {out}");
+        let out = redact(r#"config: access_token="abc def ghi""#);
+        assert!(!out.contains("abc def"), "got: {out}");
+    }
+
+    #[test]
+    fn masks_hyphenated_api_keys_entirely() {
+        // The key alphabet includes `-` and `_`: the whole material must
+        // vanish, not an `sk-`-adjacent fragment with the suffix left.
+        let out = redact("token leaked: sk-ant-api03-AbCdEfGhIjKlMnOp");
+        assert!(!out.contains("AbCdEfGhIjKlMnOp"), "got: {out}");
+        assert!(out.contains("[REDACTED key]"), "got: {out}");
+        let out = redact("project key sk-proj-1234abcd5678ef90");
+        assert!(!out.contains("1234abcd"), "got: {out}");
+    }
+
+    #[test]
     fn leaves_prose_untouched() {
         let text = "the session paused at 14:32; hold released for agent";
+        assert_eq!(redact(text), text);
+    }
+
+    #[test]
+    fn leaving_prose_untouched_quoted_keys() {
+        // Ordinary quoted prose must not accidentally trip the maskers.
+        let text = "the agent said \"password\" twice and kept working";
         assert_eq!(redact(text), text);
     }
 

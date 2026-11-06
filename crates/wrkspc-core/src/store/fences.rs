@@ -99,13 +99,28 @@ impl Store {
         Ok(())
     }
 
-    /// Clears a fence. Idempotent.
+    /// Clears a fence. Idempotent. A `fence.cleared` event is appended in
+    /// the same transaction so the committed feed shows the release, not
+    /// a fence that reads as applied forever; it is emitted only when an
+    /// active fence actually flipped.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the fence
     /// does not exist.
     pub async fn clear_fence(&self, fence_id: &str, cleared_by: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String, String, String)> =
+            sqlx::query_as("SELECT conversation_id, peer_id, kind FROM fences WHERE id = ?")
+                .bind(fence_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((conversation_id, peer_id, kind)) = row else {
+            return Err(StoreError::NotFound {
+                entity: "fence",
+                id: fence_id.to_string(),
+            });
+        };
         let now = Utc::now().to_rfc3339();
         let result = sqlx::query(
             "UPDATE fences SET active = 0, cleared_by = ?, cleared_at = ?
@@ -114,21 +129,23 @@ impl Store {
         .bind(cleared_by)
         .bind(&now)
         .bind(fence_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
-            let exists: Option<String> = sqlx::query("SELECT id FROM fences WHERE id = ?")
-                .bind(fence_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .map(|r| r.get("id"));
-            if exists.is_none() {
-                return Err(StoreError::NotFound {
-                    entity: "fence",
-                    id: fence_id.to_string(),
-                });
-            }
+        if result.rows_affected() == 1 {
+            self.append_event_in(
+                &mut tx,
+                &conversation_id,
+                "fence.cleared",
+                &serde_json::json!({
+                    "fence_id": fence_id,
+                    "peer_id": peer_id,
+                    "kind": kind,
+                    "cleared_by": cleared_by,
+                }),
+            )
+            .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 

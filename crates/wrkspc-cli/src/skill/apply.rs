@@ -12,9 +12,28 @@ pub fn install(
     let mut any_new = false;
     let mut any_refreshed = false;
 
+    // Read first, write second — on either file. A pointer section
+    // (AGENTS.md/CLAUDE.md/GEMINI.md) that cannot be read must abort
+    // the install before anything is touched.
+    let pointer_plan =
+        if let Some(instructions) = entry.pointer.then(|| pointer_file(home, entry)).flatten() {
+            let current = read_or_default(&instructions).map_err(|error| {
+                format!(
+                    "cannot read {} before install: {error}",
+                    instructions.display()
+                )
+            })?;
+            let (_, section_existed) = without_section(&current);
+            let (updated, changed) = with_section(&current, &pointer_section(entry));
+            Some((instructions, updated, changed, section_existed))
+        } else {
+            None
+        };
+
     // The skills directory copy.
     let path = skill_path(home, entry);
-    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    let current = read_or_default(&path)
+        .map_err(|error| format!("cannot read {} before install: {error}", path.display()))?;
     if current != SKILL_MD {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -28,20 +47,15 @@ pub fn install(
     }
 
     // The standing-instructions pointer (binding cohort only).
-    if let Some(instructions) = entry.pointer.then(|| pointer_file(home, entry)).flatten() {
-        let current = std::fs::read_to_string(&instructions).unwrap_or_default();
-        let (_, section_existed) = without_section(&current);
-        let (updated, changed) = with_section(&current, &pointer_section(entry));
-        if changed {
-            if let Some(parent) = instructions.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&instructions, updated)?;
-            if section_existed {
-                any_refreshed = true;
-            } else {
-                any_new = true;
-            }
+    if let Some((instructions, updated, true, section_existed)) = pointer_plan {
+        if let Some(parent) = instructions.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&instructions, updated)?;
+        if section_existed {
+            any_refreshed = true;
+        } else {
+            any_new = true;
         }
     }
 
@@ -89,7 +103,12 @@ pub fn uninstall(
     }
 
     if let Some(instructions) = pointer_file(home, entry).filter(|path| path.exists()) {
-        let current = std::fs::read_to_string(&instructions).unwrap_or_default();
+        let current = read_or_default(&instructions).map_err(|error| {
+            format!(
+                "cannot read {} before uninstall: {error}",
+                instructions.display()
+            )
+        })?;
         let (updated, removed) = without_section(&current);
         if removed {
             std::fs::write(&instructions, updated)?;
@@ -102,6 +121,20 @@ pub fn uninstall(
     } else {
         UninstallOutcome::NothingToRemove
     })
+}
+
+/// Reads a file to a string, treating ONLY a missing file as empty.
+///
+/// Install/uninstall must never truncate an existing user-owned file
+/// (an AGENTS.md with invalid UTF-8, a permission error, or a dangling
+/// link): anything but a missing file surfaces as an error, or the next
+/// `write` would silently destroy content the unreadable read just hid.
+fn read_or_default(path: &Path) -> std::io::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Reports whether one harness's installed skill matches the shipped
