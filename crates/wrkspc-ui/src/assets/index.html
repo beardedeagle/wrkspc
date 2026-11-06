@@ -99,6 +99,19 @@
   .split-slot + .split-slot { border-top: 1px solid var(--border); }
   .split-slot > h2:first-child, .split-slot > .rail-row:first-child h2 { margin-top: 0.75rem; }
   .split-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+
+  /* One tooltip layer for the whole page. The browser's native tooltip is slow
+     and its delay is not configurable, so a hovered element's title is lifted
+     into this element instead. */
+  #tooltip { position: fixed; z-index: 90; pointer-events: none; max-width: 22rem;
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--border-strong);
+    border-radius: 6px; padding: 0.25rem 0.45rem; font-size: 0.72rem; line-height: 1.4;
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.45); white-space: pre-line; }
+  #tooltip[hidden] { display: none; }
+  /* A hairline under each rail heading, so a section's list is bounded at the
+     top the same way its rows are separated below. */
+  .split-slot > .rail-row:first-child { border-bottom: 1px solid var(--border);
+    padding-bottom: 0.35rem; }
   .rail-row { display: flex; align-items: center; gap: 0.5rem; }
   .rail-row h2 { margin: 0.9rem 0 0.4rem; }
   .rail-action { margin-left: auto; padding: 0.15rem 0.5rem; font-size: 0.66rem; }
@@ -116,6 +129,38 @@
   .cohort-tools { display: flex; align-items: center; font-size: 0.72rem; color: var(--faint); margin: 0 0 0 auto; }
   .cohort-tools label { cursor: pointer; display: flex; align-items: center; gap: 0.3rem; }
 
+  /* ---- conversation strip: room, members, gates ---- */
+  #convo-head { border-bottom: 1px solid var(--border); background: var(--panel);
+    padding: 0.5rem 0.9rem 0.45rem; }
+  /* The gates trigger sits inline with the room name, pinned to the right of
+     the centre column, and its menu drops from there over the transcript. */
+  .room-line { display: flex; align-items: baseline; gap: 0.5rem; position: relative; }
+  .room-name { font-size: 0.95rem; font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+  .room-id { font-family: ui-monospace, monospace; font-size: 0.72rem; color: var(--faint); }
+  .room-line #unknown-banner { margin-left: auto; }
+  .room-members { margin-top: 0.2rem; font-size: 0.72rem; color: var(--faint); overflow-wrap: anywhere; }
+  /* The banner and the gates trigger share the right end of the room line, so
+     the trigger is pinned where the menu opens and nothing drifts left. */
+  .room-actions { margin-left: auto; display: flex; align-items: center; gap: 0.5rem; position: relative; }
+  #gates-toggle { border: 1px solid var(--border-strong); background: var(--surface);
+    color: var(--muted); border-radius: 6px; padding: 0.02rem 0.4rem; font-size: 0.8rem; cursor: pointer; }
+  #gates-toggle:hover { color: var(--text); border-color: var(--accent); }
+  /* The menu floats over the transcript: opening it never reflows the pane. */
+  .gates-menu { position: absolute; top: 100%; right: 0; z-index: 40; margin-top: 0.25rem;
+    width: min(24rem, 90vw); background: var(--surface); border: 1px solid var(--border-strong);
+    border-radius: 8px; box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45); }
+  .gates-menu[hidden] { display: none; }
+  .gates-head { display: flex; align-items: center; gap: 0.25rem;
+    padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--border); }
+  .gates-head .gates-hint { margin-right: auto; font-size: 0.66rem; text-transform: uppercase;
+    letter-spacing: 0.05em; color: var(--faint); }
+  .gates-list { max-height: 14rem; overflow-y: auto; padding: 0.2rem; }
+  .gate-row { display: flex; align-items: center; gap: 0.25rem; padding: 0.15rem 0.3rem; border-radius: 5px; }
+  .gate-row:hover { background: var(--surface-2); }
+  .gate-row .gate-name { margin-right: auto; font-size: 0.76rem; color: var(--text); overflow-wrap: anywhere; }
+  .gate-row .peer-btn.on { color: var(--amber); }
+  .gate-row .peer-btn.on.block { color: var(--red); }
+
   .convo {
     display: flex; flex-direction: column; gap: 0.1rem;
     width: 100%; text-align: left; margin: 0.2rem 0;
@@ -129,12 +174,26 @@
   .convo:hover { border-color: var(--border-strong); background: var(--surface-2); }
   .convo.selected { border-color: var(--accent); background: rgba(68, 147, 248, 0.09); }
   .convo .cid { font-family: ui-monospace, monospace; font-size: 0.72rem; color: var(--faint); }
+  .convo-top { display: flex; align-items: baseline; gap: 0.4rem; }
+  .convo .cname { flex: 0 1 auto; font-size: 0.8rem; color: var(--text); overflow-wrap: anywhere; }
+  /* Both controls pin to the block's right edge, so they stay put and behave
+     the same; the name keeps the left to itself. */
+  .convo-actions { margin-left: auto; display: flex; align-items: baseline; gap: 0.1rem; flex: none; }
+  .convo .convo-edit, .convo .convo-del { padding: 0 3px; color: var(--faint); cursor: pointer; }
+  .convo .convo-edit:hover, .convo .convo-del:hover { color: var(--text); }
+  /* Renaming takes the block: a full-width field, then the id on the left and
+     the controls on the right beneath it, the way the cohort rename reads. */
+  .convo-rename { display: flex; flex-direction: column; gap: 0.2rem; }
+  .convo-rename-input { width: 100%; box-sizing: border-box; font-size: 0.78rem; background: var(--surface-2);
+    color: var(--text); border: 1px solid var(--border-strong); border-radius: 4px; padding: 0.05rem 0.3rem; }
+  .convo-rename-foot { display: flex; align-items: baseline; gap: 0.4rem; }
   .convo .members { font-size: 0.82rem; }
   .convo .when { font-size: 0.72rem; color: var(--muted); }
-  .convo { position: relative; padding-right: 1.6rem; }
+  /* The delete control used to be pinned to the block's corner, which put it on
+     the name row while the edit control stayed inline: the two never travelled
+     together and the field couldn't reach the block's right edge. Both now live
+     in the block's action cluster. */
   .convo .members { white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
-  .convo .convo-del { position: absolute; top: 0.35rem; right: 0.45rem;
-    padding: 0 4px; color: var(--faint); cursor: pointer; }
   .convo .convo-del:hover { color: var(--red, #f85149); }
 
   .peer-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem 0.45rem;
@@ -192,40 +251,8 @@
 
   /* ---- center ---- */
   #workspace { flex: 1; min-width: 0; background: var(--bg); }
-  #workspace .topbar {
-    flex: none;
-    display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
-    padding: 0.7rem 1rem;
-    border-bottom: 1px solid var(--border);
-    background: var(--panel);
-  }
-  #workspace .topbar .title { font-weight: 600; font-size: 0.95rem; }
-  #workspace .topbar .subtitle { color: var(--faint); font-size: 0.75rem; }
+  #workspace { flex: 1; min-width: 0; background: var(--bg); }
 
-  #moderation { flex: none; display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.5rem 1rem 0; align-items: center; }
-  #moderation .label { color: var(--faint); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; margin-right: 0.2rem; }
-  .peer-ctl {
-    display: flex; align-items: center; gap: 0.35rem;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 0.2rem 0.35rem 0.2rem 0.65rem;
-    font-size: 0.78rem;
-  }
-  .peer-ctl .name { color: var(--muted); }
-  .peer-ctl button { padding: 0.12rem 0.45rem; font-size: 0.7rem; }
-
-  #fences { flex: none; display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.4rem 1rem 0; }
-  .fence-chip {
-    display: flex; align-items: center; gap: 0.45rem;
-    background: rgba(210, 153, 34, 0.12);
-    border: 1px solid rgba(210, 153, 34, 0.5);
-    color: #e3b341;
-    border-radius: 999px;
-    padding: 0.2rem 0.4rem 0.2rem 0.7rem;
-    font-size: 0.75rem;
-  }
-  .fence-chip button { padding: 0.12rem 0.45rem; font-size: 0.7rem; }
 
   #transcript-scroll { flex: 1; overflow-y: auto; padding: 1rem; }
   #transcript { max-width: 52rem; margin: 0 auto; }
@@ -244,16 +271,32 @@
   .msg .content { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.9rem; }
   .msg .deliveries { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.5rem; align-items: center; }
   .msg .deliveries .label { color: var(--faint); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; }
-  .badge {
-    font-size: 0.68rem; font-weight: 600;
-    border-radius: 999px; padding: 0.06rem 0.5rem;
-    border: 1px solid transparent;
+  .msg .deliveries { gap: 0.25rem 0.7rem; }
+  .msg .deliveries .label { display: none; }
+  .msg .deliveries .delivery { position: relative; display: inline-flex; align-items: center; }
+  .msg .deliveries .delivery-btn {
+    display: inline-flex; align-items: center; gap: 0.3rem;
+    background: none; border: 1px solid transparent; border-radius: 6px;
+    padding: 0.05rem 0.3rem; cursor: pointer; color: var(--muted);
   }
-  .badge.delivered { background: rgba(63, 185, 80, 0.13); color: var(--green); border-color: rgba(63, 185, 80, 0.4); }
-  .badge.held { background: rgba(210, 153, 34, 0.13); color: #e3b341; border-color: rgba(210, 153, 34, 0.4); }
-  .badge.unknown { background: rgba(248, 81, 73, 0.13); color: var(--red); border-color: rgba(248, 81, 73, 0.4); }
-  .badge.stored, .badge.eligible { background: rgba(139, 148, 158, 0.12); color: var(--muted); border-color: var(--border-strong); }
-  .msg .deliveries button { padding: 0.1rem 0.4rem; font-size: 0.66rem; }
+  .msg .deliveries .delivery-btn:hover { border-color: var(--border-strong); background: var(--surface-2); color: var(--text); }
+  .msg .deliveries .delivery-menu {
+    position: absolute; top: 100%; left: 0; z-index: 5;
+    display: flex; gap: 0.1rem; margin-top: 0.15rem;
+    background: var(--surface-2); border: 1px solid var(--border-strong);
+    border-radius: 6px; padding: 0.1rem 0.15rem;
+  }
+  .msg .deliveries .delivery-menu[hidden] { display: none; }
+  .msg .deliveries .dname { color: inherit; font-size: 0.72rem; }
+  .msg .deliveries .dstate { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .msg .deliveries .dstate.stored,
+  .msg .deliveries .dstate.eligible,
+  .msg .deliveries .dstate.expired { background: var(--faint); }
+  .msg .deliveries .dstate.delivered { background: var(--green); box-shadow: 0 0 5px rgba(63, 185, 80, 0.6); }
+  .msg .deliveries .dstate.held { background: var(--amber); }
+  .msg .deliveries .dstate.blocked { background: var(--red); }
+  .msg .deliveries button { padding: 0.02rem 0.16rem; font-size: 0.7rem; }
+  .msg .deliveries button.danger:hover { color: var(--red); }
 
   .event {
     font-size: 0.75rem; color: var(--muted);
@@ -288,9 +331,23 @@
     border-top: 1px solid var(--border);
     background: var(--panel);
   }
-  #compose-panel .inner { max-width: 52rem; margin: 0 auto; display: flex; flex-direction: column; gap: 0.45rem; }
-  #compose-panel .actions { display: flex; gap: 0.5rem; align-items: center; }
+  #compose-panel .inner { max-width: 52rem; margin: 0 auto; }
   #compose-panel .hint { color: var(--faint); font-size: 0.72rem; }
+  /* The composer is one box: the mode tabs sit inside its top edge and the send
+     control inside its bottom edge, so the controls take no room away from the
+     writing surface. */
+  .composer { display: flex; flex-direction: column; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(68, 147, 248, 0.18); }
+  .composer-foot .seg { border: none; background: transparent; padding: 0; }
+  #compose-text { border: none; border-radius: 0; background: transparent;
+    min-height: 8.5rem; padding: 0.55rem 0.7rem; }
+  #compose-text:focus { border: none; box-shadow: none; }
+  .composer-foot { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; row-gap: 0.35rem;
+    padding: 0.4rem 0.5rem; border-top: 1px solid var(--border); background: var(--panel); }
+  /* The send control takes the right edge; everything else keeps the left. */
+  #compose-send { margin-left: auto; }
+  .composer-foot .hint { color: var(--amber, #d29922); }
   .seg { display: inline-flex; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 2px; gap: 2px; align-self: flex-start; }
   .seg button { border: none; background: transparent; padding: 0.3rem 0.85rem; border-radius: 6px; color: var(--muted); }
   .seg button.active { background: var(--accent); color: #fff; }
@@ -308,20 +365,6 @@
     font-size: 0.8rem;
   }
 
-  /* conversation membership strip: kick is room-scoped, unlike the
-     hub-wide boot/ban controls on the peer rows */
-  #convo-members { display: flex; flex-wrap: wrap; gap: 0.35rem; padding: 0 1rem 0.5rem; }
-  #convo-members:empty { display: none; }
-  #convo-members .member {
-    display: inline-flex; align-items: center; gap: 0.3rem;
-    background: var(--surface-2); border: 1px solid var(--border);
-    border-radius: 999px; padding: 0.1rem 0.5rem; font-size: 0.75rem; color: var(--muted);
-  }
-  #convo-members .member .kick {
-    border: none; background: none; color: var(--faint); cursor: pointer;
-    font-size: 0.8rem; padding: 0 0.1rem; line-height: 1;
-  }
-  #convo-members .member .kick:hover { color: var(--red); }
   #unknown .attempt { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 0.55rem 0.65rem; margin: 0.4rem 0; }
   #unknown .attempt .meta { font-size: 0.74rem; color: var(--muted); margin-bottom: 0.35rem; }
   #unknown .attempt .row { display: flex; flex-wrap: wrap; gap: 0.3rem; }
@@ -405,25 +448,39 @@
   </section>
 </aside>
 <section id="workspace">
-  <div class="topbar">
-    <span class="title" id="convo-title">wrkspc</span>
-    <span class="subtitle" id="convo-subtitle"></span>
-    <div id="unknown-banner" hidden style="margin-left:auto"></div>
+  <div id="convo-head">
+    <div class="room-line">
+      <span class="room-name" id="room-name">wrkspc</span>
+      <span class="room-id" id="room-id"></span>
+      <div class="room-actions">
+        <div id="unknown-banner" hidden></div>
+        <button id="gates-toggle" title="conversation gates" aria-haspopup="true" aria-expanded="false">☰</button>
+        <div id="gates-menu" class="gates-menu" hidden>
+        <div class="gates-head">
+          <span class="gates-hint">all members</span>
+          <button class="peer-btn" data-bulk="pause" title="pause every member — no new deliveries">⏸</button>
+          <button class="peer-btn" data-bulk="block" title="block every member — no delivery at all">⛔</button>
+          <button class="peer-btn" data-bulk="clear" title="clear every gate in this room">⌫</button>
+        </div>
+          <div class="gates-list" id="gates-list"></div>
+        </div>
+      </div>
+    </div>
+    <div class="room-members" id="room-members"></div>
   </div>
-  <div id="convo-members"></div>
-  <div id="moderation"><span class="label">conversation gates</span></div>
-  <div id="fences"></div>
   <div id="transcript-scroll"><div id="transcript-loading">loading…</div><div id="transcript"></div></div>
   <div id="compose-panel">
     <div class="inner">
-      <div class="seg">
-        <button id="compose-mode-msg" class="active">message</button>
-        <button id="compose-mode-guidance">guidance</button>
-      </div>
-      <textarea id="compose-text" rows="3" placeholder="post a message to the conversation"></textarea>
-      <div class="actions">
-        <button id="compose-send" class="primary">send</button>
-        <span class="hint" id="compose-hint"></span>
+      <div class="composer">
+        <textarea id="compose-text" rows="3" placeholder="post a message to the conversation"></textarea>
+        <div class="composer-foot">
+          <div class="seg">
+            <button id="compose-mode-msg" class="active">message</button>
+            <button id="compose-mode-guidance">guidance</button>
+          </div>
+          <span class="hint" id="compose-hint"></span>
+          <button id="compose-send" class="primary">send</button>
+        </div>
       </div>
     </div>
   </div>
@@ -444,6 +501,13 @@
 "use strict";
 let token = localStorage.getItem("wrkspc_token");
 let selected = null;
+// The conversation whose name is being edited inline. While set, renders are
+// skipped so a poll cannot replace the input mid-edit.
+let editingConversation = null;
+// The selected room's members and fences, kept for the gates menu's bulk
+// actions so a button does not have to re-read them from the DOM.
+let roomMembers = [];
+let roomFences = [];
 let eventCursor = 0;
 // The selected conversation's events, accumulated across incremental
 // fetches (eventCursor is the highest seq held). viewGeneration bumps on
@@ -467,13 +531,115 @@ let moderationCache = [];
 let composeMode = "message";
 // The default compose hint ("as operator · to …"), restored when the
 // box holds no @ mention.
-let composeDefaultHint = "";
+// The compose hint only ever carries something the operator has to act on: an
+// unknown mention, or a directed send. Who is in the room is already in the
+// strip above, so a standing "as operator · to …" line said nothing new.
 
 function hash(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return h; }
+// How long the pointer must rest on an element before its tooltip shows. The
+// native tooltip is closer to a second; this is fast enough to feel immediate
+// and slow enough that sweeping across a toolbar does not flash.
+const TOOLTIP_DELAY_MS = 120;
+
+// Turns every `title` in the page into a fast, styled tooltip.
+//
+// The browser's own tooltip cannot be sped up, so the title is lifted off the
+// element as the pointer arrives (which is what stops the native one from ever
+// appearing) and put back when the pointer leaves.
+function installTooltips() {
+  const tip = document.createElement("div");
+  tip.id = "tooltip";
+  tip.hidden = true;
+  document.body.appendChild(tip);
+  let current = null;
+  let timer = null;
+
+  const hide = () => {
+    clearTimeout(timer);
+    timer = null;
+    tip.hidden = true;
+    if (current) {
+      // `dataset.tip` holds the text while it is off the element.
+      if (current.dataset.tip) {
+        current.title = current.dataset.tip;
+        delete current.dataset.tip;
+      }
+      current = null;
+    }
+  };
+
+  // Anchored to the element, not the pointer: the transcript scrolls under a
+  // resting pointer several times a second, and a cursor-anchored tooltip
+  // would drift away from what it describes.
+  const place = (target) => {
+    const box = target.getBoundingClientRect();
+    tip.hidden = false;
+    const size = tip.getBoundingClientRect();
+    const pad = 8;
+    const left = Math.max(pad, Math.min(box.left, window.innerWidth - size.width - pad));
+    const below = box.bottom + 6;
+    const top = below + size.height > window.innerHeight - pad
+      ? Math.max(pad, box.top - size.height - 6)
+      : below;
+    tip.style.left = left + "px";
+    tip.style.top = top + "px";
+  };
+
+  document.addEventListener("mouseover", (event) => {
+    const target = event.target instanceof Element ? event.target.closest("[title]") : null;
+    if (target === current) return;
+    hide();
+    if (!target) return;
+    const text = target.getAttribute("title");
+    if (!text) return;
+    current = target;
+    target.dataset.tip = text;
+    target.removeAttribute("title");
+    timer = setTimeout(() => {
+      if (current !== target) return;
+      tip.textContent = text;
+      place(target);
+    }, TOOLTIP_DELAY_MS);
+  });
+
+  document.addEventListener("mouseout", (event) => {
+    if (!current) return;
+    if (event.relatedTarget instanceof Node && current.contains(event.relatedTarget)) return;
+    hide();
+  });
+  document.addEventListener("mousedown", hide, true);
+  // A scroll (the transcript follows new traffic several times a second) must
+  // not cancel a tooltip that is still on its way: it only re-places one that
+  // is already up.
+  const reflow = () => {
+    if (!current || tip.hidden) return;
+    if (!current.isConnected) {
+      hide();
+      return;
+    }
+    place(current);
+  };
+  window.addEventListener("scroll", reflow, true);
+  window.addEventListener("resize", reflow);
+  window.addEventListener("blur", hide);
+}
+
 function renderIfChanged(key, h, fn) {
   if (seenHashes[key] === h) return;
   seenHashes[key] = h;
   fn();
+}
+
+// Forgets a render hash so the next render rebuilds that region even when its
+// payload is unchanged. Closing an inline editor restores DOM a poll never sees,
+// and the payload hash alone would skip the rebuild and leave the field on
+// screen.
+//
+// # Arguments
+//
+// * `key` — the render region to invalidate.
+function invalidate(key) {
+  delete seenHashes[key];
 }
 
 async function api(path, options = {}) {
@@ -505,11 +671,21 @@ const btn = (label, onClick, cls, title) => {
   if (title) b.title = title;
   return b;
 };
-const badge = (text, cls) => {
-  const s = document.createElement("span");
-  s.className = "badge " + (cls || "stored");
-  s.textContent = text;
-  return s;
+// Closes every open delivery menu. Clicking a delivery button toggles its own
+// menu, and any click outside one closes the rest so two are never open at once.
+function closeDeliveryMenus() {
+  for (const menu of document.querySelectorAll(".delivery-menu")) menu.hidden = true;
+}
+
+// What a delivery state means, spelled out for the hover title so the row can
+// stay a name, a dot, and its controls.
+const DELIVERY_STATE_TEXT = {
+  stored: "stored — committed, not yet claimed",
+  eligible: "eligible — cleared for delivery",
+  held: "held — gated pending operator review",
+  blocked: "blocked by an operator",
+  delivered: "delivered — recorded by the recipient's node",
+  expired: "expired under the retention policy",
 };
 
 // A duration with no words: hours and seconds, nothing else. The cohort row
@@ -578,90 +754,259 @@ function age(updatedAt) {
 async function loadConversations() {
   let conversations = [];
   try { conversations = await api("/api/conversations"); } catch { return; }
+  if (editingConversation) return; // an inline rename is open: freeze the list
   renderIfChanged("convos", hash(JSON.stringify(conversations) + selected), () => {
     const list = el("convo-list");
     clear(list);
     for (const c of conversations) {
-      const b = document.createElement("button");
-      b.className = "convo" + (c.id === selected ? " selected" : "");
+      // A div, not a button: the row owns an inline rename field and two
+      // controls, and interactive elements cannot nest inside a button.
+      const block = document.createElement("div");
+      block.className = "convo" + (c.id === selected ? " selected" : "");
+      block.tabIndex = 0;
+      block.onclick = () => select(c.id);
+      block.onkeydown = (event) => { if (event.key === "Enter") select(c.id); };
+      const top = document.createElement("div");
+      top.className = "convo-top";
+      const name = document.createElement("span");
+      name.className = "cname";
+      name.textContent = c.name || "unnamed room";
+      name.title = c.name || "this room has no name yet";
       const cid = document.createElement("span");
       cid.className = "cid";
       cid.textContent = c.id.slice(0, 8);
+      // Both controls live in one right-pinned cluster, so they line up and
+      // behave the same however long the name is.
+      const actions = document.createElement("div");
+      actions.className = "convo-actions";
+      const edit = document.createElement("span");
+      edit.className = "convo-edit";
+      edit.textContent = "✎";
+      edit.title = "rename this room";
+      edit.onclick = (event) => {
+        event.stopPropagation();
+        startRoomRename(block, c);
+      };
+      const del = document.createElement("span");
+      del.className = "convo-del";
+      del.textContent = "✕";
+      del.title = "delete this room (click again to confirm)";
+      // Two-click confirm: Chrome silently swallows a blocked window.confirm, so
+      // a one-click delete was one stray click away from losing a transcript.
+      let armed = false;
+      let armTimer = null;
+      del.onclick = async (event) => {
+        event.stopPropagation();
+        if (!armed) {
+          armed = true;
+          del.textContent = "✓";
+          del.title = "click again to delete " + (c.name || c.id.slice(0, 8));
+          armTimer = setTimeout(() => {
+            armed = false;
+            del.textContent = "✕";
+            del.title = "delete this room (click again to confirm)";
+          }, 4000);
+          return;
+        }
+        clearTimeout(armTimer);
+        try { await api("/api/conversations/" + encodeURIComponent(c.id), { method: "DELETE" }); }
+        catch { del.title = "delete failed"; return; }
+        if (selected === c.id) selected = null;
+        invalidate("convos");
+        await loadConversations();
+      };
+      actions.append(edit, del);
+      top.append(name, cid, actions);
       const members = document.createElement("span");
       members.className = "members";
       members.textContent = c.members.map(peerLabel).join(", ");
       const when = document.createElement("span");
       when.className = "when";
       when.textContent = "created " + age(c.created_at);
-      const del = document.createElement("span");
-      del.className = "convo-del";
-      del.textContent = "✕";
-      del.title = "delete this room";
-      del.onclick = async (event) => {
-        // Deleting a room is the only way to stop agents that keep waking in
-        // it; make it one click, but never silent.
-        event.stopPropagation();
-        if (!window.confirm("delete room " + c.id.slice(0, 8) + " (" + c.members.map(peerLabel).join(", ") + ")? its messages leave this store.")) return;
-        try { await api("/api/conversations/" + encodeURIComponent(c.id), { method: "DELETE" }); } catch { return; }
-        if (selected === c.id) selected = null;
-        await loadConversations();
-      };
-      b.appendChild(cid); b.appendChild(members); b.appendChild(when); b.appendChild(del);
-      b.onclick = () => select(c.id);
-      list.appendChild(b);
+      block.append(top, members, when);
+      list.appendChild(block);
     }
   });
   if (selected) {
     const meta = conversations.find((c) => c.id === selected);
     if (meta) {
-      el("convo-title").textContent = meta.members.join(" · ");
-      el("convo-subtitle").textContent = meta.id.slice(0, 8);
-      composeDefaultHint = "as operator · to " + meta.members.join(", ");
-      el("compose-hint").textContent = composeDefaultHint;
-      renderMembers(meta);
+      renderRoomHeader(meta);
     }
   }
 }
 
-// The conversation's membership strip. Kick is room-scoped: the peer stays
-// enrolled in the hub (and in other rooms) — the hub-wide boot/ban controls
-// live on the peer rows instead.
-function renderMembers(meta) {
-  const box = el("convo-members");
-  box.textContent = "";
-  for (const member of meta.members) {
-    if (member === "operator") continue;
-    const peer = rosterEntries.find((p) => p.peer_id === member);
-    const label = (peer && peer.alias) || member;
-    const chip = document.createElement("span");
-    chip.className = "member";
-    chip.textContent = label;
-    const kick = document.createElement("button");
-    kick.className = "kick";
-    kick.textContent = "✕";
-    kick.title = "kick " + label + " from this room (stays enrolled; other rooms unaffected)";
-    kick.onclick = async () => {
-      if (!confirm("kick " + label + " from this room?")) return;
-      try {
-        await api(
-          "/api/conversations/" + selected + "/members/" + encodeURIComponent(member),
-          { method: "DELETE" },
-        );
-      } catch (e) { alert("kick failed: " + e.message); }
-      await renderAll();
+// Renders the conversation strip's room line and member line.
+//
+// The strip is one block: the room's name and short id, then its members. The
+// gates menu lives in the same strip and is rendered by renderAll, which is the
+// only place the room's active fences are known.
+//
+// # Arguments
+//
+// * `meta` — the conversation view from `/api/conversations`.
+function renderRoomHeader(meta) {
+  el("room-name").textContent = meta.name || "unnamed room";
+  el("room-id").textContent = meta.id.slice(0, 8);
+  el("room-members").textContent = meta.members.map(peerLabel).join(", ");
+}
+
+// Arms a two-click delete on a room control.
+//
+// Chrome silently swallows a blocked `window.confirm`, so a one-click delete
+// was one stray click away from losing a room's transcript. The first click
+// arms, the second fires, and the arm lapses on its own.
+//
+// # Arguments
+//
+// * `control` — the element to arm and fire.
+// * `conversation` — the room it deletes.
+function wireRoomDelete(control, conversation) {
+  let armed = false;
+  let armTimer = null;
+  const label = conversation.name || conversation.id.slice(0, 8);
+  control.onclick = async (event) => {
+    event.stopPropagation();
+    if (!armed) {
+      armed = true;
+      control.textContent = "✓";
+      control.title = "click again to delete " + label;
+      armTimer = setTimeout(() => {
+        armed = false;
+        control.textContent = "✕";
+        control.title = "delete this room (click again to confirm)";
+      }, 4000);
+      return;
+    }
+    clearTimeout(armTimer);
+    try {
+      await api("/api/conversations/" + encodeURIComponent(conversation.id), { method: "DELETE" });
+    } catch {
+      control.title = "delete failed";
+      return;
+    }
+    if (selected === conversation.id) selected = null;
+    invalidate("convos");
+    await loadConversations();
+  };
+}
+
+// Opens an inline field that renames a room.
+//
+// Renaming takes the block: a full-width field, then the room's id on the left
+// and the same two controls beneath it, so nothing shifts sideways. Names are
+// vanity metadata: blanking the field clears the name, the room stays usable,
+// and the id remains the key. Enter commits, Escape cancels, clicking the edit
+// control again cancels, and blur commits.
+//
+// # Arguments
+//
+// * `block` — the room's block in the left column.
+// * `conversation` — the room being renamed.
+function startRoomRename(block, conversation) {
+  if (editingConversation) return;
+  const top = block.querySelector(".convo-top");
+  if (!top) return;
+  editingConversation = conversation.id;
+
+  let settled = false;
+  const shell = document.createElement("div");
+  shell.className = "convo-rename";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = conversation.name || "";
+  input.maxLength = 64;
+  input.placeholder = "unnamed room";
+  input.className = "convo-rename-input";
+  input.onclick = (event) => event.stopPropagation();
+
+  const foot = document.createElement("div");
+  foot.className = "convo-rename-foot";
+  const cid = document.createElement("span");
+  cid.className = "cid";
+  cid.textContent = conversation.id.slice(0, 8);
+  const actions = document.createElement("div");
+  actions.className = "convo-actions";
+  const cancel = document.createElement("span");
+  cancel.className = "convo-edit";
+  cancel.textContent = "✎";
+  cancel.title = "cancel renaming";
+  cancel.onclick = (event) => {
+    event.stopPropagation();
+    close(false);
+  };
+  const remove = document.createElement("span");
+  remove.className = "convo-del";
+  remove.textContent = "✕";
+  remove.title = "delete this room (click again to confirm)";
+  wireRoomDelete(remove, conversation);
+  // Pressing either control blurs the field first, and the blur handler commits.
+  // Mark the edit settled on pointerdown — which reaches us before the blur — so
+  // cancel cancels and delete deletes instead of each quietly saving the name.
+  for (const control of [cancel, remove]) {
+    control.onpointerdown = (event) => {
+      event.stopPropagation();
+      settled = true;
     };
-    chip.appendChild(kick);
-    box.appendChild(chip);
   }
+  actions.append(cancel, remove);
+  foot.append(cid, actions);
+  shell.append(input, foot);
+  top.replaceWith(shell);
+  input.focus();
+  input.select();
+
+  // `close(true, value)` commits that value (null clears the name); `close(false)`
+  // abandons the edit. Either way the block is rebuilt from the store, because
+  // replacing DOM the poll never sees leaves the render hash unchanged.
+  const close = async (commit, value) => {
+    if (editingConversation === null) return;
+    editingConversation = null;
+    invalidate("convos");
+    if (commit) {
+      try {
+        await api("/api/conversations/" + encodeURIComponent(conversation.id), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: value }),
+        });
+      } catch { /* a refused name leaves the old one in place */ }
+    }
+    await loadConversations();
+  };
+  const submit = (commit) => {
+    const next = input.value.trim();
+    close(commit, next === "" ? null : next);
+  };
+  input.addEventListener("keydown", (event) => {
+    event.stopPropagation();
+    if (event.key === "Enter") {
+      settled = true;
+      submit(true);
+    } else if (event.key === "Escape") {
+      settled = true;
+      close(false);
+    }
+  });
+  input.addEventListener("blur", () => {
+    if (settled) return;
+    settled = true;
+    submit(true);
+  });
 }
 
 async function loadPeers() {
   let peers = [];
   try { peers = await api("/api/peers"); rosterEntries = peers; } catch { return; }
   if (editingPeer) return; // an inline rename is open: the section stays frozen until it commits
+  // Always a copy: the pin below sorts it, and the roster array itself stays as
+  // the API returned it.
   const visible = hideEjected
     ? peers.filter((p) => (p.status || "enrolled") === "enrolled")
-    : peers;
+    : [...peers];
+  // The operator is the human at this console: it is in every room by
+  // construction, so it holds the top of the cohort permanently instead of
+  // drifting with the rest of the roster. Everything below keeps its own order.
+  visible.sort((a, b) => (b.peer_id === "operator") - (a.peer_id === "operator"));
   renderIfChanged("peers", hash(JSON.stringify(peers) + JSON.stringify(moderationCache)), () => {
     const list = el("peer-list");
     clear(list);
@@ -931,7 +1276,7 @@ function refreshComposeHint() {
     el("compose-hint").textContent = "directed to " + names.join(", ") + " — others read only, no turn";
     return;
   }
-  if (composeDefaultHint) el("compose-hint").textContent = composeDefaultHint;
+  el("compose-hint").textContent = "";
 }
 
 async function sendComposed() {
@@ -1382,15 +1727,39 @@ async function renderAll() {
       if (harnessDeliveries.length) {
         const row = document.createElement("div");
         row.className = "deliveries";
-        const label = document.createElement("span");
-        label.className = "label";
-        label.textContent = "delivery to";
-        row.appendChild(label);
+        row.title = "delivery state and controls, per cohort member";
         for (const d of harnessDeliveries) {
-          row.appendChild(badge(d.peer_id + " · " + d.state, d.state));
-          row.appendChild(btn("hold", () => act("/api/messages/" + m.id + "/deliveries/" + d.peer_id + "/hold", "POST"), "", "gate this delivery pending review"));
-          row.appendChild(btn("release", () => act("/api/messages/" + m.id + "/deliveries/" + d.peer_id + "/release", "POST"), "", "release the held delivery"));
-          row.appendChild(btn("cancel", () => act("/api/messages/" + m.id + "/deliveries/" + d.peer_id + "/cancel", "POST"), "danger", "cancel this delivery"));
+          // One control per recipient: its name and state are the button, and
+          // the actions open beneath it as icons, so the row stays a row of
+          // names instead of a wall of text buttons.
+          const chip = document.createElement("span");
+          chip.className = "delivery";
+          const name = document.createElement("span");
+          name.className = "dname";
+          name.textContent = peerLabel(d.peer_id);
+          const state = document.createElement("span");
+          state.className = "dstate " + (d.state || "stored");
+          state.title = DELIVERY_STATE_TEXT[d.state] || d.state;
+          const open = document.createElement("button");
+          open.className = "delivery-btn";
+          open.title = (d.state ? d.state + " — " : "") + "delivery to " + d.peer_id + "; click for actions";
+          open.append(name, state);
+          const menu = document.createElement("span");
+          menu.className = "delivery-menu";
+          menu.hidden = true;
+          menu.append(
+            btn("⏸", () => act("/api/messages/" + m.id + "/deliveries/" + d.peer_id + "/hold", "POST"), "peer-btn", "hold this delivery pending review"),
+            btn("▶", () => act("/api/messages/" + m.id + "/deliveries/" + d.peer_id + "/release", "POST"), "peer-btn", "release the held delivery"),
+            btn("✕", () => act("/api/messages/" + m.id + "/deliveries/" + d.peer_id + "/cancel", "POST"), "peer-btn danger", "cancel this delivery"),
+          );
+          open.addEventListener("click", (event) => {
+            event.stopPropagation();
+            const wasOpen = !menu.hidden;
+            closeDeliveryMenus();
+            menu.hidden = wasOpen;
+          });
+          chip.append(open, menu);
+          row.appendChild(chip);
         }
         box.appendChild(row);
       }
@@ -1459,43 +1828,129 @@ async function renderAll() {
     renderEventFeed(feed);
   });
 
-  renderIfChanged("moderation", hash(JSON.stringify(members) + JSON.stringify(fences)), () => {
-    const box = el("moderation");
-    clear(box);
-    const label = document.createElement("span");
-    label.className = "label";
-    label.textContent = "conversation gates";
-    box.appendChild(label);
-    for (const peer of members) {
-      const chip = document.createElement("span");
-      chip.className = "peer-ctl";
+  // The gates menu: one row per gateable member, with pause/block toggles and
+  // kick. The operator is not gateable — it is in every room by construction and
+  // has no deliveries to gate — so it is neither listed nor offered a control.
+  const gateable = members.filter((peer) => peer !== "operator");
+  roomMembers = gateable;
+  roomFences = fences;
+  renderIfChanged("gates", hash(JSON.stringify(gateable) + JSON.stringify(fences) + selected), () => {
+    const list = el("gates-list");
+    clear(list);
+    for (const peer of gateable) {
+      const row = document.createElement("div");
+      row.className = "gate-row";
       const name = document.createElement("span");
-      name.className = "name";
-      name.textContent = peer;
-      chip.appendChild(name);
-      chip.appendChild(btn("pause", () => fence("pause", peer), "", "no NEW deliveries to " + peer + "; in-flight turns may finish"));
-      chip.appendChild(btn("block", () => fence("block", peer), "danger", "no delivery to " + peer + " at all"));
-      box.appendChild(chip);
-    }
-    const fenceBox = el("fences");
-    clear(fenceBox);
-    for (const f of fences) {
-      const chip = document.createElement("span");
-      chip.className = "fence-chip";
-      chip.appendChild(document.createTextNode(f.kind + " on " + f.peer_id + " by " + f.set_by));
-      chip.appendChild(btn("clear", () => act("/api/fences/" + f.id, "DELETE"), "danger", "remove this gate"));
-      fenceBox.appendChild(chip);
+      name.className = "gate-name";
+      name.textContent = peerLabel(peer);
+      name.title = peer;
+      row.appendChild(name);
+      for (const kind of ["pause", "block"]) {
+        const fence = fences.find((f) => f.peer_id === peer && f.kind === kind);
+        const label = kind === "pause" ? "⏸" : "⛔";
+        // "block" already blocks everything, so it reads as the stronger gate.
+        const title = fence
+          ? "clear the " + kind + " gate on " + peer
+          : (kind === "pause" ? "no NEW deliveries to " : "no delivery to ") + peer;
+        row.appendChild(btn(label, () => toggleFence(peer, kind, fence),
+          "peer-btn" + (fence ? " on" : "") + (kind === "block" ? " block" : ""), title));
+      }
+      // Two-click confirm: a blocked window.confirm returns false silently, so
+      // one click would look dead.
+      let armed = false;
+      let armTimer = null;
+      const kick = btn("✕", () => {
+        if (!armed) {
+          armed = true;
+          kick.textContent = "✓";
+          kick.title = "click again to kick " + peer + " from this room";
+          armTimer = setTimeout(() => {
+            armed = false;
+            kick.textContent = "✕";
+            kick.title = "kick " + peer + " from this room";
+          }, 4000);
+          return;
+        }
+        clearTimeout(armTimer);
+        kick.disabled = true;
+        kickMember(peer);
+      }, "peer-btn danger", "kick " + peer + " from this room (stays enrolled)");
+      row.appendChild(kick);
+      list.appendChild(row);
     }
   });
 }
 
-async function fence(kind, peerId) {
+// Sets or clears one gate on one member.
+//
+// # Arguments
+//
+// * `peerId` — the member.
+// * `kind` — `pause` or `block`.
+// * `existing` — the fence already set for this member and kind, if any.
+async function toggleFence(peerId, kind, existing) {
+  if (existing) {
+    await act("/api/fences/" + existing.id, "DELETE");
+    return;
+  }
   await api("/api/conversations/" + selected + "/fences", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ peer_id: peerId, kind }),
   });
   await renderAll();
+}
+
+// Applies a bulk gate action to every member of the room.
+//
+// # Arguments
+//
+// * `action` — `pause`, `block`, or `clear` for every gate in the room.
+async function applyBulkGate(action) {
+  if (action === "clear") {
+    for (const gate of roomFences) {
+      await api("/api/fences/" + gate.id, { method: "DELETE" });
+    }
+    await renderAll();
+    return;
+  }
+  for (const peer of roomMembers) {
+    if (roomFences.some((gate) => gate.peer_id === peer && gate.kind === action)) continue;
+    await api("/api/conversations/" + selected + "/fences", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ peer_id: peer, kind: action }),
+    });
+  }
+  await renderAll();
+}
+
+// Kicks a member out of this room. The peer stays enrolled in the hub and in
+// its other rooms; only this room's membership changes.
+//
+// # Arguments
+//
+// * `peerId` — the member to remove.
+async function kickMember(peerId) {
+  try {
+    await api("/api/conversations/" + selected + "/members/" + encodeURIComponent(peerId), {
+      method: "DELETE",
+    });
+  } catch { /* the next render shows the membership as it stands */ }
+  await renderAll();
+}
+
+// Opens or closes the gates menu. It floats over the transcript, so opening it
+// never reflows the pane.
+//
+// # Arguments
+//
+// * `open` — force a state; omitted toggles.
+function toggleGatesMenu(open) {
+  const menu = el("gates-menu");
+  const next = open ?? menu.hidden;
+  menu.hidden = !next;
+  el("gates-toggle").setAttribute("aria-expanded", String(next));
 }
 
 async function act(path, method) {
@@ -1633,8 +2088,28 @@ async function connectWith(value) {
 }
 
 async function startApp() {
+  installTooltips();
   el("boot").classList.add("connecting");
   startCounterTicker();
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest(".delivery")) closeDeliveryMenus();
+  });
+  el("gates-toggle").addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleGatesMenu();
+  });
+  for (const bulk of document.querySelectorAll("#gates-menu [data-bulk]")) {
+    bulk.addEventListener("click", (event) => {
+      event.stopPropagation();
+      applyBulkGate(bulk.dataset.bulk);
+    });
+  }
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest("#convo-head")) toggleGatesMenu(false);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") toggleGatesMenu(false);
+  });
   await loadConversations();
   await loadModeration();
   await loadPeers();

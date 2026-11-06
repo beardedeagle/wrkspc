@@ -25,7 +25,16 @@
 //      a JSON content type and a JSON body;
 //   9. boot/ban/restore/forget carry the right PATCH/DELETE wire shapes,
 //      render their badges, stamp rows from the moderation feed, and the
-//      hide-ejected toggle filters the cohort.
+//      hide-ejected toggle filters the cohort;
+//  10. the conversation strip carries the room's name (or `unnamed room`), its
+//      short id and its members in one block, the edit control renames it over
+//      PATCH, and the gates menu floats over the transcript, keeps its header
+//      fixed while its rows scroll, and gates and kicks from each row;
+//  11. each of the four side panes (cohort, conversations, unknown attempts,
+//      system events) is its own scroll container, and a hovered element's
+//      tooltip arrives in under 400 ms with the native title held off. The
+//      operator is in every room by construction and has no deliveries to gate,
+//      so it is neither listed nor given pause/block.
 //
 // Prerequisites: Node >= 22 (global WebSocket and fetch), python3, and
 // Google Chrome. Set CHROME to the browser binary when it isn't at the
@@ -88,10 +97,13 @@ async function waitFor(probe, timeoutMs, what) {
  *   The mock process and its base URL.
  * @throws {Error} When the mock exits or never reports its port.
  */
-function startMock(aCount) {
-  const proc = spawn("python3", ["-I", join(HERE, "mock_api.py"), PAGE, String(aCount)], {
-    stdio: ["ignore", "pipe", "inherit"],
-  });
+function startMock(aCount, peerCount = 2, unknownCount = 0, eventCount = 0) {
+  const proc = spawn(
+    "python3",
+    ["-I", join(HERE, "mock_api.py"), PAGE, String(aCount), String(peerCount), String(unknownCount),
+      String(eventCount)],
+    { stdio: ["ignore", "pipe", "inherit"] },
+  );
   return new Promise((resolvePort, reject) => {
     const timer = setTimeout(() => reject(new Error("mock did not report its port")), STARTUP_TIMEOUT_MS);
     proc.once("error", (e) => reject(new Error("could not start python3: " + e.message)));
@@ -180,6 +192,7 @@ async function connect(port) {
       return msg.result?.result?.value;
     },
     navigate: async (url) => { await send("Page.navigate", { url }); },
+    send,
     errors,
     close: () => ws.close(),
   };
@@ -341,6 +354,46 @@ async function runScenario(aCount) {
     }
     if (!split.feedHasDispatch) failures.push("the system feed is missing dispatch events");
     if (split.feedHasReport) failures.push("the work report leaked into the system feed");
+
+    // The delivery row is a name, a state dot, and three icon controls — no
+    // badge wall, no words on the buttons.
+    const delivery = await page.evaluate(`(() => {
+      const chips = [...document.querySelectorAll("#transcript .deliveries .delivery")];
+      return {
+        chips: chips.length,
+        names: chips.map((c) => c.querySelector(".dname")?.textContent ?? null),
+        states: chips.map((c) => (c.querySelector(".dstate")?.className ?? "").replace("dstate ", "")),
+        stateTitles: chips.map((c) => c.querySelector(".dstate")?.title ?? null),
+        buttons: chips.map((c) => c.querySelectorAll("button.delivery-btn").length),
+        menuIcons: chips.map((c) => c.querySelectorAll(".delivery-menu button.peer-btn").length),
+        menuHidden: chips.map((c) => c.querySelector(".delivery-menu")?.hidden ?? null),
+        wordButtons: [...document.querySelectorAll("#transcript .deliveries button")]
+          .map((b) => b.textContent.trim())
+          .filter((t) => ["hold", "release", "cancel"].includes(t)).length,
+      };
+    })()`);
+    if (delivery.chips !== 2) failures.push(`delivery chips: got ${delivery.chips}, want 2`);
+    if (JSON.stringify(delivery.names) !== JSON.stringify(["codex", "kestrel"])) {
+      failures.push(`delivery names: got ${JSON.stringify(delivery.names)}`);
+    }
+    if (JSON.stringify(delivery.states) !== JSON.stringify(["delivered", "stored"])) {
+      failures.push(`delivery state dots: got ${JSON.stringify(delivery.states)}`);
+    }
+    if (!delivery.stateTitles.every((t) => typeof t === "string" && t.includes("—"))) {
+      failures.push(`delivery state titles: got ${JSON.stringify(delivery.stateTitles)}`);
+    }
+    if (!delivery.buttons.every((n) => n === 1)) {
+      failures.push(`every delivery must be one button: got ${JSON.stringify(delivery.buttons)}`);
+    }
+    if (!delivery.menuIcons.every((n) => n === 3)) {
+      failures.push(`delivery action menu: got ${JSON.stringify(delivery.menuIcons)} icons, want 3`);
+    }
+    if (!delivery.menuHidden.every((h) => h === true)) {
+      failures.push(`delivery menus must start closed: got ${JSON.stringify(delivery.menuHidden)}`);
+    }
+    if (delivery.wordButtons !== 0) {
+      failures.push(`delivery row still renders word buttons: ${delivery.wordButtons}`);
+    }
     if (split.unstampedLines !== 0) {
       failures.push(`${split.unstampedLines} feed line(s) render without a timestamp`);
     }
@@ -490,6 +543,578 @@ async function runPeerRenameScenario() {
         failures.push(`PATCH body ${JSON.stringify(patch.body)}, want {"alias":"renamed-codex"}`);
       }
       if (patch.path !== "/api/peers/codex") failures.push(`PATCH path ${patch.path}, want /api/peers/codex`);
+    }
+    if (page.errors.length) failures.push("page exceptions: " + page.errors.join(" | "));
+  } finally {
+    page?.close();
+    if (chrome) {
+      await stop(chrome.proc);
+      rmSync(chrome.profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    }
+    await stop(mock.proc);
+  }
+  return failures;
+}
+
+/**
+ * Runs the pane-scrolling and tooltip scenario once against a fresh mock with a
+ * wide roster and seeded unknown attempts: all four panes (cohort and
+ * conversations on the left, unknown attempts and system events on the right)
+ * must each be their own scroll container, and a hovered element's tooltip must
+ * arrive far faster than the browser's own.
+ *
+ * @returns {Promise<string[]>} Failure descriptions; empty on success.
+ */
+async function runScrollAndTooltipScenario() {
+  const failures = [];
+  const mock = await startMock(5, 14, 6, 30);
+  let chrome;
+  let page;
+  try {
+    chrome = await startChrome();
+    page = await connect(chrome.port);
+    // A short window is what makes every pane overflow at once; the assertions
+    // are about each pane owning its own scroll, not about a particular height.
+    await page.send("Emulation.setDeviceMetricsOverride", {
+      width: 1100,
+      height: 420,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await page.navigate(mock.base + "/");
+    await waitFor(
+      () => page.evaluate("document.querySelectorAll('#peer-list .peer-row').length >= 12"),
+      STARTUP_TIMEOUT_MS,
+      "the wide cohort to render",
+    );
+
+    // Every pane has to have finished loading before it can be measured: the
+    // feed renders after its events fetch lands.
+    await waitFor(
+      () => page.evaluate("document.querySelectorAll('#events-feed .feed-line').length >= 10 && document.querySelectorAll('#unknown-list .attempt').length >= 6"),
+      STARTUP_TIMEOUT_MS,
+      "the right column to load",
+    );
+
+    // The operator holds the top of the cohort, however the roster is ordered.
+    const firstPeer = await page.evaluate(
+      "document.querySelector('#peer-list .peer-row .peer-name')?.textContent ?? null",
+    );
+    if (firstPeer !== "operator") {
+      failures.push(`the cohort starts with ${JSON.stringify(firstPeer)}, want "operator"`);
+    }
+
+    // Each rail heading draws a hairline, so its list is bounded at the top the
+    // same way the rows are separated below.
+    const headings = JSON.parse(
+      await page.evaluate(
+        "JSON.stringify([...document.querySelectorAll('.split-slot > .rail-row')].map((r) => ({ label: r.querySelector('h2').textContent, border: getComputedStyle(r).borderBottomWidth })))",
+      ),
+    );
+    if (headings.length !== 2) failures.push(`${headings.length} rail headings, want 2 (cohort and conversations)`);
+    for (const heading of headings) {
+      if (heading.border !== "1px") failures.push(`the ${heading.label} heading draws no rule (border-bottom: ${heading.border})`);
+    }
+
+    const panes = ["peer-list", "convo-list", "unknown-list", "events-feed"];
+    const measured = JSON.parse(
+      await page.evaluate(
+        `JSON.stringify(${JSON.stringify(panes)}.map((id) => {
+          const el = document.getElementById(id);
+          const style = getComputedStyle(el);
+          return { id, overflow: style.overflowY, client: el.clientHeight, scroll: el.scrollHeight };
+        }))`,
+      ),
+    );
+    for (const pane of measured) {
+      if (pane.overflow !== "auto" && pane.overflow !== "scroll") {
+        failures.push(`${pane.id} does not scroll on its own (overflow-y: ${pane.overflow})`);
+      }
+      if (!(pane.scroll > pane.client)) {
+        failures.push(`${pane.id} has nothing to scroll: ${pane.scroll} <= ${pane.client}`);
+      }
+    }
+
+    // Each pane scrolls alone: moving one must leave the other three at the top.
+    for (const id of panes) {
+      await page.evaluate(`document.getElementById(${JSON.stringify(id)}).scrollTop = 10000`);
+      const state = JSON.parse(
+        await page.evaluate(
+          `JSON.stringify(${JSON.stringify(panes)}.map((p) => ({ id: p, top: document.getElementById(p).scrollTop })))`,
+        ),
+      );
+      const moved = state.find((p) => p.id === id).top;
+      if (moved <= 0) failures.push(`${id} did not scroll when asked`);
+      for (const other of state) {
+        // The feed follows new traffic by design, so its scrollTop moves on its
+        // own; the independence check only covers panes that never self-scroll.
+        if (other.id !== id && other.id !== "events-feed" && other.top !== 0) {
+          failures.push(`scrolling ${id} also moved ${other.id} to ${other.top}`);
+        }
+      }
+      await page.evaluate(`document.getElementById(${JSON.stringify(id)}).scrollTop = 0`);
+    }
+
+    // Let the page settle: the transcript follows new traffic, which used to be
+    // enough to cancel a pending tooltip.
+    await sleep(1200);
+
+    // The tooltip: fast, and the native one never gets a chance to appear.
+    const timing = await page.evaluate(`(async () => {
+      const toggle = document.getElementById('gates-toggle');
+      const box = toggle.getBoundingClientRect();
+      const text = toggle.getAttribute('title');
+      if (!text) return JSON.stringify({ error: 'the trigger carries no title' });
+      const started = performance.now();
+      toggle.dispatchEvent(new MouseEvent('mouseover', {
+        bubbles: true, clientX: box.left + 4, clientY: box.top + 4,
+      }));
+      let shown = null;
+      while (performance.now() - started < 1500) {
+        const tip = document.getElementById('tooltip');
+        if (tip && !tip.hidden && tip.textContent) {
+          shown = { ms: performance.now() - started, text: tip.textContent, title: toggle.getAttribute('title') };
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      toggle.dispatchEvent(new MouseEvent('mouseout', {
+        bubbles: true, relatedTarget: document.body, clientX: box.left + 4, clientY: box.top + 4,
+      }));
+      await new Promise((r) => setTimeout(r, 60));
+      const tip = document.getElementById('tooltip');
+      return JSON.stringify({
+        text, shown,
+        afterHide: { hidden: tip.hidden, title: toggle.getAttribute('title') },
+      });
+    })()`);
+    const tip = JSON.parse(timing);
+    if (tip.error) failures.push(tip.error);
+    else {
+      if (!tip.shown) failures.push("the tooltip never appeared: " + JSON.stringify(tip));
+      else {
+        if (tip.shown.ms > 400) failures.push(`the tooltip took ${Math.round(tip.shown.ms)}ms, want under 400ms`);
+        if (tip.shown.text !== tip.text) {
+          failures.push(`the tooltip reads ${JSON.stringify(tip.shown.text)}, want ${JSON.stringify(tip.text)}`);
+        }
+        if (tip.shown.title !== null) {
+          failures.push("the native title stayed on the element while the tooltip showed");
+        }
+      }
+      if (!tip.afterHide?.hidden) failures.push("the tooltip stayed up after the pointer left");
+      if (tip.afterHide?.title !== tip.text) failures.push("the title was not restored after the tooltip hid");
+    }
+
+    if (page.errors.length) failures.push("page exceptions: " + page.errors.join(" | "));
+  } finally {
+    page?.close();
+    if (chrome) {
+      await stop(chrome.proc);
+      rmSync(chrome.profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    }
+    await stop(mock.proc);
+  }
+  return failures;
+}
+
+/**
+ * Runs the conversation-strip regression scenario once against a fresh mock:
+ * the strip carries the room's name (or `unnamed room`), its id, and its
+ * members in one block; the gates menu floats over the transcript instead of
+ * pushing it down, keeps its header put while its rows scroll, and each member
+ * row carries pause, block, and (except for the operator) kick.
+ *
+ * @returns {Promise<string[]>} Failure descriptions; empty on success.
+ */
+async function runRoomStripScenario() {
+  const failures = [];
+  const mock = await startMock(5);
+  const stats = async () => (await fetch(mock.base + "/__stats")).json();
+  let chrome;
+  let page;
+  try {
+    chrome = await startChrome();
+    page = await connect(chrome.port);
+    // A desktop-sized column, so the composer's single-row footer is the shape
+    // being asserted rather than a narrow-window wrap.
+    await page.send("Emulation.setDeviceMetricsOverride", {
+      width: 1280,
+      height: 860,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await page.navigate(mock.base + "/");
+    await waitFor(
+      () => page.evaluate("document.querySelectorAll('.convo').length === 3"),
+      STARTUP_TIMEOUT_MS,
+      "the conversation blocks to render",
+    );
+
+    // The composer is one box: tabs inside its top edge, send inside its bottom,
+    // and the writing surface taking the room the outside controls used to hold.
+    const composer = JSON.parse(
+      await page.evaluate(
+        "(() => { const box = document.querySelector('.composer'); if (!box) return JSON.stringify({missing: true}); const foot = box.querySelector('.composer-foot'); const t = document.getElementById('compose-text').getBoundingClientRect(); const seg = foot.querySelector('.seg').getBoundingClientRect(); const send = document.getElementById('compose-send').getBoundingClientRect(); const fb = foot.getBoundingClientRect(); return JSON.stringify({border: getComputedStyle(box).borderTopWidth, sendInside: box.contains(document.getElementById('compose-send')), tabsInside: box.contains(document.getElementById('compose-mode-msg')), tabsInFoot: foot.contains(document.getElementById('compose-mode-msg')), hintText: document.getElementById('compose-hint').textContent, sameRow: Math.abs(seg.top - send.top) < 6 && Math.abs(seg.bottom - send.bottom) < 8, padL: parseFloat(getComputedStyle(foot).paddingLeft), padR: parseFloat(getComputedStyle(foot).paddingRight), segLeft: Math.round(seg.left - fb.left), sendRight: Math.round(fb.right - send.right), textHeight: Math.round(t.height)}); })()",
+      ),
+    );
+    if (composer.missing) failures.push("the composer box is gone");
+    else {
+      if (composer.border !== "1px") failures.push(`the composer draws no border (${composer.border})`);
+      if (!composer.sendInside) failures.push("the send control is outside the composer box");
+      if (!composer.tabsInside) failures.push("the mode tabs are outside the composer box");
+      // The standing "as operator · to …" line is gone; the hint is only for
+      // something the operator must act on.
+      if (composer.hintText !== "") failures.push(`the compose hint reads ${JSON.stringify(composer.hintText)}, want it empty`);
+      if (!composer.tabsInFoot) failures.push("the mode tabs are not in the composer footer");
+      if (!composer.sameRow) failures.push("the mode tabs and send do not share a row");
+      // Measured from the footer's content box: its padding is not a gap.
+      if (Math.abs(composer.segLeft - composer.padL) > 1) {
+        failures.push(`the mode tabs sit ${Math.round(composer.segLeft - composer.padL)}px off the footer's left edge`);
+      }
+      if (Math.abs(composer.sendRight - composer.padR) > 1) {
+        failures.push(`send sits ${Math.round(composer.sendRight - composer.padR)}px off the footer's right edge`);
+      }
+      if (composer.textHeight < 110) failures.push(`the writing surface is ${composer.textHeight}px tall, want at least 110px`);
+    }
+
+    // The left column: a named room, and an unnamed one that says so.
+    const blocks = JSON.parse(
+      await page.evaluate(
+        "JSON.stringify([...document.querySelectorAll('.convo')].map((b) => ({ name: b.querySelector('.cname').textContent, id: b.querySelector('.cid').textContent })))",
+      ),
+    );
+    const named = blocks.find((b) => b.id === "A");
+    const unnamed = blocks.find((b) => b.id === "B");
+    if (named?.name !== "Veritas design") {
+      failures.push(`room A reads ${JSON.stringify(named?.name)}, want "Veritas design"`);
+    }
+    if (unnamed?.name !== "unnamed room") {
+      failures.push(`room B reads ${JSON.stringify(unnamed?.name)}, want "unnamed room"`);
+    }
+
+    // The inline rename: an edit control, a focused field, and a PATCH on Enter.
+    const glyph = await page.evaluate(
+      "[...document.querySelectorAll('.convo')].find((b) => b.querySelector('.cid').textContent === 'A').querySelector('.convo-edit').textContent",
+    );
+    if (glyph !== "\u270e") failures.push(`the edit control reads ${JSON.stringify(glyph)}, want the low pencil U+270E`);
+    const opened = await page.evaluate(
+      "(() => { const block = [...document.querySelectorAll('.convo')].find((b) => b.querySelector('.cid').textContent === 'A'); if (!block) return false; block.querySelector('.convo-edit').click(); return true; })()",
+    );
+    if (!opened) failures.push("room A block or its edit control not found");
+    const editing = await page.evaluate(
+      "document.querySelectorAll('input.convo-rename-input').length === 1 && document.activeElement.classList.contains('convo-rename-input')",
+    );
+    if (!editing) failures.push("the rename field did not open focused");
+
+    // The field takes the block, with the id and both controls on the row below.
+    const layout = JSON.parse(
+      await page.evaluate(
+        "(() => { const b = [...document.querySelectorAll('.convo')].find((x) => x.querySelector('input.convo-rename-input')); const i = b.querySelector('input.convo-rename-input'); const shell = b.querySelector('.convo-rename').getBoundingClientRect(); const id = b.querySelector('.convo-rename-foot .cid').getBoundingClientRect(); const ctl = b.querySelector('.convo-rename-foot .convo-actions').getBoundingClientRect(); const ib = i.getBoundingClientRect(); const ed = b.querySelector('.convo-edit').getBoundingClientRect(); const dl = b.querySelector('.convo-del').getBoundingClientRect(); return JSON.stringify({ field: ib.width, block: shell.width, idBelow: id.top >= ib.bottom - 1, idLeft: id.left - shell.left, ctlBelow: ctl.top >= ib.bottom - 1, ctlRight: shell.right - ctl.right, sameRow: Math.abs(ed.top - dl.top) < 4 && dl.left >= ed.left, delOffRight: Math.abs(shell.right - dl.right) }); })()",
+      ),
+    );
+    if (layout.field < layout.block * 0.75) {
+      failures.push(`rename field is ${Math.round(layout.field)}px of a ${Math.round(layout.block)}px block, want it full width`);
+    }
+    if (!layout.idBelow) failures.push("the room id is not beneath the field");
+    if (!layout.ctlBelow) failures.push("the controls are not beneath the field");
+    if (layout.idLeft > 4) failures.push(`the room id starts ${Math.round(layout.idLeft)}px into the block, want it left-aligned`);
+    if (layout.ctlRight > 4) failures.push(`the controls end ${Math.round(layout.ctlRight)}px short of the block edge, want them pinned right`);
+    if (!layout.sameRow) failures.push("the edit and delete controls do not share a row");
+    if (layout.delOffRight > 4) failures.push(`the delete control ends ${Math.round(layout.delOffRight)}px off the block edge`);
+
+    // The resting block keeps both controls in one right-pinned cluster.
+    const resting = JSON.parse(
+      await page.evaluate(
+        "(() => { const b = [...document.querySelectorAll('.convo')].find((x) => x.querySelector('.cid')?.textContent === 'A'); const a = b.querySelector('.convo-actions').getBoundingClientRect(); const ed = b.querySelector('.convo-edit').getBoundingClientRect(); const dl = b.querySelector('.convo-del').getBoundingClientRect(); const bb = b.getBoundingClientRect(); return JSON.stringify({ delInside: dl.left >= a.left - 1 && dl.right <= a.right + 1, sameRow: Math.abs(ed.top - dl.top) < 4, delOffRight: bb.right - dl.right }); })()",
+      ),
+    );
+    if (!resting.delInside) failures.push("the resting delete control is outside the action cluster");
+    if (!resting.sameRow) failures.push("the resting edit and delete controls do not share a row");
+
+    // Escape must always get out, and must leave the block rebuilt.
+    await page.evaluate(
+      "(() => { const i = document.querySelector('input.convo-rename-input'); i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); return true; })()",
+    );
+    const escaped = await waitFor(
+      async () => {
+        const state = JSON.parse(
+          await page.evaluate(
+            "(() => { const b = [...document.querySelectorAll('.convo')].find((x) => x.querySelector('.cid')?.textContent === 'A'); return JSON.stringify({ inputs: document.querySelectorAll('input.convo-rename-input').length, name: b?.querySelector('.cname')?.textContent ?? null }); })()",
+          ),
+        );
+        return state.inputs === 0 && state.name === "Veritas design" ? state : null;
+      },
+      WATCH_MS,
+      "Escape to leave the rename and restore the block",
+    );
+    if (escaped === null) failures.push("Escape did not leave the rename");
+
+    // Clicking the edit control again cancels without saving.
+    await page.evaluate(
+      "[...document.querySelectorAll('.convo')].find((b) => b.querySelector('.cid')?.textContent === 'A').querySelector('.convo-edit').click()",
+    );
+    await waitFor(
+      () => page.evaluate("document.querySelectorAll('input.convo-rename-input').length === 1"),
+      WATCH_MS,
+      "the rename field to reopen for the cancel path",
+    );
+    const beforeCancel = (await stats()).last_patch?.path ?? null;
+    await page.evaluate(
+      "(() => { const i = document.querySelector('input.convo-rename-input'); i.value = 'never saved'; const b = [...document.querySelectorAll('.convo')].find((x) => x.querySelector('input.convo-rename-input')); b.querySelector('.convo-edit').click(); return true; })()",
+    );
+    const cancelled = await waitFor(
+      async () => {
+        const state = JSON.parse(
+          await page.evaluate(
+            "(() => { const b = [...document.querySelectorAll('.convo')].find((x) => x.querySelector('.cid')?.textContent === 'A'); return JSON.stringify({ inputs: document.querySelectorAll('input.convo-rename-input').length, name: b?.querySelector('.cname')?.textContent ?? null }); })()",
+          ),
+        );
+        return state.inputs === 0 ? state : null;
+      },
+      WATCH_MS,
+      "the cancel click to close the field",
+    );
+    if (cancelled === null) failures.push("clicking the edit control again did not close the field");
+    if (cancelled?.name !== "Veritas design") failures.push(`cancel saved a name: ${JSON.stringify(cancelled?.name)}`);
+    if (((await stats()).last_patch?.path ?? null) !== beforeCancel) {
+      failures.push("cancel sent a PATCH");
+    }
+
+    // Re-open for the commit path.
+    await page.evaluate(
+      "[...document.querySelectorAll('.convo')].find((b) => b.querySelector('.cid').textContent === 'A').querySelector('.convo-edit').click()",
+    );
+    await waitFor(
+      () => page.evaluate("document.querySelectorAll('input.convo-rename-input').length === 1"),
+      WATCH_MS,
+      "the rename field to open again",
+    );
+    // A poll must not eat the field while it is open.
+    await sleep(WATCH_MS);
+    const survived = await page.evaluate("document.querySelectorAll('input.convo-rename-input').length === 1");
+    if (!survived) failures.push("rename field destroyed by a poll re-render");
+    await page.evaluate(
+      "(() => { const i = document.querySelector('input.convo-rename-input'); i.value = 'Veritas design 2'; i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); return true; })()",
+    );
+    const patch = await waitFor(
+      async () => {
+        const seen = (await stats()).last_patch;
+        return seen?.path === "/api/conversations/A" ? seen : null;
+      },
+      WATCH_MS,
+      "the rename PATCH to reach the mock",
+    );
+    let patchBody = null;
+    try {
+      patchBody = JSON.parse(patch.body);
+    } catch {
+      /* stays null */
+    }
+    if (!patch.content_type.includes("application/json")) {
+      failures.push(`rename content type ${JSON.stringify(patch.content_type)}, want application/json`);
+    }
+    if (patchBody?.name !== "Veritas design 2") {
+      failures.push(`rename body ${JSON.stringify(patch.body)}, want {"name":"Veritas design 2"}`);
+    }
+    const renamed = await waitFor(
+      async () => {
+        const current = await page.evaluate(
+          "[...document.querySelectorAll('.convo')].find((b) => b.querySelector('.cid')?.textContent === 'A')?.querySelector('.cname')?.textContent ?? null",
+        );
+        return current === "Veritas design 2" ? current : null;
+      },
+      WATCH_MS,
+      "the renamed room to re-render",
+    );
+    if (renamed !== "Veritas design 2") failures.push("the renamed room did not re-render");
+
+    // Select the wide room and read the strip.
+    await page.evaluate(
+      "[...document.querySelectorAll('.convo')].find((b) => b.querySelector('.cid')?.textContent === 'C').click()",
+    );
+    await waitFor(
+      () => page.evaluate("document.getElementById('room-id').textContent === 'C'"),
+      STARTUP_TIMEOUT_MS,
+      "the wide room to open",
+    );
+    const strip = JSON.parse(
+      await page.evaluate(
+        "JSON.stringify({ name: document.getElementById('room-name').textContent, id: document.getElementById('room-id').textContent, members: document.getElementById('room-members').textContent })",
+      ),
+    );
+    if (strip.name !== "unnamed room") {
+      failures.push(`strip name ${JSON.stringify(strip.name)}, want "unnamed room"`);
+    }
+    if (!strip.members.startsWith("operator, m01")) {
+      failures.push(`members line ${JSON.stringify(strip.members)}, want it to start "operator, m01"`);
+    }
+
+    // The trigger is pinned to the strip's right edge, and the menu opens
+    // beneath it rather than under the room name.
+    const pinned = JSON.parse(
+      await page.evaluate(
+        "(() => { const t = document.getElementById('gates-toggle').getBoundingClientRect(); const h = document.getElementById('convo-head').getBoundingClientRect(); return JSON.stringify({ gap: h.right - t.right, toggleRight: t.right }); })()",
+      ),
+    );
+    if (pinned.gap > 24) failures.push(`the gates trigger sits ${Math.round(pinned.gap)}px from the strip's right edge`);
+
+    // The menu floats: opening it must not move the transcript.
+    const closedTop = await page.evaluate("document.getElementById('transcript').getBoundingClientRect().top");
+    const hiddenAtStart = await page.evaluate("document.getElementById('gates-menu').hidden");
+    if (!hiddenAtStart) failures.push("the gates menu starts open");
+    await page.evaluate("document.getElementById('gates-toggle').click()");
+    await sleep(150);
+    const openTop = await page.evaluate("document.getElementById('transcript').getBoundingClientRect().top");
+    if (Math.abs(openTop - closedTop) > 0.5) {
+      failures.push(`opening the menu moved the transcript by ${openTop - closedTop}px`);
+    }
+    const menuAligned = JSON.parse(
+      await page.evaluate(
+        "(() => { const m = document.getElementById('gates-menu').getBoundingClientRect(); const t = document.getElementById('gates-toggle').getBoundingClientRect(); return JSON.stringify({ delta: Math.abs(m.right - t.right) }); })()",
+      ),
+    );
+    if (menuAligned.delta > 2) failures.push(`the menu's right edge is ${Math.round(menuAligned.delta)}px off the trigger's`);
+    const rows = await page.evaluate("document.querySelectorAll('#gates-list .gate-row').length");
+    if (rows !== 19) failures.push(`${rows} gate rows, want 19 (20 members less the operator)`);
+    const listed = JSON.parse(
+      await page.evaluate(
+        "JSON.stringify([...document.querySelectorAll('#gates-list .gate-row .gate-name')].map((n) => n.textContent))",
+      ),
+    );
+    if (listed.includes("operator")) failures.push("the operator is listed in the gates menu");
+
+    // A fixed header over a scrolling list.
+    const scroll = JSON.parse(
+      await page.evaluate(
+        "(() => { const l = document.getElementById('gates-list'); return JSON.stringify({ client: l.clientHeight, scroll: l.scrollHeight, headTop: document.querySelector('.gates-head').getBoundingClientRect().top }); })()",
+      ),
+    );
+    if (!(scroll.scroll > scroll.client)) {
+      failures.push(`the gates list does not scroll: ${scroll.scroll} <= ${scroll.client}`);
+    }
+    await page.evaluate("document.getElementById('gates-list').scrollTop = 10000");
+    await sleep(100);
+    const headAfter = await page.evaluate("document.querySelector('.gates-head').getBoundingClientRect().top");
+    if (Math.abs(headAfter - scroll.headTop) > 0.5) failures.push("the menu header scrolled with the list");
+
+    // One member's gate: the POST shape, then the icon lit from the re-read.
+    await page.evaluate(
+      "(() => { const row = [...document.querySelectorAll('#gates-list .gate-row')].find((r) => r.querySelector('.gate-name').textContent === 'm01'); row.querySelector('.peer-btn').click(); return true; })()",
+    );
+    const gate = await waitFor(
+      async () => {
+        const seen = (await stats()).last_fence;
+        return seen?.path === "/api/conversations/C/fences" ? seen : null;
+      },
+      WATCH_MS,
+      "the pause gate to reach the mock",
+    );
+    let gateBody = null;
+    try {
+      gateBody = JSON.parse(gate.body);
+    } catch {
+      /* stays null */
+    }
+    if (gateBody?.peer_id !== "m01" || gateBody?.kind !== "pause") {
+      failures.push(`pause body ${JSON.stringify(gate.body)}, want {"peer_id":"m01","kind":"pause"}`);
+    }
+    const lit = await waitFor(
+      async () => {
+        const count = await page.evaluate("document.querySelectorAll('#gates-list .peer-btn.on').length");
+        return count === 1 ? count : null;
+      },
+      WATCH_MS,
+      "the pause gate to light up",
+    );
+    if (lit !== 1) failures.push("the pause gate did not render as set");
+
+    // The bulk header: pause everyone, then clear every gate in the room.
+    await page.evaluate(`document.querySelector('#gates-menu [data-bulk="pause"]').click()`);
+    const allPaused = await waitFor(
+      async () => {
+        const count = await page.evaluate("document.querySelectorAll('#gates-list .peer-btn.on:not(.block)').length");
+        return count === 19 ? count : null;
+      },
+      2 * WATCH_MS,
+      "every gateable member to be paused",
+    );
+    if (allPaused !== 19) failures.push("the bulk pause did not apply to every gateable member");
+    await page.evaluate(`document.querySelector('#gates-menu [data-bulk="clear"]').click()`);
+    let cleared = null;
+    try {
+      cleared = await waitFor(
+        async () => {
+          // `0` is falsy, so the probe returns a word: waitFor reads a falsy
+          // result as "not yet".
+          const count = await page.evaluate("document.querySelectorAll('#gates-list .gate-row .peer-btn.on').length");
+          return count === 0 ? "cleared" : null;
+        },
+        2 * WATCH_MS,
+        "every gate to clear",
+      );
+    } catch (error) {
+      const left = await page.evaluate("document.querySelectorAll('#gates-list .gate-row .peer-btn.on').length");
+      failures.push(
+        `bulk clear left ${left} gates set (errors: ${page.errors.join(" | ") || "none"}, last delete ${JSON.stringify((await stats()).last_fence_delete)})`,
+      );
+    }
+    if (cleared !== null && cleared !== "cleared") failures.push("the bulk clear left gates set");
+    const clearedPath = (await stats()).last_fence_delete?.path ?? "";
+    if (!clearedPath.startsWith("/api/fences/")) {
+      failures.push(`the bulk clear deleted ${JSON.stringify(clearedPath)}, want /api/fences/{id}`);
+    }
+
+    // Kick arms on the first click and fires on the second.
+    const beforeKick = (await stats()).last_delete?.path ?? null;
+    const armed = await page.evaluate(
+      "(() => { const row = [...document.querySelectorAll('#gates-list .gate-row')].find((r) => r.querySelector('.gate-name').textContent === 'm02'); const k = row.querySelector('.peer-btn.danger'); k.click(); return k.textContent; })()",
+    );
+    if (armed !== "✓") failures.push(`the kick did not arm: ${JSON.stringify(armed)}`);
+    await sleep(200);
+    if (((await stats()).last_delete?.path ?? null) !== beforeKick) {
+      failures.push("the first click already kicked");
+    }
+    await page.evaluate(
+      "(() => { const row = [...document.querySelectorAll('#gates-list .gate-row')].find((r) => r.querySelector('.gate-name').textContent === 'm02'); row.querySelector('.peer-btn.danger').click(); return true; })()",
+    );
+    const kickedDelete = await waitFor(
+      async () => {
+        const seen = (await stats()).last_delete;
+        return seen?.path?.includes("/members/m02") ? seen : null;
+      },
+      WATCH_MS,
+      "the kick to reach the mock",
+    );
+    if (kickedDelete.method !== "DELETE") failures.push("the kick did not use DELETE");
+
+    // Deleting a room arms first: one stray click must not lose a transcript.
+    const beforeRoomDelete = (await stats()).last_delete?.path ?? null;
+    const armedRoom = await page.evaluate(
+      "(() => { const b = [...document.querySelectorAll('.convo')].find((x) => x.querySelector('.cid').textContent === 'B'); const d = b.querySelector('.convo-del'); d.click(); return d.textContent; })()",
+    );
+    if (armedRoom !== "✓") failures.push(`the room delete did not arm: ${JSON.stringify(armedRoom)}`);
+    await sleep(200);
+    if (((await stats()).last_delete?.path ?? null) !== beforeRoomDelete) {
+      failures.push("the first click already deleted the room");
+    }
+    await page.evaluate(
+      "(() => { const b = [...document.querySelectorAll('.convo')].find((x) => x.querySelector('.cid').textContent === 'B'); b.querySelector('.convo-del').click(); return true; })()",
+    );
+    const roomDeleted = await waitFor(
+      async () => {
+        const seen = (await stats()).last_delete;
+        return seen?.path === "/api/conversations/B" ? seen : null;
+      },
+      WATCH_MS,
+      "the confirmed delete to reach the mock",
+    );
+    if (roomDeleted.method !== "DELETE") failures.push("the room delete did not use DELETE");
+
+    // Escape closes the menu.
+    await page.evaluate(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))`);
+    await sleep(100);
+    if (!(await page.evaluate("document.getElementById('gates-menu').hidden"))) {
+      failures.push("Escape did not close the gates menu");
     }
     if (page.errors.length) failures.push("page exceptions: " + page.errors.join(" | "));
   } finally {
@@ -806,6 +1431,28 @@ for (const aCount of SCENARIOS) {
   }
   failed ||= failures.length > 0;
   console.log(`${failures.length ? "FAIL" : "ok  "} peer moderation`);
+  for (const f of failures) console.log("     " + f);
+}
+{
+  let failures;
+  try {
+    failures = await runScrollAndTooltipScenario();
+  } catch (e) {
+    failures = [e.message];
+  }
+  failed ||= failures.length > 0;
+  console.log(`${failures.length ? "FAIL" : "ok  "} panes + tooltip`);
+  for (const f of failures) console.log("     " + f);
+}
+{
+  let failures;
+  try {
+    failures = await runRoomStripScenario();
+  } catch (e) {
+    failures = [e.message];
+  }
+  failed ||= failures.length > 0;
+  console.log(`${failures.length ? "FAIL" : "ok  "} room strip`);
   for (const f of failures) console.log("     " + f);
 }
 {

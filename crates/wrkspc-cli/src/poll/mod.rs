@@ -21,7 +21,7 @@ pub use delivery::{Delivery, PollOutcome, process_deliveries};
 pub(crate) use outbound::sync_outbound;
 pub use poll_loop::{PollLoopConfig, run_poll_loop};
 pub use presence::{PresenceDecl, PresenceSource};
-pub(crate) use presence::{sync_roster, upload_presence};
+pub(crate) use presence::{sync_conversations, sync_roster, upload_presence};
 
 #[cfg(test)]
 use wrkspc_core::{Store, TaskRow};

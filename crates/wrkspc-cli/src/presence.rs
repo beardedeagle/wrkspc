@@ -122,6 +122,41 @@ pub async fn roster_get(
     }
 }
 
+/// `GET /conversations` — the hub's room list, for node mirroring.
+///
+/// Nodes learn a room from the first delivery that reaches them; this fills in
+/// the rest, so the room set, its members, and the operator's names agree across
+/// machines instead of each store knowing only what it happened to see.
+///
+/// # Arguments
+///
+/// * `state` — the discovery state holding the hub's store.
+/// * `headers` — the stamped identity headers; a request without a peer stamp
+///   is refused.
+///
+/// # Returns
+///
+/// The conversation list, or a JSON error with the status that caused it.
+pub async fn conversations_get(
+    State(state): State<PresenceState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = crate::delivery::stamped_host(&headers) {
+        return response.into_response();
+    }
+    match state.store.list_conversations().await {
+        Ok(conversations) => (StatusCode::OK, Json(conversations)).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "conversation list read failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "conversation list read failed" })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// `GET /peers/{peer}/agent-card.json` — the per-peer discovery card.
 pub async fn peer_card(
     State(state): State<PresenceState>,

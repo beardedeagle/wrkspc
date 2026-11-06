@@ -128,7 +128,8 @@ class MockState:
         a_from_zero (int): Conversation-A events requests with after_seq=0.
     """
 
-    def __init__(self, a_count: int) -> None:
+    def __init__(self, a_count: int, peer_count: int = 2, unknown_count: int = 0,
+                 event_count: int = 0) -> None:
         """Seeds conversations A and B.
 
         Args:
@@ -137,16 +138,41 @@ class MockState:
                 claude turn follows in seq order, two fragments in.
         """
         self.lock = threading.Lock()
+        # Extra roster rows and unknown attempts, seeded only by the scroll
+        # scenario so the four panes have something to scroll.
+        self.extra_peers = peer_count
+        self.extra_events = event_count
+        self.unknown_attempts = [
+            {"attempt_id": f"attempt-unknown-{n:02d}", "recipient_id": f"m{n:02d}",
+             "stop_reason": "dispatcher restart during attempt"}
+            for n in range(1, unknown_count + 1)
+        ]
         self.conversations: list[dict[str, Any]] = [
-            {"id": "A", "members": ["operator", "codex"], "created_at": "2026-11-01T00:00:00Z"},
-            {"id": "B", "members": ["operator", "claude"], "created_at": "2026-11-01T00:00:00Z"},
+            # A is named, B is not, and C holds enough members that the gates
+            # menu has to scroll under its fixed header.
+            {"id": "A", "name": "Veritas design",
+             "members": ["operator", "codex"], "created_at": "2026-11-01T00:00:00Z"},
+            {"id": "B", "name": None,
+             "members": ["operator", "claude"], "created_at": "2026-11-01T00:00:00Z"},
+            {"id": "C", "name": None,
+             "members": ["operator"] + [f"m{n:02d}" for n in range(1, 20)],
+             "created_at": "2026-11-01T00:00:00Z"},
         ]
         # A's message is newer, so the page's boot picks A.
         self.messages: dict[str, list[dict[str, Any]]] = {
-            "A": [{"id": "ma1", "sender_id": "codex", "content": "A-msg-1",
-                   "created_at": "2026-11-02T10:00:00Z", "deliveries": []}],
+            "A": [{
+                "id": "ma1", "sender_id": "codex", "content": "A-msg-1",
+                "created_at": "2026-11-02T10:00:00Z",
+                # One delivered and one stored, so the row's state dots and
+                # controls are exercised in both shapes.
+                "deliveries": [
+                    {"peer_id": "codex", "state": "delivered"},
+                    {"peer_id": "kestrel", "state": "stored"},
+                ],
+            }],
             "B": [{"id": "mb1", "sender_id": "claude", "content": B_MESSAGE,
                    "created_at": B_MESSAGE_AT, "deliveries": []}],
+            "C": [],
         }
         a_stop = a_count + 3
         self.events: dict[str, list[dict[str, Any]]] = {
@@ -168,6 +194,7 @@ class MockState:
                        {"task_id": "task-A", "host": "node-test-1", "recipient_peer": "codex"},
                        "2026-11-02T10:00:06Z"),
             ],
+            "C": [],
             "B": [
                 _event("B", a_stop + 3, "dispatch.started",
                        {"attempt_id": "attempt-B", "recipient_id": "claude"}, B_STARTED_AT),
@@ -175,6 +202,14 @@ class MockState:
                 _chunk("B", a_stop + 5, 2, "b-1", B_TURN_AT),
             ],
         }
+        # Extra narration lines, so the system-events pane has something to
+        # scroll in the pane scenario.
+        base = a_stop + 6
+        for n in range(1, event_count + 1):
+            self.events["A"].append(_event(
+                "A", base + n, "delivery.acked",
+                {"task_id": f"task-extra-{n}", "host": "node-test-1", "recipient_peer": f"m{n:02d}"},
+            ))
         self.b_chunks = 2
         self.added_events = 0
         self.a_inflight = 0
@@ -185,6 +220,11 @@ class MockState:
         self.peer_status: dict[str, str] = {}
         self.forgotten: set[str] = set()
         self.moderation: list[dict[str, Any]] = []
+        # Room gates, and the last wire shape each gate call carried, so the
+        # harness can pin what the menu sends.
+        self.fences: dict[str, list[dict[str, Any]]] = {}
+        self.last_fence: dict[str, Any] = {}
+        self.last_fence_delete: dict[str, Any] = {}
 
     def _mod_event(self, peer_id: str, action: str, after: str | None) -> dict[str, Any]:
         """Appends and returns one moderation audit row (operator actor)."""
@@ -208,8 +248,11 @@ class MockState:
         through from PATCHes."""
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         rows = []
-        for pid, host in (("codex", "randys-macbook-pro.mtls.devlocal.home.arpa"),
-                          ("operator", "wrkspc-pilot-host")):
+        roster = [("codex", "randys-macbook-pro.mtls.devlocal.home.arpa"),
+                  ("operator", "wrkspc-pilot-host")]
+        roster += [(f"m{n:02d}", "randys-macbook-pro.mtls.devlocal.home.arpa")
+                   for n in range(1, max(0, self.extra_peers - 2) + 1)]
+        for pid, host in roster:
             if pid in self.forgotten:
                 continue
             rows.append({"peer_id": pid, "alias": self.aliases.get(pid),
@@ -288,7 +331,9 @@ def make_handler(page: str, state: MockState) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, {"a_inflight": state.a_inflight,
                                             "a_from_zero": state.a_from_zero,
                                             "last_patch": state.last_patch,
-                                            "last_delete": state.last_delete})
+                                            "last_delete": state.last_delete,
+                                            "last_fence": state.last_fence,
+                                            "last_fence_delete": state.last_fence_delete})
             if parts == ["api", "conversations"]:
                 return self._send(200, state.conversations)
             if parts == ["api", "peers"]:
@@ -296,7 +341,7 @@ def make_handler(page: str, state: MockState) -> type[BaseHTTPRequestHandler]:
             if parts == ["api", "moderation"]:
                 return self._send(200, list(reversed(state.moderation)))
             if parts == ["api", "attempts", "unknown"]:
-                return self._send(200, [])
+                return self._send(200, state.unknown_attempts)
             if len(parts) in (3, 4) and parts[:2] == ["api", "conversations"] and parts[2] in state.messages:
                 cid = parts[2]
                 if len(parts) == 3:
@@ -304,7 +349,7 @@ def make_handler(page: str, state: MockState) -> type[BaseHTTPRequestHandler]:
                 if parts[3] == "messages":
                     return self._send(200, state.messages[cid])
                 if parts[3] == "fences":
-                    return self._send(200, [])
+                    return self._send(200, state.fences.get(cid, []))
                 if parts[3] == "events":
                     return self._events(cid, parse_qs(url.query))
             self._send(404, {"error": "not found"})
@@ -323,6 +368,29 @@ def make_handler(page: str, state: MockState) -> type[BaseHTTPRequestHandler]:
                     state.events["B"].append(_chunk("B", seq, state.b_chunks, "b-2"))
                     chunks = state.b_chunks
                 return self._send(200, {"chunks": chunks})
+            if self.path.startswith("/api/conversations/") and self.path.endswith("/fences"):
+                parts = [p for p in urlparse(self.path).path.split("/") if p]
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length).decode()
+                with state.lock:
+                    state.last_fence = {
+                        "path": self.path,
+                        "content_type": self.headers.get("Content-Type", ""),
+                        "body": raw,
+                    }
+                    try:
+                        payload = json.loads(raw)
+                    except ValueError:
+                        payload = {}
+                    room = parts[2]
+                    entry = {
+                        "id": f"fence-{room}-{len(state.fences.get(room, [])) + 1}",
+                        "peer_id": payload.get("peer_id"),
+                        "kind": payload.get("kind"),
+                        "set_by": "operator",
+                    }
+                    state.fences.setdefault(room, []).append(entry)
+                return self._send(200, entry)
             if self.path.startswith("/__add_event"):
                 query = parse_qs(urlparse(self.path).query)
                 cid = query.get("conversation", ["B"])[0]
@@ -344,10 +412,26 @@ def make_handler(page: str, state: MockState) -> type[BaseHTTPRequestHandler]:
             body) so check.mjs can pin the wire shape, and applies an alias."""
             url = urlparse(self.path)
             parts = [p for p in url.path.split("/") if p]
-            if len(parts) != 3 or parts[:2] != ["api", "peers"]:
-                return self._send(404, {"error": "not found"})
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length).decode()
+            if len(parts) == 3 and parts[:2] == ["api", "conversations"]:
+                with state.lock:
+                    state.last_patch = {
+                        "path": self.path,
+                        "content_type": self.headers.get("Content-Type", ""),
+                        "body": raw,
+                    }
+                    try:
+                        payload = json.loads(raw)
+                    except ValueError:
+                        payload = {}
+                    for room in state.conversations:
+                        if room["id"] == parts[2]:
+                            room["name"] = payload.get("name")
+                            return self._send(200, room)
+                return self._send(404, {"error": "not found"})
+            if len(parts) != 3 or parts[:2] != ["api", "peers"]:
+                return self._send(404, {"error": "not found"})
             with state.lock:
                 state.last_patch = {
                     "path": self.path,
@@ -372,6 +456,26 @@ def make_handler(page: str, state: MockState) -> type[BaseHTTPRequestHandler]:
             and drops the peer from the roster view."""
             url = urlparse(self.path)
             parts = [p for p in url.path.split("/") if p]
+            if len(parts) == 3 and parts[:2] == ["api", "fences"]:
+                with state.lock:
+                    state.last_fence_delete = {"path": self.path, "method": "DELETE"}
+                    for room, gates in state.fences.items():
+                        state.fences[room] = [g for g in gates if g["id"] != parts[2]]
+                return self._send(204, b"")
+            if len(parts) == 3 and parts[:2] == ["api", "conversations"]:
+                with state.lock:
+                    state.last_delete = {"path": self.path, "method": "DELETE"}
+                    state.conversations = [c for c in state.conversations if c["id"] != parts[2]]
+                    state.messages.pop(parts[2], None)
+                    state.events.pop(parts[2], None)
+                return self._send(204, b"")
+            if len(parts) == 5 and parts[:2] == ["api", "conversations"] and parts[3] == "members":
+                with state.lock:
+                    state.last_delete = {"path": self.path, "method": "DELETE"}
+                    for room in state.conversations:
+                        if room["id"] == parts[2]:
+                            room["members"] = [m for m in room["members"] if m != parts[4]]
+                return self._send(204, b"")
             if len(parts) != 3 or parts[:2] != ["api", "peers"]:
                 return self._send(404, {"error": "not found"})
             with state.lock:
@@ -389,14 +493,22 @@ def main() -> None:
     Raises:
         SystemExit: On wrong arguments.
     """
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: mock_api.py <index.html> <a_count>")
+    if len(sys.argv) not in (3, 4, 5, 6):
+        raise SystemExit(
+            "usage: mock_api.py <index.html> <a_count> [peer_count] [unknown_count] [event_count]"
+        )
     with open(sys.argv[1], encoding="utf-8") as f:
         html = f.read()
     if "</head>" not in html:
         raise SystemExit("page has no </head> to inject the probe before")
     page = html.replace("</head>", PROBE + "</head>", 1)
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(page, MockState(int(sys.argv[2]))))
+    peer_count = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+    unknown_count = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+    event_count = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(page, MockState(int(sys.argv[2]), peer_count, unknown_count, event_count)),
+    )
     print(f"PORT={server.server_address[1]}", flush=True)
     server.serve_forever()
 

@@ -12,7 +12,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use conversations::{
     conversation, conversation_events, conversation_fences, conversation_messages,
-    create_conversation, delete_conversation, list_conversations,
+    create_conversation, delete_conversation, list_conversations, rename_conversation,
 };
 use gates::{
     add_guidance, cancel_delivery, clear_fence, create_fence, hold_delivery, post_message,
@@ -134,7 +134,9 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/api/moderation", axum::routing::get(moderation_log))
         .route(
             "/api/conversations/{id}",
-            axum::routing::get(conversation).delete(delete_conversation),
+            axum::routing::get(conversation)
+                .patch(rename_conversation)
+                .delete(delete_conversation),
         )
         .route(
             "/api/conversations/{id}/events",

@@ -1,7 +1,10 @@
 //! The poll loop: delivery claim/mirror/ack, outbound propagation,
 //! presence upload, and roster mirroring on one tick cadence.
 
-use super::{PresenceSource, process_deliveries, sync_outbound, sync_roster, upload_presence};
+use super::{
+    PresenceSource, process_deliveries, sync_conversations, sync_outbound, sync_roster,
+    upload_presence,
+};
 use std::time::Duration;
 use wrkspc_core::{Store, TaskRow};
 
@@ -150,5 +153,6 @@ pub async fn run_poll_loop(
             let _accepted = upload_presence(&client, &hub_url, &decls).await;
         }
         let _refreshed = sync_roster(&client, &hub_url, &store).await;
+        let _rooms = sync_conversations(&client, &hub_url, &store).await;
     }
 }

@@ -250,6 +250,11 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                                             .with_state(presence.clone()),
                                     )
                                     .route(
+                                        "/conversations",
+                                        axum::routing::get(crate::presence::conversations_get)
+                                            .with_state(presence.clone()),
+                                    )
+                                    .route(
                                         "/peers/{peer}/agent-card.json",
                                         axum::routing::get(crate::presence::peer_card)
                                             .with_state(presence),

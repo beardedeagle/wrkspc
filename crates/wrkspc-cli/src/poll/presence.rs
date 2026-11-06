@@ -119,3 +119,51 @@ pub(crate) async fn upload_presence(
     }
     accepted
 }
+
+/// Mirrors the hub's conversation list into the local store.
+///
+/// A node learns a room from the first delivery that reaches it, which leaves
+/// every other room invisible and every operator-set name unknown. This asks the
+/// hub for its rooms each tick and mirrors them, so both machines show the same
+/// list. Failures keep the last-known mirror rather than emptying it.
+///
+/// # Arguments
+///
+/// * `client` — the node's stamped mTLS client.
+/// * `hub_url` — the hub's base URL.
+/// * `store` — the node's local store.
+///
+/// # Returns
+///
+/// Whether the mirror was refreshed.
+pub(crate) async fn sync_conversations(
+    client: &reqwest::Client,
+    hub_url: &str,
+    store: &Store,
+) -> bool {
+    match client.get(format!("{hub_url}/conversations")).send().await {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<Vec<wrkspc_core::ConversationView>>().await {
+                Ok(conversations) => match store.mirror_conversations(&conversations).await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::error!(%error, "conversation mirror write failed");
+                        false
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "conversation list parse failed");
+                    false
+                }
+            }
+        }
+        Ok(response) => {
+            tracing::warn!(status = %response.status(), "conversation list fetch refused");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(%error, "conversation list fetch failed; keeping last-known mirror");
+            false
+        }
+    }
+}

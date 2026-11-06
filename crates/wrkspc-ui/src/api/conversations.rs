@@ -41,6 +41,74 @@ pub(crate) async fn conversation(
     Ok(Json(conversation))
 }
 
+/// The `PATCH /api/conversations/{id}` body.
+#[derive(Deserialize)]
+pub(crate) struct RenameConversationBody {
+    /// The new name. Omitted, null, or blank clears it: the name is display
+    /// metadata and a room is fully usable unnamed.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Renames a conversation, or clears its name.
+///
+/// The name is never a key and never has to be unique — two rooms may share one,
+/// and the id is what everything else joins on. The hub owns the value and
+/// mirrors it to nodes.
+///
+/// # Arguments
+///
+/// * `state` — the API state holding the store.
+/// * `id` — the conversation to rename.
+/// * `body` — the new name, or null to clear it.
+///
+/// # Returns
+///
+/// The updated conversation, or a JSON error with the status that caused it.
+pub(crate) async fn rename_conversation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RenameConversationBody>,
+) -> Result<Json<ConversationView>, (StatusCode, Json<Value>)> {
+    /// Longest name accepted, matching the peer alias limit.
+    const MAX_NAME_CHARS: usize = 64;
+    if let Some(name) = body.name.as_deref()
+        && name.trim().chars().count() > MAX_NAME_CHARS
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("conversation names are limited to {MAX_NAME_CHARS} characters")
+            })),
+        ));
+    }
+    let updated = state
+        .store
+        .set_conversation_name(&id, body.name.as_deref())
+        .await
+        .map_err(store_error)?;
+    if !updated {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("conversation {id} not found") })),
+        ));
+    }
+    let conversation = state
+        .store
+        .list_conversations()
+        .await
+        .map_err(store_error)?
+        .into_iter()
+        .find(|row| row.id == id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("conversation {id} not found") })),
+            )
+        })?;
+    Ok(Json(conversation))
+}
+
 #[derive(Deserialize)]
 pub(crate) struct EventsQuery {
     after_seq: Option<i64>,

@@ -436,3 +436,91 @@ async fn roster_sync_and_presence_upload_ride_the_stamped_routes() {
     tx.send(()).ok();
     let _ = server.await;
 }
+
+#[tokio::test]
+async fn conversation_mirror_carries_room_names_and_members() {
+    // Hub side: a named room behind the stamped discovery routes.
+    let hub_store = Store::open_in_memory("conversation-mirror-hub")
+        .await
+        .unwrap();
+    hub_store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    hub_store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    let room = hub_store
+        .create_conversation(&["codex", "operator"])
+        .await
+        .unwrap();
+    assert!(
+        hub_store
+            .set_conversation_name(&room, Some("Veritas design"))
+            .await
+            .unwrap()
+    );
+    let presence_state = crate::presence::PresenceState::new(
+        hub_store.clone(),
+        "https://hub.test".to_string(),
+        true,
+    );
+    let router = axum::Router::new()
+        .route(
+            "/conversations",
+            axum::routing::get(crate::presence::conversations_get).with_state(presence_state),
+        )
+        .layer(axum::middleware::from_fn(
+            |mut request: axum::extract::Request, next: axum::middleware::Next| async move {
+                request.headers_mut().insert(
+                    "x-wrkspc-peer",
+                    axum::http::HeaderValue::from_static("CN=test,SAN=node-test-1"),
+                );
+                next.run(request).await
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    let client = reqwest::Client::new();
+    let hub_url = format!("http://{addr}");
+
+    // Node side: it has never seen the room, and knows only one of its members.
+    let node_store = Store::open_in_memory("conversation-mirror-node")
+        .await
+        .unwrap();
+    node_store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    assert!(node_store.list_conversations().await.unwrap().is_empty());
+
+    assert!(sync_conversations(&client, &hub_url, &node_store).await);
+    let rows = node_store.list_conversations().await.unwrap();
+    let mirrored = rows
+        .iter()
+        .find(|row| row.id == room)
+        .expect("the hub's room is mirrored");
+    assert_eq!(mirrored.name.as_deref(), Some("Veritas design"));
+    assert_eq!(mirrored.members, vec!["codex".to_string()]);
+    assert!(
+        !mirrored.members.contains(&"operator".to_string()),
+        "a member this node has never enrolled is not fabricated locally"
+    );
+
+    // A dead hub keeps the last-known mirror.
+    assert!(!sync_conversations(&client, "http://127.0.0.1:1", &node_store).await);
+    assert_eq!(node_store.list_conversations().await.unwrap().len(), 1);
+
+    tx.send(()).ok();
+    let _ = server.await;
+}

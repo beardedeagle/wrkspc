@@ -11,10 +11,13 @@ use crate::store::Store;
 use sqlx::Row;
 
 /// A conversation with its members.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConversationView {
     /// Conversation id.
     pub id: String,
+    /// The operator's vanity name for the room, when one is set. Nullable by
+    /// design: rooms are usable unnamed, and the id is the key everywhere.
+    pub name: Option<String>,
     /// RFC 3339 UTC creation time.
     pub created_at: String,
     /// Member peer ids.
@@ -76,7 +79,7 @@ impl Store {
     /// Returns [`StoreError::Db`](StoreError::Db) on failure.
     pub async fn list_conversations(&self) -> Result<Vec<ConversationView>> {
         let rows = sqlx::query(
-            "SELECT c.id AS id, c.created_at AS created_at,
+            "SELECT c.id AS id, c.name AS name, c.created_at AS created_at,
                     GROUP_CONCAT(cm.peer_id) AS members
              FROM conversations c
              JOIN conversation_members cm ON cm.conversation_id = c.id
@@ -89,6 +92,7 @@ impl Store {
             .into_iter()
             .map(|r| ConversationView {
                 id: r.get("id"),
+                name: r.get::<Option<String>, _>("name"),
                 created_at: r.get("created_at"),
                 members: r
                     .get::<Option<String>, _>("members")
