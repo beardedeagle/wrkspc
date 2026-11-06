@@ -148,21 +148,35 @@ class MockState:
             "B": [{"id": "mb1", "sender_id": "claude", "content": B_MESSAGE,
                    "created_at": B_MESSAGE_AT, "deliveries": []}],
         }
-        a_stop = a_count + 2
+        a_stop = a_count + 3
         self.events: dict[str, list[dict[str, Any]]] = {
             "A": [
-                _event("A", 1, "dispatch.started", {"attempt_id": "attempt-A", "recipient_id": "codex"}),
-                *(_chunk("A", 1 + n, n, "a-1") for n in range(1, a_count + 1)),
+                # A work report authored before the message, so the transcript
+                # has to merge sorted rather than list messages then events.
+                _event("A", 1, "work.report",
+                       {"peer_id": "codex", "summary": "A-report-1"}, "2026-11-02T09:59:00Z"),
+                _event("A", 2, "dispatch.started", {"attempt_id": "attempt-A", "recipient_id": "codex"}),
+                *(_chunk("A", 2 + n, n, "a-1") for n in range(1, a_count + 1)),
                 _event("A", a_stop, "dispatch.stopped", {"attempt_id": "attempt-A", "state": "completed"}),
+                # One delivery: claim then ack, which the feed collapses to a
+                # single line per delivery.
+                # Historical shape: the claim carries no recipient, the ack does.
+                _event("A", a_stop + 1, "delivery.claimed",
+                       {"task_id": "task-A", "host": "node-test-1"},
+                       "2026-11-02T10:00:05Z"),
+                _event("A", a_stop + 2, "delivery.acked",
+                       {"task_id": "task-A", "host": "node-test-1", "recipient_peer": "codex"},
+                       "2026-11-02T10:00:06Z"),
             ],
             "B": [
-                _event("B", a_stop + 1, "dispatch.started",
+                _event("B", a_stop + 3, "dispatch.started",
                        {"attempt_id": "attempt-B", "recipient_id": "claude"}, B_STARTED_AT),
-                _chunk("B", a_stop + 2, 1, "b-1", B_TURN_AT),
-                _chunk("B", a_stop + 3, 2, "b-1", B_TURN_AT),
+                _chunk("B", a_stop + 4, 1, "b-1", B_TURN_AT),
+                _chunk("B", a_stop + 5, 2, "b-1", B_TURN_AT),
             ],
         }
         self.b_chunks = 2
+        self.added_events = 0
         self.a_inflight = 0
         self.a_from_zero = 0
         self.aliases: dict[str, str] = {}
@@ -296,15 +310,34 @@ def make_handler(page: str, state: MockState) -> type[BaseHTTPRequestHandler]:
             self._send(404, {"error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802
-            """Handles ``/__add_b_chunk``: streams a fragment of a new agent message into B's turn."""
-            if self.path != "/__add_b_chunk":
-                return self._send(404, {"error": "not found"})
-            with state.lock:
-                seq = max(e["seq"] for events in state.events.values() for e in events) + 1
-                state.b_chunks += 1
-                state.events["B"].append(_chunk("B", seq, state.b_chunks, "b-2"))
-                chunks = state.b_chunks
-            self._send(200, {"chunks": chunks})
+            """Streams a fragment into B's turn, or adds a narration event.
+
+            ``/__add_b_chunk`` appends a turn fragment; ``/__add_event`` appends
+            a delivery ack with its own task id, so the system feed grows with a
+            new line each call. Both are test levers, not part of the product.
+            """
+            if self.path == "/__add_b_chunk":
+                with state.lock:
+                    seq = max(e["seq"] for events in state.events.values() for e in events) + 1
+                    state.b_chunks += 1
+                    state.events["B"].append(_chunk("B", seq, state.b_chunks, "b-2"))
+                    chunks = state.b_chunks
+                return self._send(200, {"chunks": chunks})
+            if self.path.startswith("/__add_event"):
+                query = parse_qs(urlparse(self.path).query)
+                cid = query.get("conversation", ["B"])[0]
+                with state.lock:
+                    seq = max(e["seq"] for events in state.events.values() for e in events) + 1
+                    state.added_events += 1
+                    task_id = f"task-added-{state.added_events}"
+                    state.events[cid].append(_event(cid, seq, "delivery.acked", {
+                        "task_id": task_id,
+                        "host": "node-test-1",
+                        "recipient_peer": "codex",
+                    }, "2026-11-02T12:00:00Z"))
+                    added = state.added_events
+                return self._send(200, {"added": added})
+            self._send(404, {"error": "not found"})
 
         def do_PATCH(self) -> None:  # noqa: N802
             """Records every ``/api/peers/{id}`` PATCH (content-type + raw

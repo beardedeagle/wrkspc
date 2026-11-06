@@ -51,7 +51,7 @@ const WATCH_MS = 3500;
 const STARTUP_TIMEOUT_MS = 15000;
 // B's entries' created_at in mock_api.py, in transcript order: the message,
 // dispatch.started, and the turn (its first chunk).
-const B_TIMES = ["2026-11-02T09:00:00Z", "2026-11-02T09:01:00Z", "2026-11-02T09:01:05.123456+00:00"];
+const B_TIMES = ["2026-11-02T09:00:00Z", "2026-11-02T09:01:05.123456+00:00"];
 // The local wall-clock time a gutter must show for an instant.
 const LOCAL_CLOCK = new Intl.DateTimeFormat("en-GB", {
   hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
@@ -287,10 +287,11 @@ async function runScenario(aCount) {
       "the boot gate to drop",
     );
     await sleep(WATCH_MS);
-    // A's events render as three lines: started, the turn block, stopped.
+    // A's transcript holds authored content only: its message, the work report,
+    // and the turn block. Dispatch narration lives in the system feed now.
     const bootSamples = (await samples()).filter((s) => !s.gate && s.bootHidden);
     const boot = distinctStates(bootSamples);
-    if (boot.length !== 1 || boot[0] !== "msgs=1 events=3") {
+    if (boot.length !== 1 || boot[0] !== "msgs=1 events=2") {
       failures.push(`transcript changed after the gate dropped, or chunks not grouped: ${boot.join(" -> ")}`);
     }
     if (!bootSamples.at(-1)?.text.includes(turnText("A", "codex", 1, aCount))) {
@@ -298,6 +299,57 @@ async function runScenario(aCount) {
     }
     const { a_from_zero: loads } = await stats();
     if (loads !== 1) failures.push(`backlog loaded ${loads} times, expected once`);
+
+    // The transcript is one chronological timeline of authored content; the
+    // hub narrating itself (delivery, dispatch) belongs in the system feed beside
+    // the unknown attempts. A claim and its ack describe one delivery.
+    const feedText = await page.evaluate("window.__feedText || document.getElementById('events-feed').textContent");
+    const split = await page.evaluate(`(() => {
+      const centre = document.getElementById("transcript").textContent;
+      const feed = document.getElementById("events-feed").textContent;
+      window.__feedText = feed;
+      const count = (hay, needle) => hay.split(needle).length - 1;
+      return {
+        reportAt: centre.indexOf("A-report-1"),
+        messageAt: centre.indexOf("A-msg-1"),
+        centreHasNarration: /delivery\\.(claimed|acked)|dispatch\\.(started|stopped)/.test(centre),
+        collapsedDeliveryLines: count(feed, "delivery · codex · acked"),
+        feedHasDispatch: feed.includes("dispatch.started"),
+        feedHasReport: feed.includes("A-report-1"),
+        unstampedLines: [...document.querySelectorAll("#events-feed .feed-line")]
+          .filter((l) => !l.querySelector("time.feed-ts")?.dateTime).length,
+        deliveryStamp: (() => {
+          const line = [...document.querySelectorAll("#events-feed .feed-line")]
+            .find((l) => l.textContent.includes("delivery · codex · acked"));
+          const ts = line?.querySelector("time.feed-ts");
+          return ts ? { dateTime: ts.dateTime, text: ts.textContent } : null;
+        })(),
+      };
+    })()`);
+    if (split.reportAt < 0) failures.push("the work report is missing from the transcript");
+    if (!(split.reportAt < split.messageAt)) {
+      failures.push("the work report must sort before the message it precedes, not after it");
+    }
+    if (split.centreHasNarration) failures.push("hub narration is still rendered in the transcript");
+    if (split.collapsedDeliveryLines !== 1) {
+      failures.push(`a delivery's claim and ack must collapse to one feed line, got ${split.collapsedDeliveryLines}`);
+    }
+    // A claim recorded before the recipient field existed must still show the
+    // peer its ack names, rather than latching the unknown.
+    if (feedText.includes("delivery · ?")) {
+      failures.push("a delivery line shows an unresolved peer even though its ack names one");
+    }
+    if (!split.feedHasDispatch) failures.push("the system feed is missing dispatch events");
+    if (split.feedHasReport) failures.push("the work report leaked into the system feed");
+    if (split.unstampedLines !== 0) {
+      failures.push(`${split.unstampedLines} feed line(s) render without a timestamp`);
+    }
+    // The collapsed line carries the time of the hop that produced its state:
+    // the ack at 10:00:06, not the claim at 10:00:05.
+    const wantDeliveryStamp = new Date("2026-11-02T10:00:06Z").toISOString();
+    if (split.deliveryStamp?.dateTime !== wantDeliveryStamp) {
+      failures.push(`collapsed delivery stamp: got ${JSON.stringify(split.deliveryStamp)}, want ${wantDeliveryStamp}`);
+    }
 
     // 3: switch to B while an A poll is in flight.
     await waitFor(async () => (await stats()).a_inflight > 0, STARTUP_TIMEOUT_MS, "an in-flight A poll");
@@ -307,9 +359,10 @@ async function runScenario(aCount) {
     await sleep(WATCH_MS);
     const afterSwitch = (await samples()).filter((s) => s.t > switchedAt && !s.loading);
     if (afterSwitch.some((s) => s.text.includes("A-"))) failures.push("A's content appeared in B's view");
-    // B's events render as two lines: started and the open turn block.
+    // B's transcript holds its message and the open turn block; its dispatch
+    // narration is in the feed.
     const switched = distinctStates(afterSwitch);
-    if (switched.length !== 1 || switched[0] !== "msgs=1 events=2") {
+    if (switched.length !== 1 || switched[0] !== "msgs=1 events=1") {
       failures.push(`B's view changed after the switch: ${switched.join(" -> ")}`);
     }
     if (!afterSwitch.at(-1)?.text.includes(turnText("B", "claude", 1, 2))) {
@@ -351,7 +404,7 @@ async function runScenario(aCount) {
           const paragraphs = await page.evaluate(
             "[...document.querySelectorAll('#transcript .turn-body p')].map((p) => p.textContent)",
           );
-          return last.events === 2 && JSON.stringify(paragraphs) === JSON.stringify(wantParagraphs);
+          return last.events === 1 && JSON.stringify(paragraphs) === JSON.stringify(wantParagraphs);
         },
         WATCH_MS,
         `B's turn block to grow in place into paragraphs ${JSON.stringify(wantParagraphs)}`,
@@ -587,6 +640,138 @@ async function runPeerModerationScenario() {
   return failures;
 }
 
+/**
+ * Verifies sticky-bottom scrolling in both reader panes: a pane sitting at its
+ * bottom follows new content, a pane scrolled up keeps its view, and scrolling
+ * back to the bottom resumes the follow.
+ *
+ * @returns {Promise<string[]>} Failure messages, empty when the behaviour holds.
+ */
+async function runFollowScenario() {
+  const failures = [];
+  const mock = await startMock(5);
+  let chrome;
+  let page;
+  try {
+    chrome = await startChrome();
+    page = await connect(chrome.port);
+    const post = (path) => fetch(mock.base + path, { method: "POST" }).then((r) => r.json());
+    const panes = () => page.evaluate(`(() => {
+      const read = (id) => {
+        const e = document.getElementById(id);
+        return {
+          top: Math.round(e.scrollTop),
+          gap: Math.round(e.scrollHeight - e.scrollTop - e.clientHeight),
+          height: e.scrollHeight,
+          client: e.clientHeight,
+        };
+      };
+      return { transcript: read("transcript-scroll"), feed: read("events-feed") };
+    })()`);
+    const scrollTo = (value) => page.evaluate(
+      `(() => { for (const id of ["transcript-scroll", "events-feed"]) document.getElementById(id).scrollTop = ${value}; return true; })()`,
+    );
+
+    await page.navigate(mock.base + "/");
+    await waitFor(
+      () => page.evaluate("window.__probe?.samples.some((s) => !s.gate && s.bootHidden)"),
+      STARTUP_TIMEOUT_MS,
+      "the boot gate to drop",
+    );
+    await page.evaluate("select('B')");
+    // Shrink both panes so ordinary traffic overflows them. They are flex
+    // children, so the basis has to be pinned too or flex grows them back.
+    await page.evaluate(`(() => {
+      for (const id of ["transcript-scroll", "events-feed"]) {
+        const e = document.getElementById(id);
+        e.style.flex = "none";
+        e.style.height = "120px";
+        e.style.minHeight = "120px";
+      }
+      return true;
+    })()`);
+    for (let i = 0; i < 60; i += 1) await post("/__add_b_chunk");
+    for (let i = 0; i < 40; i += 1) await post("/__add_event?conversation=B");
+    let overflow = null;
+    try {
+      await waitFor(async () => {
+        const p = await panes();
+        return p.transcript.height > p.transcript.client + 1
+          && p.feed.height > p.feed.client + 1;
+      }, WATCH_MS, "both panes to overflow");
+    } catch (e) {
+      overflow = await panes();
+      failures.push(`${e.message} (transcript ${JSON.stringify(overflow.transcript)}, feed ${JSON.stringify(overflow.feed)})`);
+    }
+
+    // 1: at the bottom, new content keeps both panes pinned.
+    await scrollTo(1e6);
+    await sleep(250);
+    const pinnedBefore = await panes();
+    await post("/__add_b_chunk");
+    await post("/__add_event?conversation=B");
+    await waitFor(async () => {
+      const p = await panes();
+      return p.transcript.height > pinnedBefore.transcript.height
+        && p.feed.height > pinnedBefore.feed.height;
+    }, WATCH_MS, "the new content to render in both panes");
+    const pinnedAfter = await panes();
+    if (pinnedAfter.transcript.gap >= 60) {
+      failures.push(`transcript stopped following at the bottom: gap ${pinnedAfter.transcript.gap}px`);
+    }
+    if (pinnedAfter.feed.gap >= 60) {
+      failures.push(`feed stopped following at the bottom: gap ${pinnedAfter.feed.gap}px`);
+    }
+
+    // 2: scrolled up, new content must not move the reader.
+    await scrollTo(30);
+    await sleep(250);
+    const upBefore = await panes();
+    await post("/__add_b_chunk");
+    await post("/__add_event?conversation=B");
+    await waitFor(async () => {
+      const p = await panes();
+      return p.transcript.height > upBefore.transcript.height;
+    }, WATCH_MS, "the new content to render while scrolled up");
+    const upAfter = await panes();
+    if (Math.abs(upAfter.transcript.top - upBefore.transcript.top) > 2) {
+      failures.push(`a scrolled-up transcript moved: ${upBefore.transcript.top} -> ${upAfter.transcript.top}`);
+    }
+    if (Math.abs(upAfter.feed.top - upBefore.feed.top) > 2) {
+      failures.push(`a scrolled-up feed moved: ${upBefore.feed.top} -> ${upAfter.feed.top}`);
+    }
+
+    // 3: back at the bottom, the follow resumes.
+    await scrollTo(1e6);
+    await sleep(250);
+    const resumeBefore = await panes();
+    await post("/__add_b_chunk");
+    await post("/__add_event?conversation=B");
+    await waitFor(async () => {
+      const p = await panes();
+      return p.transcript.height > resumeBefore.transcript.height
+        && p.feed.height > resumeBefore.feed.height;
+    }, WATCH_MS, "the new content to render after resuming");
+    const resumeAfter = await panes();
+    if (resumeAfter.transcript.gap >= 60) {
+      failures.push(`transcript did not resume following: gap ${resumeAfter.transcript.gap}px`);
+    }
+    if (resumeAfter.feed.gap >= 60) {
+      failures.push(`feed did not resume following: gap ${resumeAfter.feed.gap}px`);
+    }
+
+    if (page.errors.length) failures.push("page exceptions: " + page.errors.join(" | "));
+  } finally {
+    page?.close();
+    if (chrome) {
+      await stop(chrome.proc);
+      rmSync(chrome.profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    }
+    await stop(mock.proc);
+  }
+  return failures;
+}
+
 let failed = false;
 for (const aCount of SCENARIOS) {
   let failures;
@@ -623,4 +808,16 @@ for (const aCount of SCENARIOS) {
   console.log(`${failures.length ? "FAIL" : "ok  "} peer moderation`);
   for (const f of failures) console.log("     " + f);
 }
+{
+  let failures;
+  try {
+    failures = await runFollowScenario();
+  } catch (e) {
+    failures = [e.message];
+  }
+  failed ||= failures.length > 0;
+  console.log(`${failures.length ? "FAIL" : "ok  "} sticky scroll`);
+  for (const f of failures) console.log("     " + f);
+}
+
 process.exit(failed ? 1 : 0);
