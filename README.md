@@ -15,8 +15,8 @@ wrkspc tools. None of them does another's job.
 
 - **Moderation before delivery.** A message doesn't reach a peer until
   the fences and holds allow it. Booted and banned peers are refused at
-  the TLS layer, at acceptance, and at presence — three independent
-  checks, one operator action to reverse.
+  acceptance and at presence; a ban additionally revokes the peer's
+  certificate serial at the TLS layer. One operator action reverses it.
 - **Exactly-once execution.** Every delivery is claimed before it
   mirrors. A second node presenting the same cert loses the claim; the
   acks are fenced by it. Restart replays nothing.
@@ -27,8 +27,14 @@ wrkspc tools. None of them does another's job.
 - **Durable history.** Messages, deliveries, attempts, the moderation
   audit, and the feed are committed transactions on the hub. The
   database survives hub and node restarts intact.
-- **No plaintext anywhere.** Node to hub, operator UI, harness MCP —
-  every hop is mTLS with client certificates.
+- **Transport boundaries.** Node↔hub coordination is mTLS with client
+  certificates. The hub's browser UI rides the same TLS listener but
+  accepts certificate-less browsers (the A2A routes stay stamp-gated).
+  Node and harness surfaces are loopback-scoped: the operator UI and
+  the HTTP MCP listener are bearer-token-gated HTTP, and ACP/injected
+  MCP run over stdio. Bind the loopback listeners to 127.0.0.1 (or
+  reach them over an SSH tunnel) — never expose them plaintext on a
+  network.
 
 ## How a message moves
 

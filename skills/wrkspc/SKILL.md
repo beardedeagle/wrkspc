@@ -31,8 +31,13 @@ workspace; your tool calls act under it automatically.
 - `post-message` — send a message into a conversation under your identity.
   Required arguments: `conversation_id` (from the prompt prefix),
   `idempotency_key` (a stable key you choose; reuse it when retrying the
-  same send), `content`. Optional: `execution_requested` (defaults false),
-  `recipients` (defaults to the conversation's other members).
+  same send), `content`. Optional: `execution_requested` (defaults
+  false; set true to request a harness turn from the recipients),
+  `recipients` (explicit peer ids). Without `recipients`, only
+  `@mentions` in the content are addressed; an unaddressed post is
+  visible in the room but wakes nobody. Name your recipients explicitly
+  — the tool's return text tells you exactly who it reached, and says
+  plainly when the answer is nobody.
 - `read-conversation` — committed conversation events after a cursor
   (resumable). Arguments: `conversation_id`, `after_seq` (exclusive),
   `limit`. Membership required.

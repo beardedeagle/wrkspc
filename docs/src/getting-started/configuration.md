@@ -6,29 +6,37 @@ configuration — a process with no flags does nothing but print usage.
 
 ## Node: bindings.toml
 
-The node's harness bindings are the one file with real structure:
+The node's harness bindings are the one file with real structure. One
+`[[binding]]` entry declares one enrolled peer:
 
 ```toml
 # Each entry binds one harness. The node spawns the command and drives
 # the session over ACP on stdio.
-[codex]
-command = "npx"
-args = ["codex-acp@latest"]
+[[binding]]
+peer_id = "codex"
+harness = "codex"
+cwd = "/path/to/workspace"
+command = "npx -y @agentclientprotocol/codex-acp@2.1.1"
 
-[antigravity]
-command = "antigravity-acp"
-args = ["--stdio"]
-
-[pi]
-command = "pi-acp"
-args = []
+[[binding]]
+peer_id = "agy"
+harness = "antigravity"
+cwd = "/path/to/workspace"
+command = "npx -y antigravity-acp@latest"
 ```
 
-- `command` is spawned with `args`; stdout/stdin is the ACP wire. The
-  node owns the child: it starts it per session, feeds it
-  initialization, and tears it down.
-- The binding name is the harness the peer presents as. The same peer
-  name cannot bind on two hosts.
+- `peer_id` is the identity the store and the dispatcher use; `harness`
+  is the display name. `command` is one shell-style command line
+  (program + args), matching the ACP stdio transport's spawn shape;
+  `cwd` is the session working directory.
+- Optional per-entry fields: `model` (a model pin applied via ACP
+  `session/set_config_option` after `session/new` — only for adapters
+  that honor it) and `mcp_http = true` (serve this peer's wrkspc MCP
+  tools over loopback HTTP and register them with the harness's native
+  MCP config — the agy path). The MCP tools are otherwise injected as
+  a stdio `McpServer` pointing at this binary's `mcp-bridge` subcommand
+  from the session's first turn.
+- The same peer id cannot bind on two hosts.
 - The command runs with the node's PATH. If the node is supervised by
   launchd, that PATH is the supervisor's, not your shell's — bind an
   absolute path or a wrapper script when the harness CLI isn't on it.
@@ -41,7 +49,7 @@ Both roles take the same three pieces:
 |---|---|
 | `--tls-cert` | The role's own certificate chain |
 | `--tls-key` | Its private key |
-| `--ca` | The CA used to verify peers |
+| `--tls-ca` | The CA used to verify peers |
 
 The hub identifies nodes by the certificate they present. Identity,
 enrollment, and revocation all hang off that certificate — there is no
@@ -56,5 +64,15 @@ persistent storage — they are the durable history.
 
 ## Operator UI token
 
-The node prints the UI URL and a bearer token at startup; the token
-authenticates the operator to the UI it serves on loopback.
+The node resolves the operator UI token from `WRKSPC_UI_TOKEN`, or
+from the platform secret store (macOS: the login Keychain, keyed
+`wrkspc.<node>`; elsewhere: a 0600 token file next to the database).
+It never prints the token — logs point at the retrieval command:
+
+```console
+$ wrkspc ui-token
+```
+
+macOS copies the token to the clipboard (it clears itself after 30
+seconds); other platforms print the token file path. The token
+authenticates the operator to the UI the node serves on loopback.

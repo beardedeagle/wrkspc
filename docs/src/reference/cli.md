@@ -14,7 +14,7 @@ $ wrkspc hub run \
     --a2a ADDR           # A2A coordination port nodes dial
     --tls-cert PATH      # hub certificate chain
     --tls-key PATH       # hub private key
-    --ca PATH            # CA used to verify nodes
+    --tls-ca PATH        # CA used to verify nodes
 ```
 
 ## node run
@@ -28,7 +28,7 @@ $ wrkspc node run \
     --hub URL            # the hub to enroll with and poll
     --tls-cert PATH      # node certificate chain
     --tls-key PATH       # node private key
-    --ca PATH            # CA used to verify the hub
+    --tls-ca PATH        # CA used to verify the hub
 ```
 
 The node dials the hub. The hub never dials the node, so a node
@@ -41,7 +41,22 @@ $ wrkspc skill install [--all | --harness NAME]
 $ wrkspc skill status
 ```
 
-`install` writes the MCP registration for the harnesses it knows
-(codex, antigravity, pi); `status` reports what's registered.
-Unknown harnesses still work — see
+`install` copies the embedded wrkspc SKILL.md into each detected
+harness's skills directory and (for the binding cohort) inserts the
+standing-instructions pointer section; `status` compares installed
+copies against the shipped content. The MCP tool surface itself is
+registered by the node's per-harness wiring (ACP `session/new`
+injection, or the harness's own MCP config for HTTP-bound peers), not
+by the skill installer. Unknown harnesses still work — see
 [Harnesses](../getting-started/harnesses.md).
+
+## ui-token
+
+```console
+$ wrkspc ui-token [--node NAME] [--db PATH]
+```
+
+Copies the operator UI token to the clipboard (macOS, 30-second
+self-clearing) or prints the token file path (other platforms). The
+node never writes the token into logs; this command retrieves it from
+the platform secret store.

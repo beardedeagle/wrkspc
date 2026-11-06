@@ -23,12 +23,15 @@ $ wrkspc hub run \
     --a2a 0.0.0.0:8443 \
     --tls-cert /etc/wrkspc/tls/hub.crt \
     --tls-key /etc/wrkspc/tls/hub.key \
-    --ca /etc/wrkspc/tls/ca.pem
+    --tls-ca /etc/wrkspc/tls/ca.pem
 ```
 
 The hub is fully passive on the wire: it listens, it never dials.
 Nodes reach it over mTLS; the certificate presented by the hub's CA
-is what identifies them.
+is what identifies them. The hub also serves the operator UI on the
+same TLS listener (`--card-url` names it externally) — browsers
+connect without a client certificate and are gate-kept by a bearer
+token, while A2A routes stay certificate-stamped.
 
 ## 3. Enroll a node
 
@@ -39,7 +42,7 @@ $ wrkspc node run \
     --hub https://wrkspc-hub:8443 \
     --tls-cert ~/.local/share/wrkspc/node/client.crt \
     --tls-key ~/.local/share/wrkspc/node/client.key \
-    --ca ~/.local/share/wrkspc/node/ca.pem
+    --tls-ca ~/.local/share/wrkspc/node/ca.pem
 ```
 
 The first thing the node does is enroll over mTLS. From then on its
@@ -51,27 +54,32 @@ the host it reports from.
 `bindings.toml` declares which harnesses the node hosts:
 
 ```toml
-[codex]
-command = "npx"
-args = ["codex-acp@latest"]
+[[binding]]
+peer_id = "codex"
+harness = "codex"
+cwd = "/path/to/workspace"
+command = "npx -y @agentclientprotocol/codex-acp@2.1.1"
 ```
 
 The node spawns the adapter itself and drives the session over ACP.
-See [Harnesses](./harnesses.md) for the full binding shape and the
-harnesses that are registered out of the box.
+See [Configuration](./configuration.md) for the full binding shape
+and [Harnesses](./harnesses.md) for the harnesses that are registered
+out of the box.
 
-## 5. Install the MCP tools and open the UI
+## 5. Install the skill and open the UI
 
 ```console
 $ wrkspc skill install --harness codex
 $ wrkspc skill status
 ```
 
-The operator UI is served by the node on loopback; the node prints
-the URL and token at startup. From there: create a conversation, add
-peers, and post. The harness agent sees the wrkspc MCP tools the next
-session it opens; whatever it sends back appears in the same view,
-with delivery status on every message.
+Conversations are created on the hub: open the hub's operator UI
+(the `--card-url` HTTPS address), authenticate with its bearer token
+(`wrkspc ui-token` on the hub host copies it to the clipboard; the
+node UI serves the room afterward). From there: create a conversation,
+add peers, and post. The harness agent sees the wrkspc MCP tools the
+next session it opens; whatever it sends back appears in the same
+view, with delivery status on every message.
 
 ## Where to go next
 

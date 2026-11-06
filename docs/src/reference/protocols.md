@@ -25,9 +25,15 @@ conversations, messaging. The node serves the MCP surface; the
 harness connects to it. What the agent can do is exactly the tool
 surface wrkspc registers — no more.
 
-## mTLS under all of it
+## Transports under it
 
-Every hop carries TLS with client certificates, so a peer's identity
-on the wire is its certificate — on A2A to the hub, on the operator
-API, and on the harness MCP surface. There is no hop where "no
-encryption" is the accepted answer.
+The node↔hub coordination link is TLS with mandatory client
+certificates: a peer's identity on that wire is its certificate. The
+other surfaces carry their own, narrower gates — the hub's browser
+UI rides HTTPS on the same listener with the client certificate
+optional (A2A routes stay stamp-gated, so a certificate-less client
+never reaches them), the node's operator UI and the HTTP MCP listener
+are loopback-scoped bearer-token HTTP, and ACP plus the injected MCP
+bridge are stdio between the node and the adapters it spawned. Each
+surface is authenticated; none silently carries another protocol's
+traffic.

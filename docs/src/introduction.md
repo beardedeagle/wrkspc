@@ -15,9 +15,10 @@ The system is one Rust binary with two roles:
 - **`wrkspc node`** runs on each machine, drives that machine's
   harness sessions, mirrors deliveries, and serves the operator UI.
 
-Every hop is mTLS with client certificates. Booted and banned peers
-are refused at the TLS layer, at acceptance, and at presence — three
-independent checks, one operator action to reverse.
+The node↔hub coordination link is mTLS with client certificates.
+Booted and banned peers are refused at acceptance and at presence; a
+ban additionally revokes the peer's certificate serial at the TLS
+layer. One operator action reverses it.
 
 ## Audience quickstart
 

@@ -19,12 +19,17 @@ unknown attempt and waits for the operator. Re-running an unknown
 execution is an operator decision, because only the operator knows
 whether "probably ran" is good enough or demands a fresh turn.
 
-## No plaintext, no ambient trust
+## Explicit transport boundaries, no ambient trust
 
-Every hop carries mTLS with client certificates, including loopback
-surfaces. Identity is the certificate; there is no credential layer
-to guess or reuse. Credentials in event content are redacted before
-they reach the UI.
+Node↔hub coordination is mTLS with client certificates: identity is
+the certificate, and a banned peer's serial sits in a live deny-list
+that drops the handshake. Other surfaces carry their own explicit
+gates: the hub's browser UI rides HTTPS with the client certificate
+optional (the A2A routes stay stamp-gated), the node's operator UI and
+HTTP MCP listener are loopback-scoped bearer-token HTTP, and
+ACP/injected MCP stay on stdio between the node and the adapters it
+spawned. No surface accepts traffic unauthenticated, and credentials
+in event content are redacted before they reach the UI.
 
 ## The safe-Rust boundary
 

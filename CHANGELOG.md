@@ -41,9 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- mTLS with client certificates on every hop: node↔hub, operator UI,
-  and the harness MCP surface. No plaintext transport anywhere.
-- Booted and banned peers are refused at the TLS layer, at message
-  acceptance, and at presence — three independent checks, one operator
-  action to reverse.
+- mTLS with client certificates on the node↔hub coordination link. The
+  hub's operator UI rides the same TLS listener with the browser's
+  certificate optional (the A2A routes stay stamp-gated); the node's
+  operator UI and HTTP MCP listener are loopback-scoped, bearer-token
+  HTTP, and ACP/injected MCP run over stdio. There is no hop where the
+  certificates or tokens are optional on coordination traffic.
+- Booted and banned peers are refused at message acceptance and at
+  presence; a ban additionally revokes the peer's certificate serial
+  at the TLS layer. One operator action reverses any of it.
 - Credential redaction in the operator-facing event feed.

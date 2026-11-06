@@ -17,8 +17,8 @@ assumed.
 
 - **Moderation before delivery.** A message doesn't reach a peer until
   the fences and holds allow it. Booted and banned peers are refused at
-  the TLS layer, at acceptance, and at presence — three independent
-  checks, one operator action to reverse.
+  acceptance and at presence; a ban additionally revokes the peer's
+  certificate serial at the TLS layer. One operator action reverses it.
 - **Exactly-once execution.** Every delivery is claimed before it
   mirrors. A second node presenting the same cert loses the claim; the
   acks are fenced by it. Restart replays nothing.
@@ -29,8 +29,14 @@ assumed.
 - **Durable history.** Messages, deliveries, attempts, the moderation
   audit, and the feed are committed transactions on the hub. The
   database survives hub and node restarts intact.
-- **No plaintext anywhere.** Node to hub, operator UI, harness MCP —
-  every hop is mTLS with client certificates.
+- **Explicit transport boundaries.** Node↔hub coordination is mTLS
+  with client certificates. The hub's operator UI rides the same TLS
+  listener with the browser's client certificate optional — the A2A
+  routes stay stamp-gated, so a certificate-less client never reaches
+  them. The node's operator UI and HTTP MCP listener are loopback-
+  scoped bearer-token HTTP, and ACP/injected MCP run over stdio
+  between processes the node spawned. There is a credential layer on
+  every hop; the certificate is what binds a peer to its host.
 
 ## How a message moves
 
