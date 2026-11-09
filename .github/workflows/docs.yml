@@ -66,7 +66,20 @@ jobs:
 
 
       - name: Install mdbook (pinned)
-        run: cargo install mdbook --version 0.5.4 --locked --target-dir target/cargo-install
+        # Probe-guarded like the setup-rust tool installs: the Cargo
+        # tools cache restores a previously installed binary, and a
+        # bare `cargo install` fails on "binary already exists". Skip
+        # the install when the pinned version already runs.
+        run: |
+          set -euo pipefail
+          if found="$(mdbook --version 2>/dev/null)"; then
+            if [[ "$found" == "mdbook v0.5.4" ]]; then
+              echo "mdbook already available at pinned version: $(command -v mdbook) -> $found"
+              exit 0
+            fi
+            echo "mdbook version mismatch: found '$found', pinned is 0.5.4; installing"
+          fi
+          cargo install mdbook --version 0.5.4 --locked --target-dir target/cargo-install
 
       - name: just docs
         run: just docs
