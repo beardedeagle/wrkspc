@@ -2,47 +2,47 @@
 
 wrkspc exists because agents in separate harnesses don't have
 conversations the user can follow and moderate. Inbox prompts and
-disconnected transcripts prevent timely collaboration — and prevent
-timely intervention when a turn shouldn't run at all.
+disconnected transcripts prevent timely collaboration and timely
+intervention when a turn shouldn't run at all.
 
 The fix is a small, explicit trust boundary. The hub owns the shared
-record and the rules; the node owns the machines and the sessions.
+record and the rules. The node owns the machines and the sessions.
 Nothing executes until the hub has committed the message, the fence
 has let the delivery through, and the node has claimed it. Everything
-that executes is visible; everything that might have executed but
-can't be proven is surfaced as an unknown rather than silently
+that executes is visible. Everything that might have executed but
+can't be proven shows up as an unknown instead of being silently
 assumed.
 
 ## What it guarantees
 
 - **Moderation before delivery.** Fences and holds gate at claim time,
-  before anything mirrors, on every node identically — the gate is the
+  before anything mirrors, on every node identically. The gate is the
   hub's own record. An operator cancel propagates too: a canceled
   intent is never fanned out and a startup repair never re-creates
   one. Booted and banned peers are refused at acceptance and at
-  presence; a ban additionally revokes the peer's certificate serial
-  at the TLS layer. One operator action reverses it.
+  presence. A ban also revokes the peer's certificate serial at the
+  TLS layer. One operator action reverses it.
 - **Exclusive delivery.** Every delivery is claimed before it mirrors.
   A second node presenting the same cert loses the claim. Restart
-  replays nothing. The claim fences exactly-once *handoff* — the ack
+  replays nothing. The claim fences exactly-once *handoff*. The ack
   is a durable receipt, never a claim that the turn finished. The
   turn's actual outcome comes back separately and is recorded against
   the attempt.
 - **Nothing stalls silently.** A turn whose outcome the node can't
-  determine becomes a visible unknown attempt, and the operator
+  determine becomes a visible unknown attempt. The operator
   reconciles it. The feed is cursor-resumable, so the UI can't lose an
   event to a restart.
 - **Durable history.** Messages, deliveries, attempts, the moderation
   audit, and the feed are committed transactions on the hub. The
   database survives hub and node restarts intact.
 - **Explicit transport boundaries.** Node↔hub coordination is mTLS
-  with client certificates. The hub's operator UI rides the same TLS
-  listener with the browser's client certificate optional — the A2A
+  with client certificates. The hub's operator UI uses the same TLS
+  listener, with the browser's client certificate optional. The A2A
   routes stay stamp-gated, so a certificate-less client never reaches
   them. The node's operator UI and HTTP MCP listener are loopback-
   scoped bearer-token HTTP, and ACP/injected MCP run over stdio
-  between processes the node spawned. There is a credential layer on
-  every hop; the certificate is what binds a peer to its host.
+  between processes the node spawned. Every hop has a credential
+  layer. The certificate binds a peer to its host.
 
 ## How a message moves
 
