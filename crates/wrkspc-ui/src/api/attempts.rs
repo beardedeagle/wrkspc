@@ -7,21 +7,45 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use wrkspc_core::{Reconciliation, UnknownAttemptView};
+use wrkspc_core::Reconciliation;
 
 pub(crate) async fn unknown_attempts(
     State(state): State<AppState>,
-) -> Result<Json<Vec<UnknownAttemptView>>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Local unknowns (this store owns the attempts) plus the hub's
+    // mirrored unknowns (node-side attempts reported upward): one list,
+    // one reconciliation surface. The dispatcher writes adapter error
+    // text into `stop_reason`; it reaches the browser exactly as
+    // stored unless it goes through the same display redaction as
+    // every other rendered value.
+    let mut merged: Vec<Value> = Vec::new();
     let mut attempts = state.store.unknown_attempts().await.map_err(store_error)?;
-    // The dispatcher writes adapter error text into `stop_reason`; it
-    // reaches the browser exactly as stored unless it goes through the
-    // same display redaction as every other rendered value.
     for attempt in &mut attempts {
+        let mut value = serde_json::to_value(&*attempt).map_err(store_error_json)?;
         if let Some(reason) = attempt.stop_reason.take() {
-            attempt.stop_reason = Some(redact(&reason));
+            value["stop_reason"] = Value::String(redact(&reason));
         }
+        merged.push(value);
     }
-    Ok(Json(attempts))
+    for mirrored in state.store.hub_unknowns().await.map_err(store_error)? {
+        merged.push(json!({
+            "attempt_id": mirrored.attempt_id,
+            "recipient_id": mirrored.recipient_id,
+            "conversation_id": mirrored.conversation_id,
+            "host_id": mirrored.host_id,
+            "stop_reason": redact(&mirrored.stop_reason),
+            "decision": mirrored.decision,
+        }));
+    }
+    Ok(Json(Value::Array(merged)))
+}
+
+/// Maps a serde failure on a store view to a 500 JSON error.
+fn store_error_json(error: serde_json::Error) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": format!("view serialization failed: {error}") })),
+    )
 }
 
 #[derive(Deserialize)]
@@ -59,6 +83,34 @@ pub(crate) async fn reconcile_attempt(
             ));
         }
     };
+    // A hub-mirrored attempt (a node-side unknown reported upward):
+    // queue the decision for the owning node's poll loop instead of
+    // reconciling a record this store does not own.
+    let mirrored = state
+        .store
+        .hub_unknowns()
+        .await
+        .map_err(store_error)?
+        .into_iter()
+        .any(|view| view.attempt_id == attempt_id);
+    if mirrored {
+        let decision_string = match decision {
+            Reconciliation::Retry => "retry".to_string(),
+            Reconciliation::Close { state } => format!("close:{}", state.as_str()),
+        };
+        let updated = state
+            .store
+            .set_hub_unknown_decision(&attempt_id, &decision_string)
+            .await
+            .map_err(store_error)?;
+        if !updated {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "unknown attempt" })),
+            ));
+        }
+        return Ok(StatusCode::NO_CONTENT);
+    }
     state
         .store
         .reconcile_unknown(&attempt_id, decision)
@@ -136,8 +188,9 @@ mod tests {
 
         let state = AppState::new(store, Arc::new(NoCancel), false, true, false, None);
         let Json(views) = unknown_attempts(State(state)).await.unwrap();
+        let views = views.as_array().expect("array response");
         assert_eq!(views.len(), 1);
-        let reason = views[0].stop_reason.as_deref().unwrap();
+        let reason = views[0].get("stop_reason").and_then(Value::as_str).unwrap();
         assert!(
             !reason.contains("abcdef1234567890"),
             "credential must be masked: {reason:?}"

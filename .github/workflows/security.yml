@@ -19,15 +19,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Setup Rust and just
-        uses: ./.github/actions/setup-rust
-        with:
-          install-cargo-deny: "true"
-          install-cargo-audit: "true"
-
-      # Hand-rolled cargo cache (the two-step split): registry/git and
-      # the per-leg target cache as separate entries so target churn
-      # never evicts the registry. Official SHA-pinned actions only.
+      # The caches restore BEFORE setup-rust: its version probes must
+      # run against the restored pinned tools. Hand-rolled cargo cache
+      # (the two-step split); official SHA-pinned actions only.
       - name: Cache Cargo registry and tools
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
@@ -46,6 +40,12 @@ jobs:
           key: ${{ runner.os }}-scan-target-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'Justfile', 'rust-toolchain.toml', '.github/workflows/security.yml') }}
           restore-keys: |
             ${{ runner.os }}-scan-target-
+
+      - name: Setup Rust and just
+        uses: ./.github/actions/setup-rust
+        with:
+          install-cargo-deny: "true"
+          install-cargo-audit: "true"
 
       - name: just deny-check
         run: just deny-check

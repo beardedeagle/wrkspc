@@ -157,6 +157,10 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
         store.clone(),
         db.clone(),
         shutdown_rx.clone(),
+        // Team mode: the injected MCP surfaces mirror this so harness
+        // posts never create local execution intents — execution waits
+        // for hub acceptance and the echoed delivery claim.
+        args.hub.is_some(),
     ));
     let (dispatcher, dispatcher_handle) =
         Dispatcher::new(store.clone(), provider.clone(), DispatcherConfig::default());

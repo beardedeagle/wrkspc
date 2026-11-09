@@ -23,11 +23,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Setup Rust and just
-        uses: ./.github/actions/setup-rust
-
-      # Hand-rolled cargo cache (the two-step split): the registry/git
-      # checkout cache and the per-job target cache are separate entries
+      # The caches restore BEFORE setup-rust: its version probes must
+      # run against the restored pinned tools (restoring afterwards
+      # could overwrite freshly validated tools with older cached
+      # copies, and installing before the restore wastes the compile
+      # work). Hand-rolled cargo cache (the two-step split): the
+      # registry/tools entry and the per-job target entry are separate
       # so target churn never evicts the registry. Official SHA-pinned
       # actions only.
       - name: Cache Cargo registry and tools
@@ -48,6 +49,9 @@ jobs:
           key: ${{ runner.os }}-ci-rust-target-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'Justfile', 'rust-toolchain.toml', '.github/workflows/ci.yml') }}
           restore-keys: |
             ${{ runner.os }}-ci-rust-target-
+
+      - name: Setup Rust and just
+        uses: ./.github/actions/setup-rust
 
       - name: just ci-rust
         run: just ci-rust

@@ -18,13 +18,20 @@ refuse() {
 [ "$#" -eq 1 ] || fail 'usage: publish-image.sh VERSION'
 version="${1#v}"
 
-# Shape-check before the value reaches any shell construct: a tag or
-# dispatch input is write-access-only, but a wrong shape must refuse
-# loudly rather than produce a junk image tag. The whitelist requires
+# The image job runs independently of tarball publication, so it must
+# enforce the same version policy as `release-publish` before touching
+# the registry: stable X.Y.Z only (a prerelease like 0.1.0-rc.1 is
+# refused — `latest` is never replaced by a non-release), and the tag
+# must name the workspace's declared version (a tag naming one version
+# must never wrap another's binaries). The shape whitelist requires
 # digits between the dots — `1..3` and bare `.` runs are rejected, not
 # just filtered by charset.
-if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-    refuse "refusing non-semver version '$version'"
+if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    refuse "refusing non-stable version '$version' (want X.Y.Z, no prerelease)"
+fi
+declared=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
+if [ "$version" != "$declared" ]; then
+    refuse "version '$version' does not match the workspace's declared version '$declared'"
 fi
 
 : "${GITHUB_TOKEN:?publish-image: GITHUB_TOKEN is unset}"

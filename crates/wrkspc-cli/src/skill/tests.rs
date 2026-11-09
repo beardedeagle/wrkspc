@@ -323,3 +323,30 @@ fn home_validation_rejects_unset_empty_and_relative() {
     );
     assert!(super::validated_home_from(Some("/nonexistent/absolute".into())).is_ok());
 }
+
+/// Uninstalling when the user appended content after the block (and the
+/// original file had no final newline) must keep exactly one separator:
+/// an appended heading must not glue itself to the preceding paragraph.
+#[test]
+fn appended_content_keeps_its_separator_after_uninstall() {
+    // Original file, no trailing newline.
+    let (installed, _) = with_section("existing instructions", "wrkspc pointer").unwrap();
+    assert!(installed.starts_with("existing instructions\n"));
+    // The user later appends a heading after the wrkspc block.
+    let appended = format!("{installed}\n# My own section");
+    let (removed, found) = without_section(&appended).unwrap();
+    assert!(found);
+    assert_eq!(removed, "existing instructions\n# My own section");
+}
+
+/// A suffix that already begins with a newline (blank lines after the
+/// block) needs no extra separator — the surviving newlines stay exact.
+#[test]
+fn blank_line_suffix_needs_no_extra_separator() {
+    let (installed, _) = with_section("existing instructions", "wrkspc pointer").unwrap();
+    // Two blank lines between the block and the appended heading: the
+    // span consumes the block's own trailing newline, leaving one.
+    let with_blanks = format!("{installed}\n\n# Heading");
+    let (removed, _) = without_section(&with_blanks).unwrap();
+    assert_eq!(removed, "existing instructions\n\n# Heading");
+}

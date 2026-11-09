@@ -55,17 +55,33 @@ pub(crate) fn parse_send(parsed: &serde_json::Value) -> Result<Option<ParsedSend
         .and_then(|metadata| metadata.get("executionRequested"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    let recipients = message
+    // A recipient field, when present and non-null, MUST be an array
+    // of strings: malformed explicit recipients are rejected loudly
+    // instead of silently discarded. Silently dropping a malformed
+    // field can leave zero recipients while execution is requested,
+    // and acceptance would then resolve @mentions and execute a turn
+    // for a peer the sender never named.
+    let recipients = match message
         .metadata
         .as_ref()
         .and_then(|metadata| metadata.get("recipients"))
-        .and_then(|value| value.as_array())
-        .map(|entries| {
+    {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Array(entries)) => Some(
             entries
                 .iter()
-                .filter_map(|entry| entry.as_str().map(str::to_string))
-                .collect::<Vec<_>>()
-        });
+                .map(|entry| {
+                    entry
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "recipients must be an array of strings".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Some(_) => {
+            return Err("recipients must be an array of strings".to_string());
+        }
+    };
     Ok(Some(ParsedSend {
         message_id: message.message_id,
         conversation_id,
@@ -94,4 +110,60 @@ pub(crate) fn parse_send(parsed: &serde_json::Value) -> Result<Option<ParsedSend
 pub(crate) fn host_from_identity(identity: &str) -> Option<String> {
     let host = identity.trim();
     (!host.is_empty()).then(|| host.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn send_with_recipients(recipients: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "SendMessage",
+            "params": {
+                "message": {
+                    "messageId": "m-1",
+                    "role": "ROLE_USER",
+                    "contextId": "conv-1",
+                    "parts": [{"text": "hello"}],
+                    "metadata": {
+                        "peerId": "node-test-1",
+                        "recipients": recipients,
+                        "executionRequested": true,
+                    },
+                },
+            },
+        })
+    }
+
+    /// A well-formed recipients array parses; absent/null yields None.
+    #[test]
+    fn recipients_parse_strictly() {
+        let parsed = parse_send(&send_with_recipients(serde_json::json!(["codex"])))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parsed.recipients.as_deref(),
+            Some(&["codex".to_string()][..])
+        );
+    }
+
+    /// Malformed explicit recipients are REJECTED, not silently
+    /// discarded: silent discard can leave zero recipients while
+    /// execution is requested and wake the wrong peer via @mentions.
+    #[test]
+    fn malformed_recipients_are_rejected() {
+        // Non-array.
+        assert!(parse_send(&send_with_recipients(serde_json::json!("codex"))).is_err());
+        // Array containing a non-string.
+        assert!(parse_send(&send_with_recipients(serde_json::json!(["codex", 7]))).is_err());
+        // Array of objects.
+        assert!(
+            parse_send(&send_with_recipients(
+                serde_json::json!([{"peer": "codex"}])
+            ))
+            .is_err()
+        );
+    }
 }

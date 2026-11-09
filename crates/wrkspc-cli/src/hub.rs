@@ -294,6 +294,13 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                                             .with_state(delivery.clone()),
                                     )
                                     .route(
+                                        "/reconciliation-decisions",
+                                        axum::routing::get(
+                                            crate::delivery::reconciliation_decisions,
+                                        )
+                                        .with_state(delivery.clone()),
+                                    )
+                                    .route(
                                         "/presence",
                                         axum::routing::post(crate::presence::presence_upsert)
                                             .with_state(presence.clone()),

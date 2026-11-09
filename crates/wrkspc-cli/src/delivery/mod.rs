@@ -16,7 +16,7 @@ pub(crate) mod routes;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use routes::{delivery_ack, delivery_claim, delivery_report};
+pub(crate) use routes::{delivery_ack, delivery_claim, delivery_report, reconciliation_decisions};
 
 /// Shared state for the delivery-ack route.
 #[derive(Clone)]
@@ -61,11 +61,17 @@ pub(crate) struct DeliveryReport {
     /// The terminal attempt.
     #[serde(rename = "attemptId")]
     attempt_id: String,
-    /// The terminal state: `completed`, `failed`, or `canceled`.
+    /// The terminal state: `completed`, `failed`, `canceled`, or
+    /// `unknown` (a node-side outcome that could not be determined —
+    /// mirrored on the hub for operator reconciliation, never a task
+    /// transition).
     state: String,
     /// When the attempt reached the terminal state (RFC 3339).
     #[serde(rename = "recordedAt")]
     recorded_at: String,
+    /// The dispatcher-recorded reason for an unknown outcome. Optional.
+    #[serde(default, rename = "stopReason")]
+    stop_reason: String,
     /// Guidance ids the node consumed (rode a successful prompt): the
     /// hub marks its authoritative rows delivered. Optional, default
     /// empty.

@@ -689,3 +689,137 @@ async fn the_operator_takes_no_delivery() {
     assert_eq!(delivered, vec![codex]);
     assert!(!delivered.contains(&operator));
 }
+
+/// The hub-connected mirror form records the message and recipients but
+/// creates NO local execution intent: execution in team mode waits for
+/// hub acceptance and the echoed delivery claim.
+#[tokio::test]
+async fn mirror_only_accept_creates_no_local_intents() {
+    let store = Store::open_in_memory("mirror-only").await.unwrap();
+    let (operator, agent, conversation) = seeded(&store).await;
+
+    let outcome = store
+        .accept_message_mirror_only(
+            &conversation,
+            &operator,
+            &key(),
+            "hello agent",
+            true,
+            &[RecipientRequest {
+                peer_id: agent.clone(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap();
+    let message_id = match outcome {
+        AcceptOutcome::Accepted { message_id } | AcceptOutcome::Replay { message_id } => message_id,
+    };
+
+    // The message and its recipients are committed...
+    assert_eq!(
+        store.message_recipients(&message_id).await.unwrap(),
+        vec![agent.clone()]
+    );
+    // ...but there is nothing for the local dispatcher to claim: the
+    // intent that direct acceptance would have created is absent.
+    assert!(
+        store.claim_intent(&message_id, &agent).await.is_err(),
+        "mirror-only acceptance must not create a claimable intent"
+    );
+
+    // The direct path still creates the intent (the two stay distinct).
+    let direct = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &key(),
+            "again",
+            true,
+            &[RecipientRequest {
+                peer_id: agent.clone(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap();
+    let direct_id = match direct {
+        AcceptOutcome::Accepted { message_id } | AcceptOutcome::Replay { message_id } => message_id,
+    };
+    assert!(
+        store.claim_intent(&direct_id, &agent).await.is_ok(),
+        "standalone acceptance still creates the intent"
+    );
+}
+
+/// The hub mirrors node-reported unknown attempts and queues operator
+/// decisions back to the owning node's poll loop; the terminal report
+/// consumes the mirror.
+#[tokio::test]
+async fn hub_unknown_mirror_round_trip() {
+    let store = Store::open_in_memory("hub-unknown").await.unwrap();
+
+    store
+        .record_hub_unknown(
+            "att-1",
+            "task-1",
+            "node-host",
+            "codex",
+            "conv-1",
+            "spawn failed",
+        )
+        .await
+        .unwrap();
+    // Idempotent re-report refreshes the reason without dropping a
+    // queued decision.
+    store
+        .record_hub_unknown(
+            "att-1",
+            "task-1",
+            "node-host",
+            "codex",
+            "conv-1",
+            "spawn failed again",
+        )
+        .await
+        .unwrap();
+
+    let listed = store.hub_unknowns().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].attempt_id, "att-1");
+    assert_eq!(listed[0].stop_reason, "spawn failed again");
+    assert!(listed[0].decision.is_none());
+
+    // No decision queued yet: the poll leg sees nothing.
+    assert!(
+        store
+            .hub_pending_reconciliations("node-host")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    assert!(
+        store
+            .set_hub_unknown_decision("att-1", "close:failed")
+            .await
+            .unwrap()
+    );
+    let pending = store
+        .hub_pending_reconciliations("node-host")
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].decision.as_deref(), Some("close:failed"));
+
+    // The terminal report consumes the mirror.
+    store.consume_hub_unknown("att-1").await.unwrap();
+    assert!(store.hub_unknowns().await.unwrap().is_empty());
+    assert!(
+        !store
+            .set_hub_unknown_decision("att-1", "retry")
+            .await
+            .unwrap(),
+        "a consumed mirror row has no decision to set"
+    );
+}

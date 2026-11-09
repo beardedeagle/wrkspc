@@ -157,5 +157,20 @@ pub(crate) fn without_section(content: &str) -> Result<(String, bool), String> {
     }
     let mut removed = content.to_string();
     removed.replace_range(head..end, "");
+    // The span consumed the END line's trailing newline — when content
+    // follows the block (the user appended instructions later), that
+    // newline was the ONLY separator between the prefix and the
+    // appended text. Restore exactly one so an appended heading does
+    // not glue itself to the preceding paragraph. A suffix that
+    // already starts with a newline (blank lines after the block)
+    // needs nothing.
+    if head > 0
+        && end < content.len()
+        && !removed.is_empty()
+        && !removed[..head].ends_with('\n')
+        && !removed[head..].starts_with('\n')
+    {
+        removed.insert(head, '\n');
+    }
     Ok((removed, true))
 }

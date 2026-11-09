@@ -20,5 +20,5 @@ pub use moderation::{CancelOutcome, DueIntent, Guidance, OpenAttempt};
 pub use roster::{ModerationEvent, PeerStatus, PresenceOutcome, RosterEntry, status_is_ejected};
 pub use store::{AcceptOutcome, Event, Fence, RecipientRequest, Store};
 pub use tasks::{DeliveryClaimOutcome, DeliveryTaskRequest, TaskRow};
-pub use team::{OutboundMessage, RemoteFanoutRequest};
+pub use team::{HubUnknownView, OutboundMessage, RemoteFanoutRequest};
 pub use views::{ConversationView, DeliveryView, MessageView, UnknownAttemptView};

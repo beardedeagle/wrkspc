@@ -15,6 +15,11 @@ pub struct McpBridgeArgs {
     /// The peer whose surface to serve.
     #[arg(long)]
     pub peer: String,
+    /// This node runs against a hub: posts mirror locally without
+    /// execution intents — execution waits for hub acceptance and the
+    /// echoed delivery claim.
+    #[arg(long, default_value_t = false)]
+    pub hub_connected: bool,
 }
 
 /// Serves the bridge over stdio until the parent closes the stream.
@@ -28,8 +33,8 @@ pub struct McpBridgeArgs {
 /// Returns a boxed error on open or serve failure.
 pub async fn run_bridge(args: McpBridgeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let store = wrkspc_core::Store::open_shared(&args.db, "wrkspc-mcp-bridge").await?;
-    let server = wrkspc_mcp::McpServer::new(store, &args.peer);
-    tracing::info!(peer = %args.peer, "mcp bridge serving stdio");
+    let server = wrkspc_mcp::McpServer::new(store, &args.peer, args.hub_connected);
+    tracing::info!(peer = %args.peer, hub_connected = args.hub_connected, "mcp bridge serving stdio");
     server.serve_stdio().await?;
     Ok(())
 }

@@ -98,6 +98,11 @@ pub struct ReportWorkParams {
 pub struct McpServer {
     store: Store,
     peer_id: String,
+    /// A node running with `--hub` must not execute local work before
+    /// hub acceptance: posts mirror locally (no execution intents) and
+    /// execution happens only when the hub echoes a delivery this node
+    /// claims. Standalone nodes keep direct acceptance.
+    hub_connected: bool,
 }
 
 impl McpServer {
@@ -107,10 +112,13 @@ impl McpServer {
     ///
     /// * `store` — the transactional store (shared with the dispatcher).
     /// * `peer_id` — the enrolled peer this surface speaks for.
-    pub fn new(store: Store, peer_id: impl Into<String>) -> Self {
+    /// * `hub_connected` — whether this node runs against a hub; gates
+    ///   local execution behind hub acceptance and delivery claims.
+    pub fn new(store: Store, peer_id: impl Into<String>, hub_connected: bool) -> Self {
         Self {
             store,
             peer_id: peer_id.into(),
+            hub_connected,
         }
     }
 
@@ -243,18 +251,35 @@ impl McpServer {
                 execution_requested: params.execution_requested,
             })
             .collect::<Vec<_>>();
-        let outcome = self
-            .store
-            .accept_message(
-                &params.conversation_id,
-                &self.peer_id,
-                &params.idempotency_key,
-                &params.content,
-                params.execution_requested,
-                &recipient_requests,
-            )
-            .await
-            .map_err(store_error)?;
+        let outcome = if self.hub_connected {
+            // Hub mode: no local execution intents. The message mirrors
+            // locally and syncs to the hub; execution happens only when
+            // the hub accepts it (fences) and this node claims the
+            // echoed delivery.
+            self.store
+                .accept_message_mirror_only(
+                    &params.conversation_id,
+                    &self.peer_id,
+                    &params.idempotency_key,
+                    &params.content,
+                    params.execution_requested,
+                    &recipient_requests,
+                )
+                .await
+                .map_err(store_error)?
+        } else {
+            self.store
+                .accept_message(
+                    &params.conversation_id,
+                    &self.peer_id,
+                    &params.idempotency_key,
+                    &params.content,
+                    params.execution_requested,
+                    &recipient_requests,
+                )
+                .await
+                .map_err(store_error)?
+        };
         let (verb, message_id) = match outcome {
             AcceptOutcome::Accepted { message_id } => ("accepted", message_id),
             AcceptOutcome::Replay { message_id } => ("replay", message_id),

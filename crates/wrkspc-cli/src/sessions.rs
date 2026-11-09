@@ -72,6 +72,10 @@ struct Inner {
     store: Store,
     db: PathBuf,
     shutdown: watch::Receiver<bool>,
+    /// Whether the node runs against a hub: the injected bridge and the
+    /// in-process HTTP MCP surface mirror it, so harness posts never
+    /// create local execution intents in team mode.
+    hub_connected: bool,
 }
 
 /// Spawns ACP sessions on demand with per-peer backoff.
@@ -121,11 +125,15 @@ impl SessionRegistry {
     /// * `db` — the database path (token files + bridge injection).
     /// * `shutdown` — the node's shutdown signal, cloned into any HTTP
     ///   listener task spawned on demand.
+    /// * `hub_connected` — whether the node runs against a hub; the
+    ///   MCP surfaces mirror it so harness posts never create local
+    ///   execution intents in team mode.
     pub fn new(
         configs: Vec<SessionConfig>,
         store: Store,
         db: PathBuf,
         shutdown: watch::Receiver<bool>,
+        hub_connected: bool,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -139,6 +147,7 @@ impl SessionRegistry {
                 store,
                 db,
                 shutdown,
+                hub_connected,
             }),
         }
     }
@@ -196,7 +205,15 @@ impl Inner {
         // conservative outcome (no binding → the dispatcher records
         // unknown), never a panic.
         let config = self.configs.get(peer_id)?.clone();
-        match spawn_session(&config, &self.store, &self.db, self.shutdown.clone()).await {
+        match spawn_session(
+            &config,
+            &self.store,
+            &self.db,
+            self.shutdown.clone(),
+            self.hub_connected,
+        )
+        .await
+        {
             Ok(session) => {
                 let binding = session.binding.clone();
                 self.sessions
@@ -256,6 +273,7 @@ async fn spawn_session(
     store: &Store,
     db: &Path,
     shutdown: watch::Receiver<bool>,
+    hub_connected: bool,
 ) -> Result<PeerSession, String> {
     tracing::debug!(peer_id = %config.peer_id, "spawning session transport");
     let (handle, _events) = SessionHandle::spawn(StdioTransport::new(config.command.clone()));
@@ -269,7 +287,7 @@ async fn spawn_session(
             .map_err(|e| e.to_string())?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         let token = stable_token(db, &format!("{}.mcp-token", config.peer_id)).await?;
-        let server = wrkspc_mcp::McpServer::new(store.clone(), &config.peer_id);
+        let server = wrkspc_mcp::McpServer::new(store.clone(), &config.peer_id, hub_connected);
         let http = wrkspc_mcp::HttpListener::new(
             server,
             wrkspc_mcp::HttpListenerConfig {
@@ -351,7 +369,7 @@ async fn spawn_session(
             http_task: Some(task),
         });
     } else {
-        vec![bridge_injection(db, &config.peer_id)]
+        vec![bridge_injection(db, &config.peer_id, hub_connected)]
     };
     let session_id = handle
         .new_session_with_mcp(config.cwd.clone(), mcp)
@@ -419,6 +437,7 @@ mod tests {
             store.clone(),
             PathBuf::from("/nonexistent.db"),
             rx,
+            false,
         );
 
         // First resolve attempts the spawn and fails.
@@ -435,8 +454,13 @@ mod tests {
             .await
             .unwrap();
         let (_tx, rx) = watch::channel(false);
-        let registry =
-            SessionRegistry::new(Vec::new(), store, PathBuf::from("/nonexistent.db"), rx);
+        let registry = SessionRegistry::new(
+            Vec::new(),
+            store,
+            PathBuf::from("/nonexistent.db"),
+            rx,
+            false,
+        );
         assert!(registry.lookup("codex").await.is_none());
     }
 }

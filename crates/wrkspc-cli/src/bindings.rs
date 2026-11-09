@@ -69,19 +69,30 @@ impl BindingsFile {
 ///
 /// * `db_path` — the node's database file.
 /// * `peer_id` — the peer whose surface the bridge serves.
+/// * `hub_connected` — whether the node runs against a hub; the bridge
+///   mirrors the flag so hub-mode posts never create local execution
+///   intents.
 ///
 /// # Returns
 ///
 /// The ACP `McpServer` to inject at `session/new`.
-pub fn bridge_injection(db_path: &std::path::Path, peer_id: &str) -> McpServer {
+pub fn bridge_injection(
+    db_path: &std::path::Path,
+    peer_id: &str,
+    hub_connected: bool,
+) -> McpServer {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("wrkspc"));
-    McpServer::Stdio(McpServerStdio::new("wrkspc", exe).args(vec![
+    let mut args = vec![
         "mcp-bridge".to_string(),
         "--db".to_string(),
         db_path.display().to_string(),
         "--peer".to_string(),
         peer_id.to_string(),
-    ]))
+    ];
+    if hub_connected {
+        args.push("--hub-connected".to_string());
+    }
+    McpServer::Stdio(McpServerStdio::new("wrkspc", exe).args(args))
 }
 
 #[cfg(test)]
@@ -128,7 +139,7 @@ model = "gemini-3.6-flash-medium"
 
     #[test]
     fn injection_points_at_the_bridge_subcommand() {
-        let server = bridge_injection(std::path::Path::new("/tmp/wrkspc.db"), "codex");
+        let server = bridge_injection(std::path::Path::new("/tmp/wrkspc.db"), "codex", false);
         let McpServer::Stdio(stdio) = server else {
             panic!("expected stdio injection");
         };
@@ -137,6 +148,27 @@ model = "gemini-3.6-flash-medium"
         assert_eq!(
             stdio.args,
             vec!["mcp-bridge", "--db", "/tmp/wrkspc.db", "--peer", "codex"]
+        );
+    }
+
+    /// Hub-connected nodes inject the flag: the bridge mirrors hub mode,
+    /// so harness posts never create local execution intents.
+    #[test]
+    fn hub_connected_injection_carries_the_flag() {
+        let server = bridge_injection(std::path::Path::new("/tmp/wrkspc.db"), "codex", true);
+        let McpServer::Stdio(stdio) = server else {
+            panic!("expected stdio injection");
+        };
+        assert_eq!(
+            stdio.args,
+            vec![
+                "mcp-bridge",
+                "--db",
+                "/tmp/wrkspc.db",
+                "--peer",
+                "codex",
+                "--hub-connected"
+            ]
         );
     }
 }

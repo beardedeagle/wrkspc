@@ -10,6 +10,13 @@ use sqlx::Transaction;
 use sqlx::{Row, Sqlite};
 use uuid::Uuid;
 
+/// The idempotency key and message text, paired so the shared fence
+/// implementation stays under the argument-count lint.
+struct AcceptText<'a> {
+    key: &'a str,
+    content: &'a str,
+}
+
 impl Store {
     /// Runs the readiness fence: commits a message, its recipients, and any
     /// requested execution intents in one transaction.
@@ -30,6 +37,72 @@ impl Store {
         execution_requested: bool,
         recipients: &[RecipientRequest],
     ) -> Result<AcceptOutcome> {
+        self.accept_message_with(
+            conversation_id,
+            sender_id,
+            AcceptText {
+                key: idempotency_key,
+                content,
+            },
+            execution_requested,
+            recipients,
+            true,
+        )
+        .await
+    }
+
+    /// The hub-connected mirror form of
+    /// [`accept_message`](Store::accept_message): identical fence and
+    /// commit semantics, but NO local execution intents are created.
+    ///
+    /// A node running with `--hub` must never execute local work before
+    /// hub acceptance: hub fences and the hub-side delivery claim are the
+    /// execution gate. The message is stored (the mirror + the outbound
+    /// sync feed the hub), and execution happens only when the hub echoes
+    /// a delivery the node claims. Standalone nodes keep the direct path.
+    ///
+    /// # Errors
+    ///
+    /// The same error set as [`accept_message`](Store::accept_message).
+    pub async fn accept_message_mirror_only(
+        &self,
+        conversation_id: &str,
+        sender_id: &str,
+        idempotency_key: &str,
+        content: &str,
+        execution_requested: bool,
+        recipients: &[RecipientRequest],
+    ) -> Result<AcceptOutcome> {
+        self.accept_message_with(
+            conversation_id,
+            sender_id,
+            AcceptText {
+                key: idempotency_key,
+                content,
+            },
+            execution_requested,
+            recipients,
+            false,
+        )
+        .await
+    }
+
+    /// Shared fence implementation; `create_intents` selects whether
+    /// execution intents are committed (the execution authority is still
+    /// recorded on the message either way, so the wire flag never lies).
+    async fn accept_message_with(
+        &self,
+        conversation_id: &str,
+        sender_id: &str,
+        text: AcceptText<'_>,
+        execution_requested: bool,
+        recipients: &[RecipientRequest],
+        create_intents: bool,
+    ) -> Result<AcceptOutcome> {
+        let AcceptText {
+            key: idempotency_key,
+            content,
+        } = text;
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin().await?;
 
@@ -105,7 +178,7 @@ impl Store {
                 .bind(DeliveryState::Stored.as_str())
                 .execute(&mut *tx)
                 .await?;
-                if recipient.execution_requested {
+                if create_intents && recipient.execution_requested {
                     sqlx::query(
                         "INSERT OR IGNORE INTO execution_intents
                            (id, message_id, recipient_id, state, created_at)
@@ -179,7 +252,7 @@ impl Store {
             .bind(DeliveryState::Stored.as_str())
             .execute(&mut *tx)
             .await?;
-            if recipient.execution_requested {
+            if create_intents && recipient.execution_requested {
                 let intent_id = Uuid::new_v4().to_string();
                 sqlx::query(
                     "INSERT INTO execution_intents

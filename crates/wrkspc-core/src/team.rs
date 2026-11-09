@@ -317,7 +317,7 @@ impl Store {
              FROM attempts a
              JOIN execution_intents i ON i.id = a.intent_id
              JOIN messages m ON m.id = i.message_id
-             WHERE a.state IN ('completed', 'failed', 'canceled')
+             WHERE a.state IN ('completed', 'failed', 'canceled', 'unknown')
                AND a.id NOT IN (SELECT attempt_id FROM hub_outcome_reports)
              ORDER BY a.terminal_at ASC",
         )
@@ -372,6 +372,159 @@ impl Store {
         .await?;
         Ok(())
     }
+
+    /// Mirrors a node-reported unknown attempt on the hub. Idempotent:
+    /// a re-report refreshes the reason and timestamp but preserves any
+    /// queued operator decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    pub async fn record_hub_unknown(
+        &self,
+        attempt_id: &str,
+        task_id: &str,
+        host_id: &str,
+        recipient_id: &str,
+        conversation_id: &str,
+        stop_reason: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO hub_unknown_attempts
+               (attempt_id, task_id, host_id, recipient_id, conversation_id,
+                stop_reason, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(attempt_id) DO UPDATE SET
+                stop_reason = excluded.stop_reason,
+                updated_at = excluded.updated_at",
+        )
+        .bind(attempt_id)
+        .bind(task_id)
+        .bind(host_id)
+        .bind(recipient_id)
+        .bind(conversation_id)
+        .bind(stop_reason)
+        .bind(&now)
+        .bind(&now)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Every mirrored unknown attempt (the hub UI's reconciliation list).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    pub async fn hub_unknowns(&self) -> Result<Vec<HubUnknownView>> {
+        let rows = sqlx::query(
+            "SELECT attempt_id, task_id, host_id, recipient_id, conversation_id,
+                    stop_reason, decision, created_at
+             FROM hub_unknown_attempts
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| HubUnknownView {
+                attempt_id: row.get("attempt_id"),
+                task_id: row.get("task_id"),
+                host_id: row.get("host_id"),
+                recipient_id: row.get("recipient_id"),
+                conversation_id: row.get("conversation_id"),
+                stop_reason: row.get("stop_reason"),
+                decision: row.get("decision"),
+            })
+            .collect())
+    }
+
+    /// Mirrored unknowns carrying an operator decision, for one host's
+    /// poll loop to apply locally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    pub async fn hub_pending_reconciliations(&self, host_id: &str) -> Result<Vec<HubUnknownView>> {
+        let rows = sqlx::query(
+            "SELECT attempt_id, task_id, host_id, recipient_id, conversation_id,
+                    stop_reason, decision, created_at
+             FROM hub_unknown_attempts
+             WHERE host_id = ? AND decision IS NOT NULL
+             ORDER BY created_at ASC",
+        )
+        .bind(host_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| HubUnknownView {
+                attempt_id: row.get("attempt_id"),
+                task_id: row.get("task_id"),
+                host_id: row.get("host_id"),
+                recipient_id: row.get("recipient_id"),
+                conversation_id: row.get("conversation_id"),
+                stop_reason: row.get("stop_reason"),
+                decision: row.get("decision"),
+            })
+            .collect())
+    }
+
+    /// Queues the operator's reconciliation decision on a mirrored
+    /// unknown attempt (the hub UI path); the owning node's poll loop
+    /// applies it. Returns false when the mirror row is unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    pub async fn set_hub_unknown_decision(&self, attempt_id: &str, decision: &str) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE hub_unknown_attempts
+             SET decision = ?, updated_at = ?
+             WHERE attempt_id = ?",
+        )
+        .bind(decision)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(attempt_id)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Consumes the mirror row once the node reports the final terminal
+    /// state (the reconciliation is complete).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    pub async fn consume_hub_unknown(&self, attempt_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM hub_unknown_attempts WHERE attempt_id = ?")
+            .bind(attempt_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+}
+
+/// A hub-mirrored unknown attempt: a node-side attempt whose outcome
+/// could not be determined, visible and reconcilable from the hub UI.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct HubUnknownView {
+    /// The node-side attempt id (the reconciliation key).
+    pub attempt_id: String,
+    /// The hub delivery task the attempt addressed.
+    pub task_id: String,
+    /// The owning node's host id.
+    pub host_id: String,
+    /// The recipient peer.
+    pub recipient_id: String,
+    /// The conversation.
+    pub conversation_id: String,
+    /// The dispatcher-recorded reason (redacted at the display boundary).
+    pub stop_reason: String,
+    /// The queued operator decision, when one exists.
+    pub decision: Option<String>,
 }
 
 /// A delivery fan-out request: the committed message plus the

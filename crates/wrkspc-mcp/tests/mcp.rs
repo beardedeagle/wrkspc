@@ -41,7 +41,7 @@ async fn seeded() -> (Store, String, String, String, McpServer) {
         .create_conversation(&[&operator, &agent])
         .await
         .unwrap();
-    let server = McpServer::new(store.clone(), agent.clone());
+    let server = McpServer::new(store.clone(), agent.clone(), false);
     (store, operator, agent, conversation, server)
 }
 
@@ -199,7 +199,7 @@ async fn post_message_without_recipients_wakes_nobody() {
 async fn post_message_resolves_a_prose_mention_and_reports_it() {
     // Post as the operator: a peer that names itself wakes nobody, by design.
     let (store, operator, agent, conversation, _server) = seeded().await;
-    let client = connect(McpServer::new(store.clone(), operator.clone())).await;
+    let client = connect(McpServer::new(store.clone(), operator.clone(), false)).await;
 
     let result = call(
         &client,

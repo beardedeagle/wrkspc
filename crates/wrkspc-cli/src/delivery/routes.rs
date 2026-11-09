@@ -295,6 +295,27 @@ pub(crate) async fn delivery_ack(
         .into_response()
 }
 
+/// Handles `GET /reconciliation-decisions`: a node polls the
+/// operator decisions queued on its mirrored unknown attempts and
+/// applies them locally (the resulting terminal state then reports
+/// back through [`delivery_report`], consuming the mirror).
+pub(crate) async fn reconciliation_decisions(
+    State(state): State<DeliveryState>,
+    headers: HeaderMap,
+) -> Response {
+    let host = match stamped_host(&headers) {
+        Ok(host) => host,
+        Err((code, message)) => return (code, message).into_response(),
+    };
+    match state.store.hub_pending_reconciliations(&host).await {
+        Ok(decisions) => axum::Json(decisions).into_response(),
+        Err(error) => {
+            tracing::error!(%error, %host, "reconciliation decisions fetch failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "decision fetch failed").into_response()
+        }
+    }
+}
+
 /// Handles `POST /delivery-report` (the H-10 outcome leg): the node
 /// reports the terminal result of an attempt for a delivery it
 /// mirrored, so the hub's task learns the execution outcome.
@@ -337,10 +358,13 @@ pub(crate) async fn delivery_report(
         )
             .into_response();
     }
-    if !matches!(body.state.as_str(), "completed" | "failed" | "canceled") {
+    if !matches!(
+        body.state.as_str(),
+        "completed" | "failed" | "canceled" | "unknown"
+    ) {
         return (
             StatusCode::BAD_REQUEST,
-            "state must be completed|failed|canceled",
+            "state must be completed|failed|canceled|unknown",
         )
             .into_response();
     }
@@ -356,6 +380,35 @@ pub(crate) async fn delivery_report(
     ) else {
         return (StatusCode::CONFLICT, "delivery payload is incomplete").into_response();
     };
+
+    if body.state == "unknown" {
+        // An outcome the node could not determine: mirror it on the
+        // hub WITHOUT a task transition (the task stays pending) so
+        // the operator sees and reconciles it from the hub UI; the
+        // decision routes back through the node's poll loop.
+        match state
+            .store
+            .record_hub_unknown(
+                &body.attempt_id,
+                &body.task_id,
+                &host,
+                &recipient_peer,
+                &conversation_id,
+                &body.stop_reason,
+            )
+            .await
+        {
+            Ok(()) => return StatusCode::NO_CONTENT.into_response(),
+            Err(error) => {
+                tracing::error!(%error, attempt_id = %body.attempt_id, "unknown mirror failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "unknown attempt mirror failed",
+                )
+                    .into_response();
+            }
+        }
+    }
 
     // Keep the stored blob consistent with the row and preserve the
     // record (H-13): the envelope, metadata, and history survive; only
@@ -398,6 +451,9 @@ pub(crate) async fn delivery_report(
             return (StatusCode::INTERNAL_SERVER_ERROR, "delivery report failed").into_response();
         }
     }
+    // A final terminal state completes the reconciliation loop: the
+    // hub's mirrored unknown row (if any) is consumed.
+    let _ = state.store.consume_hub_unknown(&body.attempt_id).await;
     // Guidance consumption ack (hub→node propagation loop): the node
     // reports which authoritative rows rode a successful prompt; the
     // hub marks them delivered. Idempotent — unknown ids (node-local

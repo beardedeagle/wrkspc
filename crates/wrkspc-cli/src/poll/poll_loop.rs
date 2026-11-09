@@ -246,11 +246,71 @@ pub async fn run_poll_loop(
                     continue;
                 }
             }
-            if let Err(error) = store
-                .mark_outcome_reported(&report.attempt_id, &report.task_id)
-                .await
+            // Unknown outcomes stay pending in the ledger: the hub
+            // mirrors them WITHOUT a task transition, and once the
+            // operator's decision is applied locally the terminal
+            // state must still report through this leg.
+            if report.state != "unknown"
+                && let Err(error) = store
+                    .mark_outcome_reported(&report.attempt_id, &report.task_id)
+                    .await
             {
                 tracing::warn!(%error, attempt_id = %report.attempt_id, "outcome ledger write failed");
+            }
+        }
+
+        // Hub -> node reconciliation leg: operator decisions queued on
+        // the hub's mirrored unknown attempts apply to THIS store's
+        // attempt rows; the resulting terminal state then reports back
+        // through the outcome leg, which consumes the mirror.
+        if let Ok(response) = client
+            .get(format!("{hub_url}/reconciliation-decisions"))
+            .send()
+            .await
+            && response.status().is_success()
+        {
+            let decisions: Vec<wrkspc_core::HubUnknownView> = match response.json().await {
+                Ok(decisions) => decisions,
+                Err(error) => {
+                    tracing::warn!(%error, "reconciliation decisions unparseable");
+                    Vec::new()
+                }
+            };
+            for decision in decisions {
+                let Some(encoded) = decision.decision.as_deref() else {
+                    continue;
+                };
+                let reconciliation = match encoded {
+                    "retry" => Some(wrkspc_core::Reconciliation::Retry),
+                    "close:failed" => Some(wrkspc_core::Reconciliation::Close {
+                        state: wrkspc_core::AttemptState::Failed,
+                    }),
+                    "close:completed" => Some(wrkspc_core::Reconciliation::Close {
+                        state: wrkspc_core::AttemptState::Completed,
+                    }),
+                    "close:canceled" => Some(wrkspc_core::Reconciliation::Close {
+                        state: wrkspc_core::AttemptState::Canceled,
+                    }),
+                    _ => None,
+                };
+                let Some(reconciliation) = reconciliation else {
+                    tracing::warn!(%encoded, attempt_id = %decision.attempt_id, "unknown reconciliation decision");
+                    continue;
+                };
+                match store
+                    .reconcile_unknown(&decision.attempt_id, reconciliation)
+                    .await
+                {
+                    Ok(()) => tracing::info!(
+                        attempt_id = %decision.attempt_id,
+                        "hub reconciliation decision applied"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        attempt_id = %decision.attempt_id,
+                        "hub reconciliation decision failed; retrying next poll"
+                    ),
+                }
             }
         }
     }
