@@ -120,4 +120,4 @@ so what passes locally is what the gates run.
 
 ## License
 
-MIT
+Apache-2.0 — see [LICENSE](LICENSE).
