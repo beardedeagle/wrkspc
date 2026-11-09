@@ -25,6 +25,10 @@
 FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa
 COPY --chown=65532:65532 wrkspc /usr/local/bin/wrkspc
 COPY --chown=65532:65532 data/.keep /data/.keep
+# License notice retention (the project license requires the notice to
+# accompany every distribution format); LICENSE comes from the repo
+# root in the build context.
+COPY --chown=65532:65532 LICENSE /NOTICES/LICENSE
 USER 65532:65532
 WORKDIR /data
 EXPOSE 8443 8082 8083

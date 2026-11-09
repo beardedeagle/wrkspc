@@ -13,11 +13,11 @@ rooms the hub owns.
 | `POST /api/conversations` | Create a conversation; members must exist or the call is refused (422 on unknown members; hub role only) |
 | `GET /api/conversations` | List conversations |
 | `POST /api/conversations/{id}/messages` | Post a message to a conversation |
-| `GET /api/conversations/{id}/messages` | The authored transcript (messages, reports, streamed turn output) |
+| `GET /api/conversations/{id}/messages` | The conversation's message rows (redacted); `?window=N` bounds the response to the latest N; streamed turn output and reports ride the events feed |
 | `GET /api/conversations/{id}/events` | The committed event feed, cursor-resumable |
 | `GET /api/peers` | Enrolled peers and their presence |
 | `PATCH /api/peers/{id}` | Boot (or restore) a peer; `status: "banned"` also revokes its certificate serial |
-| `DELETE /api/peers/{id}` | Forget an already-ejected peer (history and revocations survive) |
+| `DELETE /api/peers/{id}` | Forget a peer — any peer (history and revocations survive; removing an enrolled peer from the roster does not revoke its certificate) |
 | `POST /api/conversations/{id}/fences` | Apply a fence (pause, hold, block) |
 | `DELETE /api/fences/{fence_id}` | Clear a fence |
 | `POST /api/messages/{message_id}/deliveries/{peer_id}/hold` | Hold a delivery |

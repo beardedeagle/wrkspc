@@ -10,11 +10,12 @@ harness control, so the image is minimal and non-root.
 docker build -t wrkspc-hub:local .
 ```
 
-The build compiles the workspace inside a `rust:1.99-slim-bookworm`
-stage (matching `rust-toolchain.toml`) and copies the single static
-binary into a distroless runtime (`cc-debian12`, digest-pinned): glibc
-and the CA bundle only — no shell, no package manager, no utilities,
-running as the distroless `nonroot` user (uid 65532).
+The build compiles the workspace inside a `rust:1.99.1-slim-bookworm`
+stage (matching `rust-toolchain.toml`, `--locked`, path-remapped) and
+copies the single binary into a distroless runtime (`cc-debian12`,
+digest-pinned): the binary links glibc from the runtime image — no
+shell, no package manager, no utilities — running as the distroless
+`nonroot` user (uid 65532).
 
 ## Published image (GHCR)
 
@@ -50,19 +51,25 @@ hosting record:
 | `/ca` (read-only) | `ca.pem` — the CA root(s) client certificates must chain to |
 | `/ops` (read-only, optional) | `revoke.txt` — operator-managed serial deny-list |
 
-Minimal run (plain pilot mode, no TLS):
+Minimal run (plain pilot mode, no TLS — the published port is plain
+HTTP, for loopback-scale testing only):
 
 ```bash
-docker run --rm -p 8443:8443 \
+docker run --rm \
+  -p 127.0.0.1:8082:8082 \
+  -p 127.0.0.1:8083:8083 \
   -v wrkspc-hub-data:/data \
   wrkspc-hub:local \
   hub run --db /data/wrkspc-hub.db --a2a 0.0.0.0:8082 --ui 0.0.0.0:8083
 ```
 
-Full mTLS run:
+Full mTLS run (the process serves A2A on container port 8082; the
+host port is the externally advertised 8443):
 
 ```bash
-docker run --rm -p 8443:8443 \
+docker run --rm \
+  -p 8443:8082 \
+  -p 127.0.0.1:8083:8083 \
   -v wrkspc-hub-data:/data \
   -v ./tls:/tls:ro -v ./ca:/ca:ro -v ./ops:/ops:ro \
   wrkspc-hub:local \
@@ -72,6 +79,9 @@ docker run --rm -p 8443:8443 \
     --revoke-list /ops/revoke.txt \
     --card-url https://your-hub-fqdn:8443
 ```
+
+The health probe below talks to container port 8083; both examples
+publish it on loopback so the probe works from the host.
 
 The hub terminates TLS itself (hub-native rustls); the client
 certificate must reach the accept loop end-to-end, so do not place a
@@ -148,10 +158,11 @@ L4/TLS passthrough (e.g. AWS NLB with TCP listeners).
 ## Cross-building release binaries
 
 Release binaries for the hub image can be built from macOS with
-cargo-zigbuild:
+`just build-matrix release linux` — the recipe pins the toolchain and
+`--locked` itself. The raw equivalent:
 
 ```bash
-RUSTUP_TOOLCHAIN=1.99.0 cargo zigbuild -p wrkspc-cli --bin wrkspc \
+RUSTUP_TOOLCHAIN=1.99.1 cargo zigbuild --locked -p wrkspc-cli --bin wrkspc \
   --target x86_64-unknown-linux-gnu --release
 ```
 

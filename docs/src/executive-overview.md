@@ -15,13 +15,19 @@ assumed.
 
 ## What it guarantees
 
-- **Moderation before delivery.** A message doesn't reach a peer until
-  the fences and holds allow it. Booted and banned peers are refused at
-  acceptance and at presence; a ban additionally revokes the peer's
-  certificate serial at the TLS layer. One operator action reverses it.
-- **Exactly-once execution.** Every delivery is claimed before it
-  mirrors. A second node presenting the same cert loses the claim; the
-  acks are fenced by it. Restart replays nothing.
+- **Moderation before delivery.** Fences and holds gate at claim time,
+  before anything mirrors, on every node identically — the gate is the
+  hub's own record. An operator cancel propagates too: a canceled
+  intent is never fanned out and a startup repair never re-creates
+  one. Booted and banned peers are refused at acceptance and at
+  presence; a ban additionally revokes the peer's certificate serial
+  at the TLS layer. One operator action reverses it.
+- **Exclusive delivery.** Every delivery is claimed before it mirrors.
+  A second node presenting the same cert loses the claim. Restart
+  replays nothing. The claim fences exactly-once *handoff* — the ack
+  is a durable receipt, never a claim that the turn finished. The
+  turn's actual outcome comes back separately and is recorded against
+  the attempt.
 - **Nothing stalls silently.** A turn whose outcome the node can't
   determine becomes a visible unknown attempt, and the operator
   reconciles it. The feed is cursor-resumable, so the UI can't lose an
@@ -43,15 +49,24 @@ assumed.
 ```text
 1. operator posts (or a peer sends over A2A)
         ↓
-2. hub commits: message, recipients, intents — one transaction
+2. hub commits: message, recipients, routing — one transaction, plus
+   a durable fan-out obligation for each recipient host
         ↓
-3. delivery task queued for each recipient host
+3. delivery task queued per recipient (a partial fan-out is repaired
+   at startup — replay never silently skips it)
         ↓
-4. node polls its queue, claims, mirrors, records
+4. node polls its queue, claims (fence-gated), mirrors, records
         ↓
-5. node spawns the harness adapter, the turn runs, chunks stream back
+5. node acks right after mirroring — the ack is a durable handoff
+   RECEIPT, and the hub marks the delivery delivered
         ↓
-6. node acks; the hub marks the delivery delivered
+6. independently, the node spawns the harness adapter, the turn runs,
+   chunks stream back
+        ↓
+7. the node reports the attempt's terminal outcome separately
+   (/delivery-report); an undeterminable outcome becomes a visible
+   unknown attempt for the operator to reconcile. `delivered` never
+   means the turn finished.
 ```
 
 ## The three protocols, one job each

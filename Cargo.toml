@@ -38,7 +38,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # UUIDs
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -76,8 +76,9 @@ wildcard_dependencies = "deny"
 
 # Shipping artifacts must not leak builder paths (no /Users/... or
 # /home/... in panic locations, error chains, or debug sections).
-# The remapping itself lives in .cargo/config.toml (cargo's
-# `trim-paths` profile option is still unstable on the pinned
+# The remapping lives in the Justfile's exported RUSTFLAGS (and the
+# Dockerfile's ENV for container builds) — cargo's `trim-paths`
+# profile option is still unstable on the pinned
 # toolchain); strip drops the debug sections entirely. Enforced by
 # the `no-user-paths` gate recipe.
 [profile.release]

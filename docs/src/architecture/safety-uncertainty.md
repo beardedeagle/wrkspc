@@ -29,12 +29,22 @@ optional (the A2A routes stay stamp-gated), the node's operator UI and
 HTTP MCP listener are loopback-scoped bearer-token HTTP, and
 ACP/injected MCP stay on stdio between the node and the adapters it
 spawned. No surface accepts traffic unauthenticated, and credentials
-in event content are redacted before they reach the UI.
+in event content are redacted before they reach the UI. Key material
+never outlives a crash either: every role lowers `RLIMIT_CORE` to zero
+(and marks the process non-dumpable on Linux) before it parses a TLS
+private key, so a panic cannot write a core image containing one.
 
 ## The safe-Rust boundary
 
-The workspace contains no `unsafe` blocks in application code —
-miri runs clean over the highest-risk modules (credential redaction,
-session stop semantics, task-state mapping), and the release binary
-is checked to carry no builder paths. Dependencies are locked,
-denied by policy, audited, and scanned with a pinned OSV tool.
+`unsafe_code` is `forbid` workspace-wide, and every crate opts into
+the workspace lint table. The single reviewed exception is
+wrkspc-cli's platform FFI — the macOS Keychain integration
+(`secrets.rs`), one `geteuid` call (`util.rs`), and the core-dump guard
+(`harden.rs`) — which is unsafe
+by nature, lives in clearly marked, cfg-gated functions, and is the
+only crate whose lint table deviates. The highest-risk modules
+(credential redaction, session stop semantics, task-state mapping)
+have local Miri coverage — it is a manual check, not an automated
+gate — and the release binary is checked to carry no builder paths.
+Dependencies are locked, denied by policy, audited, and scanned with
+a pinned OSV tool.

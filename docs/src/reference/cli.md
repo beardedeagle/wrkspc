@@ -26,10 +26,15 @@ $ wrkspc node run \
     --db PATH            # SQLite: node cursors and execution state
     --bindings PATH      # harness bindings (bindings.toml)
     --hub URL            # the hub to enroll with and poll
+    --host-id ID         # REQUIRED with --hub: this node certificate's DNS SAN
     --tls-cert PATH      # node certificate chain
     --tls-key PATH       # node private key
     --tls-ca PATH        # CA used to verify the hub
 ```
+
+`--host-id` must equal the DNS SAN of the node's certificate (the hub
+resolves peers by that SAN); it is not inferred from the certificate
+itself.
 
 The node dials the hub. The hub never dials the node, so a node
 needs no inbound coordination port.

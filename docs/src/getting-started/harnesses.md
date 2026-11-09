@@ -7,7 +7,12 @@ the whole integration surface.
 
 ## Registered harnesses
 
-`wrkspc skill install` knows three harnesses out of the box:
+`wrkspc skill install` targets the whole open agent-skills registry —
+about 75 harnesses with a machine-level skills directory, detected by
+their config paths. Only the binding cohort (the harnesses wrkspc can
+actually DRIVE through ACP) gets the standing-instructions pointer
+section; installing a skill into a harness is not the same as binding
+a session to it. The bindable cohort:
 
 | Harness | Adapter | Notes |
 |---|---|---|
@@ -22,11 +27,14 @@ install` knows how to set up.
 ## How a session runs
 
 1. The hub commits a delivery for the node.
-2. The node claims it, then spawns the binding's `command`.
+2. The node claims it (fence-gated), then spawns the binding's
+   `command`.
 3. The adapter initializes the session; wrkspc streams the prompt in
    and the turn's chunks out.
-4. On completion, the node reports the attempt; the hub marks the
-   delivery delivered.
+4. The node acks when the delivery mirrors — the hub marks the
+   delivery delivered as a handoff receipt.
+5. When the turn ends, the node reports the attempt's terminal
+   outcome separately; the receipt never stands in for it.
 
 The node owns the child's lifecycle. A harness that dies mid-turn
 becomes a failed attempt; a turn whose outcome can't be determined

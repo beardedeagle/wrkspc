@@ -22,7 +22,11 @@ command = "npx -y @agentclientprotocol/codex-acp@2.1.1"
 peer_id = "agy"
 harness = "antigravity"
 cwd = "/path/to/workspace"
-command = "npx -y antigravity-acp@latest"
+command = "npx -y antigravity-acp@1.2.0"
+# agy registers tools through its native HTTP MCP config instead of
+# ACP mcpServers injection — the separate mcp_http flag the same
+# section documents. Pin the adapter version; `@latest` drifts.
+mcp_http = true
 ```
 
 - `peer_id` is the identity the store and the dispatcher use; `harness`

@@ -7,8 +7,10 @@ not a deployment convenience.
 
 The hub owns every shared record: conversations, messages,
 deliveries, attempts, moderation events, membership, and the feed.
-Each commit is a single transaction, so a message and its deliveries
-land together or not at all.
+Acceptance commits the message, its routing, and a durable fan-out
+obligation in one transaction; fan-out itself follows, and a startup
+repair completes any fan-out a crash left partial — so a message and
+its deliveries cannot silently diverge.
 
 The hub never dials anything. It listens:
 
@@ -26,9 +28,10 @@ that path only exists on the node side of the boundary.
 The node is the per-machine process. It:
 
 - polls the hub for its delivery queue,
-- claims and mirrors deliveries,
+- claims (fence-gated) and mirrors deliveries,
 - spawns and drives the harness ACP adapters,
-- reports presence and attempts,
+- reports presence, receipts (acks), and terminal attempt outcomes
+  over the `/delivery-report` leg,
 - serves the operator UI on loopback.
 
 The node's database holds its own execution state and queue cursors.
@@ -40,7 +43,9 @@ vanished — is reported, never guessed.
 The division of labor keeps execution authority with the machine that
 executes. The hub commits what should happen; the node proves what
 did. Moderation is enforced at the boundary that owns the record it
-protects: the hub fences shared delivery, the node owns its local
-gates. A hub-initiated stop halts new deliveries and holds the queue
-while the node confirms — it never reaches across and executes
-anything remotely.
+protects: the hub fences shared delivery at claim time, the node owns
+its local gates. A hub-initiated cancel removes the intent at the
+source and propagates — a canceled intent is never fanned out and
+never re-created by repair, and an already-claimed delivery is
+canceled at the node — the hub still never reaches across and
+executes anything remotely.

@@ -88,23 +88,48 @@ osv: _osv-scanner
     sh .github/scripts/audit.sh "{{ osv_scanner_dir }}/osv-scanner"
 
 # Exercise the OSV gate's scanner failures and exception policy without
-# network access.
-test-osv:
+# network access. The suite's assertions run under jq, so the tool is
+# provisioned explicitly (T14) instead of depending on an ambient copy.
+test-osv: _jq
     sh .github/scripts/audit-test.sh
+
+# A pinned jq for the OSV policy suite. Installed into .tools like the
+# other house tools so the gate never trusts a preinstalled version.
+_jq:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v jq >/dev/null 2>&1; then
+        exit 0
+    fi
+    mkdir -p .tools
+    os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    case "$os" in
+        darwin) archive="jq-1.7.1/jq-osx-arm64" ;;
+        linux) archive="jq-1.7.1/jq-linux64" ;;
+        *)
+            echo "test-osv: no pinned jq for $os — install jq and retry" >&2
+            exit 1
+            ;;
+    esac
+    curl -fsSL "https://github.com/jqlang/jq/releases/download/${archive}" -o .tools/jq
+    chmod +x .tools/jq
 
 # Container image (hub role, from source)
 docker-build:
     docker build -t wrkspc-hub:local .
 
 # Full quality gate (house battery): formatting, compile check, three
-# clippy profiles, tests, dependency policy, and the no-user-paths
+# clippy profiles, tests, dependency policy, the OSV policy regression
+# suite (fail-closed scanner/exception paths), and the no-user-paths
 # binary audit.
-quality: fmt-check check clippy clippy-release clippy-linux test no-user-paths deny-check audit osv
+quality: fmt-check check clippy clippy-release clippy-linux test no-user-paths deny-check audit test-osv osv
 
 # CI battery (house naming): the gate GitHub's ci.yml runs on every
 # push and PR. Kept deliberately lighter than `quality`; the full
-# battery gates releases and the security workflow.
-ci-rust: fmt-check clippy clippy-release clippy-linux build test
+# battery gates releases and the security workflow. test-osv rides
+# here too (T14): scanner-failure and exception-expiry policy must
+# fail closed on every PR, not only during releases.
+ci-rust: fmt-check clippy clippy-release clippy-linux build test test-osv
 
 # Markdown lint (house recipe): every .md in the repo, pinned CLI.
 lint-md:
@@ -119,10 +144,12 @@ lint-md:
 docs:
     #!/usr/bin/env bash
     set -euo pipefail
+    # The copied pages are cleaned up on EVERY exit — a failed build
+    # must not leave untracked copies behind.
+    trap 'rm -f docs/src/changelog.md docs/src/hub-container-deployment.md' EXIT
     cp CHANGELOG.md docs/src/changelog.md
     cp deploy/README.md docs/src/hub-container-deployment.md
     mdbook build docs
-    rm -f docs/src/changelog.md docs/src/hub-container-deployment.md
     echo "Documentation built: docs/book/"
 
 # Serve the book locally with hot reload.
@@ -141,14 +168,47 @@ docs-serve:
 no-user-paths:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo +{{toolchain}} build --locked --release -p wrkspc-cli --bin wrkspc
-    hits=$(strings target/release/wrkspc | grep -cE '/(Users|home)/' || true)
-    if [ "$hits" -ne 0 ]; then
-        echo "no-user-paths FAILED: $hits builder-path strings in target/release/wrkspc"
-        strings target/release/wrkspc | grep -E '/(Users|home)/' | sort -u | head -5
+    # The binary's real artifact path: a user-supplied CARGO_TARGET_DIR
+    # must not leave this recipe scanning a stale default location.
+    # The recipe itself builds the release profile, so that is what it
+    # audits.
+    profile_dir="release"
+    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+        binary="$CARGO_TARGET_DIR/$profile_dir/wrkspc"
+    else
+        binary="target/$profile_dir/wrkspc"
+    fi
+    if [ ! -f "$binary" ]; then
+        echo "no-user-paths FAILED: artifact not found at $binary (is the profile set correctly?)"
         exit 1
     fi
-    echo "no-user-paths: clean"
+    # Extraction is a separately checked command (T10): a failing
+    # `strings` must FAIL the gate, never certify an unscanned binary.
+    if ! extracted=$(mktemp); then
+        echo "no-user-paths FAILED: cannot create the extraction temp file"
+        exit 1
+    fi
+    trap 'rm -f "$extracted"' EXIT
+    if ! strings "$binary" > "$extracted"; then
+        echo "no-user-paths FAILED: strings could not extract from $binary"
+        exit 1
+    fi
+    # grep's documented no-match status (1) is the only acceptable
+    # "clean" outcome; any other failure must surface.
+    set +e
+    grep -nE '/(Users|home)/' "$extracted" > "$extracted.hits"
+    grep_status=$?
+    set -e
+    if [ "$grep_status" -eq 1 ]; then
+        echo "no-user-paths: clean"
+    elif [ "$grep_status" -eq 0 ]; then
+        echo "no-user-paths FAILED: builder-path strings in $binary"
+        head -5 "$extracted.hits"
+        exit 1
+    else
+        echo "no-user-paths FAILED: path scan errored (status $grep_status)"
+        exit 1
+    fi
 
 # =============================================================================
 # Build Matrix — cross-platform builds with varying optimization levels
@@ -232,8 +292,11 @@ build-matrix level target="native":
             # target-cpu override (toolchain baseline).
             if [[ "$TARGET" == "native" ]]; then
                 case "$(uname -m)" in
-                    arm64|aarch64) export RUSTFLAGS="-C target-cpu=native" ;;
-                    *)             export RUSTFLAGS="-C target-cpu=x86-64-v3" ;;
+                    # APPEND, never replace: the justfile-level
+                    # RUSTFLAGS carry the path-remapping policy, and a
+                    # plain export would silently drop it (T09).
+                    arm64|aarch64) export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native" ;;
+                    *)             export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=x86-64-v3" ;;
                 esac
             fi
             echo "Building: max (LTO=fat, strip, target-cpu optimized)"
@@ -310,15 +373,32 @@ deploy-node $host="":
         elif [[ -n "$old" ]]; then
             pkill -f '[w]rkspc node run' || true
         fi
+        # Readiness is a NODE-specific handshake (T13): the old pid must
+        # be gone AND a NEW process must OWN the UI listener — an
+        # unrelated process (a hub, another node) serving the port must
+        # never certify this deploy. lsof names the listener owner; the
+        # node's default UI port is 8081 and this pilot's nodes bind
+        # 8083, so both are checked.
+        serving_pid() {
+            lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -1
+        }
         for _ in $(seq 75); do
             alive=0
             for pid in $old; do
                 if kill -0 "$pid" 2>/dev/null; then alive=1; fi
             done
-            if (( ! alive )) && curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:8083/ 2>/dev/null; then
-                echo "deploy-node: $where is serving the new binary"
-                return 0
-            fi
+            (( ! alive )) || { sleep 2; continue; }
+            for port in 8081 8083; do
+                sp=$(serving_pid "$port")
+                if [[ -n "$sp" ]] && kill -0 "$sp" 2>/dev/null; then
+                    if [[ " $old " == *" $sp "* ]]; then
+                        echo "deploy-node: port $port is still held by the OLD process $sp; waiting" >&2
+                    else
+                        echo "deploy-node: $where is serving the new binary (pid $sp owns the UI listener on $port)"
+                        return 0
+                    fi
+                fi
+            done
             sleep 2
         done
         echo "deploy-node: $where is not serving after 150 s; a Keychain prompt may be waiting there (click Allow; rerun this deploy if the node stopped). Roll back: mv -f $bin.prev $bin" >&2
@@ -361,7 +441,13 @@ release-tarball target="native":
             exit 1
             ;;
     esac
-    tar -C "$(dirname "$bin")" -czf "dist/wrkspc-${name}.tar.gz" wrkspc
+    # LICENSE rides in every artifact (the project's own license
+    # requires notice retention).
+    stage="$(mktemp -d)"
+    trap 'rm -rf "$stage"' EXIT
+    cp "$bin" "$stage/wrkspc"
+    cp LICENSE "$stage/LICENSE"
+    tar -C "$stage" -czf "dist/wrkspc-${name}.tar.gz" wrkspc LICENSE
     (cd dist && shasum -a 256 "wrkspc-${name}.tar.gz" >> "SHA256SUMS-${name}")
     echo "dist/wrkspc-${name}.tar.gz"
 
@@ -391,16 +477,48 @@ release-sign:
 
 # Create (or attach to) the GitHub release for a version. The version
 # comes from a maintainer-pushed tag or a workflow_dispatch input, both
-# write-access-only; it is still shape-checked before touching the shell.
-release-publish version:
+# write-access-only. Both values arrive as POSITIONAL arguments and are
+# shape-checked before any use — nothing is interpolated into the
+# script text ahead of validation. The SHA is the exact commit the
+# packaged binaries were built from — the release is anchored to IT,
+# never to the default branch's head (T11): a dispatch that raced new
+# commits must not tag them.
+release-publish:
     #!/usr/bin/env bash
     set -euo pipefail
-    VERSION="{{version}}"
+    VERSION="${1:-}"
+    SHA="${2:-}"
     [[ "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
         echo "release-publish: invalid version '$VERSION' (want X.Y.Z, optional v prefix)" >&2
         exit 1
     }
-    gh release create "$VERSION" --title "wrkspc $VERSION" --generate-notes dist/*
+    [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || {
+        echo "release-publish: invalid sha '$SHA'" >&2
+        exit 1
+    }
+    # The release version must equal the workspace's declared version:
+    # a tag naming one version must never wrap another's binaries.
+    declared=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
+    [[ "$VERSION" == "v$declared" || "$VERSION" == "$declared" ]] || {
+        echo "release-publish: version '$VERSION' does not match the workspace's declared version '$declared'" >&2
+        exit 1
+    }
+    if gh release view "$VERSION" >/dev/null 2>&1; then
+        # Attach to the existing release — but only when its tag points
+        # at the very commit these binaries were built from.
+        existing=$(git rev-parse "refs/tags/$VERSION^{}" 2>/dev/null || echo "")
+        if [[ -z "$existing" ]]; then
+            echo "release-publish: tag $VERSION exists but does not resolve to a commit; refusing" >&2
+            exit 1
+        fi
+        if [[ "$existing" != "$SHA" ]]; then
+            echo "release-publish: tag $VERSION points at $existing, the build was $SHA; refusing to attach" >&2
+            exit 1
+        fi
+        gh release upload "$VERSION" dist/* --clobber
+    else
+        gh release create "$VERSION" --title "wrkspc $VERSION" --generate-notes --target "$SHA" dist/*
+    fi
 
 # Publish the wrkspc-hub image to GHCR (the release pipeline's
 # container leg). VERSION is a maintainer-pushed tag or a

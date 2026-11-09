@@ -36,7 +36,8 @@ is one row: the peer's status.
 ## Why the audit log matters
 
 Moderation only works if the operator trusts their own view of it.
-Every event records the actor (the operator token that performed it),
-the target, and the state before and after. The UI renders the
-audit; the feed carries it. There is no moderation path that doesn't
-leave that trail.
+Every event records the actor, the target, and the state before and
+after. The actor is the operator console — a single local identity,
+not per-human token attribution (the UI bearer token is one shared
+credential). The UI renders the audit; the feed carries it. There is
+no moderation path that doesn't leave that trail.

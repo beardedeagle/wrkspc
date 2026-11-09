@@ -3,7 +3,10 @@ name: release
 on:
   push:
     tags:
-      - "v*"
+      # Stable versions only: prerelease tags must not publish the
+      # `latest` container channel or move it ahead of tarball
+      # publication (the recipes reject prerelease versions).
+      - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
     inputs:
       version:
@@ -35,8 +38,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {name: macos-arm64, os: macos-14, target: native}
-          - {name: macos-x86_64, os: macos-13, target: native}
+          # macos-26 is the current arm64 hosted label (macos-13 retired
+          # 2025-12-04, macos-14 retired 2026-11-02). Intel macOS is not
+          # a supported platform.
+          - {name: macos-arm64, os: macos-26, target: native}
           - name: linux-x86_64
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
@@ -106,9 +111,12 @@ jobs:
         # The version is a maintainer-pushed tag or a workflow_dispatch
         # input (write-access-only), never an untrusted event payload;
         # release-publish still shape-checks it before touching the shell.
+        # github.sha anchors the release to the exact commit the packaged
+        # binaries were built from (T11).
         run: >-
           just release-publish
           ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
+          ${{ github.sha }}
 
   container:
     name: container image (ghcr)
