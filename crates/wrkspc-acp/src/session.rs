@@ -59,6 +59,10 @@ enum Command {
 pub struct SessionHandle {
     cmd_tx: mpsc::Sender<Command>,
     ev_rx: tokio::sync::broadcast::Receiver<SessionEvent>,
+    /// The transport task's terminal state: `None` while running,
+    /// `Some(reason)` once the connection has ended (E04/H-15 — the
+    /// registry evicts dead cached sessions on this signal).
+    closed: tokio::sync::watch::Receiver<Option<String>>,
 }
 
 impl Clone for SessionHandle {
@@ -66,6 +70,7 @@ impl Clone for SessionHandle {
         Self {
             cmd_tx: self.cmd_tx.clone(),
             ev_rx: self.ev_rx.resubscribe(),
+            closed: self.closed.clone(),
         }
     }
 }
@@ -92,11 +97,20 @@ impl SessionHandle {
                 Ok(())
             })
         });
-        tokio::spawn(transport.with_connection(ev_tx, task));
+        let (closed_tx, closed_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+        tokio::spawn(async move {
+            let outcome = transport.with_connection(ev_tx, task).await;
+            let reason = match outcome {
+                Ok(()) => "transport ended".to_string(),
+                Err(error) => format!("transport failed: {error}"),
+            };
+            let _ = closed_tx.send(Some(reason));
+        });
         (
             Self {
                 cmd_tx,
                 ev_rx: ev_rx.resubscribe(),
+                closed: closed_rx,
             },
             ev_rx,
         )
@@ -111,6 +125,17 @@ impl SessionHandle {
     /// subscription.
     pub fn events(&self) -> tokio::sync::broadcast::Receiver<SessionEvent> {
         self.ev_rx.resubscribe()
+    }
+
+    /// Subscribes to this session's terminal state: `None` while the
+    /// transport is alive, `Some(reason)` once it has ended. A session
+    /// whose transport died must be evicted, never re-promoted (E04/H-15).
+    ///
+    /// # Returns
+    ///
+    /// The terminal-state watch.
+    pub fn closed(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+        self.closed.clone()
     }
 
     /// Creates a new session with the given working directory.
@@ -271,7 +296,10 @@ async fn run_session_loop(connection: ConnectionTo<Agent>, mut cmd_rx: mpsc::Rec
 
     // Prompts are serialized (one in-flight turn per session) but cancel and
     // shutdown are serviced mid-turn: the prompt runs as a subtask while the
-    // loop keeps receiving commands.
+    // loop keeps receiving commands. The pending queue is BOUNDED (E11):
+    // beyond the admission bound, a prompt is rejected as definitely unsent
+    // instead of growing the queue without limit.
+    const MAX_PENDING: usize = 64;
     let mut pending: std::collections::VecDeque<(
         String,
         Vec<ContentBlock>,
@@ -289,9 +317,16 @@ async fn run_session_loop(connection: ConnectionTo<Agent>, mut cmd_rx: mpsc::Rec
             }, if done_rx.is_some() => {
                 done_rx = None;
                 in_flight = false;
-                if let Some((session_id, blocks, respond)) = pending.pop_front() {
+                // Skip queued prompts whose caller has abandoned them:
+                // a dropped receiver means the prompt was never sent,
+                // so it must not start later (E11).
+                while let Some((session_id, blocks, respond)) = pending.pop_front() {
+                    if respond.is_closed() {
+                        continue;
+                    }
                     start_prompt(&connection, &mut done_rx, session_id, blocks, respond);
                     in_flight = true;
+                    break;
                 }
             }
             command = cmd_rx.recv() => {
@@ -325,7 +360,13 @@ async fn run_session_loop(connection: ConnectionTo<Agent>, mut cmd_rx: mpsc::Rec
                         if !initialized {
                             let _ = respond.send(Err(AcpError::NotRunning));
                         } else if in_flight {
-                            pending.push_back((session_id, blocks, respond));
+                            if pending.len() >= MAX_PENDING {
+                                // Definitely unsent: reject loudly instead
+                                // of queueing without bound (E11).
+                                let _ = respond.send(Err(AcpError::QueueFull));
+                            } else {
+                                pending.push_back((session_id, blocks, respond));
+                            }
                         } else {
                             start_prompt(&connection, &mut done_rx, session_id, blocks, respond);
                             in_flight = true;

@@ -5,6 +5,7 @@
 //! [`transport::StdioTransport`] owns the adapter child process today; a
 //! future HTTP transport implements the same trait and
 //! [`session::SessionHandle`] does not change.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod error;
 pub mod session;

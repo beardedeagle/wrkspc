@@ -18,6 +18,12 @@ pub enum AcpError {
     /// The session task failed.
     #[error("session task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
+
+    /// The serialized prompt queue is full (a turn is in flight and
+    /// more prompts than the admission bound are already waiting).
+    /// The rejected prompt was definitely NOT sent.
+    #[error("session prompt queue is full")]
+    QueueFull,
 }
 
 /// Result alias for the ACP layer.

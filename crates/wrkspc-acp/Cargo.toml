@@ -13,4 +13,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 agent-client-protocol.workspace = true
-wrkspc-core = { path = "../wrkspc-core" }
+wrkspc-core = { version = "0.1.0", path = "../wrkspc-core" }
+
+[lints]
+workspace = true

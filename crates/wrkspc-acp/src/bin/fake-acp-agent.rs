@@ -1,3 +1,7 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Test fixture: a fake ACP agent for the integration suites; the
+// test-idiom lints do not apply to a tool that only ever runs
+// under test harnesses.
 //! Fake ACP agent used by wrkspc-acp integration tests.
 //!
 //! Speaks ACP over stdio (the phase 0 spike's agent mode, extended):
@@ -14,8 +18,8 @@
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, ClientNotification, ContentBlock, InitializeRequest, InitializeResponse,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionNotification,
-    SessionUpdate, StopReason, TextContent,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, SessionNotification, SessionUpdate, StopReason, TextContent,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
 use std::collections::HashMap;
@@ -88,6 +92,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let id = format!("fake-{}", state.next_id);
                     state.sessions.insert(id.clone(), ());
                     responder.respond(NewSessionResponse::new(id))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = state.clone();
+                async move |req: LoadSessionRequest,
+                            responder: Responder<LoadSessionResponse>,
+                            _cx: ConnectionTo<Client>| {
+                    // The advertised load_session capability is REAL:
+                    // a loaded session re-enters the known set (the
+                    // fake holds no per-session process state, so the
+                    // id is the whole state).
+                    state
+                        .lock()
+                        .unwrap()
+                        .sessions
+                        .insert(req.session_id.to_string(), ());
+                    responder.respond(LoadSessionResponse::new())
                 }
             },
             agent_client_protocol::on_receive_request!(),
