@@ -126,6 +126,53 @@ impl Store {
         .fetch_all(self.pool())
         .await?;
 
+        self.assemble_messages(conversation_id, messages).await
+    }
+
+    /// The latest `window` messages of a conversation, oldest first,
+    /// with their delivery rows — the transcript's initial bounded
+    /// load (UI-19). A client that would otherwise page an entire
+    /// room into memory at startup only ever sees this window, and
+    /// can request the full list on demand.
+    ///
+    /// # Arguments
+    ///
+    /// * `conversation_id` — the room.
+    /// * `window` — the maximum number of most recent messages.
+    pub async fn list_messages_window(
+        &self,
+        conversation_id: &str,
+        window: u32,
+    ) -> Result<Vec<MessageView>> {
+        if window == 0 {
+            return Ok(Vec::new());
+        }
+        let messages = sqlx::query(
+            "SELECT id, sender_id, content, created_at, execution_requested
+             FROM (SELECT id, sender_id, content, created_at, execution_requested
+                   FROM messages
+                   WHERE conversation_id = ?
+                   ORDER BY created_at DESC
+                   LIMIT ?)
+             ORDER BY created_at ASC",
+        )
+        .bind(conversation_id)
+        .bind(window)
+        .fetch_all(self.pool())
+        .await?;
+
+        self.assemble_messages(conversation_id, messages).await
+    }
+
+    /// Joins delivery rows onto fetched message rows. The delivery
+    /// query is conversation-wide, and delivery rows dropped here
+    /// belong to messages outside the window — never shown, never
+    /// serialized.
+    async fn assemble_messages(
+        &self,
+        conversation_id: &str,
+        messages: Vec<sqlx::sqlite::SqliteRow>,
+    ) -> Result<Vec<MessageView>> {
         let deliveries = sqlx::query(
             "SELECT r.message_id, r.peer_id, r.delivery_state
              FROM message_recipients r
@@ -135,19 +182,26 @@ impl Store {
         .bind(conversation_id)
         .fetch_all(self.pool())
         .await?;
+        // One pass into a per-message index, then O(1) lookups: the
+        // transcript assembly is O(M + R), not O(M × R) — with large
+        // rooms the quadratic filter made the view 15× slower (C12).
+        let mut deliveries_by_message: std::collections::HashMap<String, Vec<DeliveryView>> =
+            std::collections::HashMap::new();
+        for row in deliveries {
+            deliveries_by_message
+                .entry(row.get("message_id"))
+                .or_default()
+                .push(DeliveryView {
+                    peer_id: row.get("peer_id"),
+                    state: row.get("delivery_state"),
+                });
+        }
 
         Ok(messages
             .into_iter()
             .map(|m| {
                 let id: String = m.get("id");
-                let deliveries = deliveries
-                    .iter()
-                    .filter(|r| r.get::<String, _>("message_id") == id)
-                    .map(|r| DeliveryView {
-                        peer_id: r.get("peer_id"),
-                        state: r.get("delivery_state"),
-                    })
-                    .collect();
+                let deliveries = deliveries_by_message.remove(&id).unwrap_or_default();
                 MessageView {
                     id,
                     sender_id: m.get("sender_id"),

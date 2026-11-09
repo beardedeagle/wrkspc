@@ -33,6 +33,106 @@ impl Store {
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin().await?;
 
+        // Ejection gate at the committed acceptance boundary: a
+        // booted/banned peer cannot post through ANY entrypoint (A2A,
+        // MCP, mirror) until the operator restores it.
+        let sender_status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM peers WHERE id = ?")
+                .bind(sender_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(status) = sender_status.as_deref()
+            && status != "enrolled"
+        {
+            return Err(StoreError::PeerEjected {
+                peer_id: sender_id.to_string(),
+                status: status.to_string(),
+            });
+        }
+
+        // Idempotency BEFORE routing resolution: a replay must reuse the
+        // committed routing and never re-resolve @mentions (an alias
+        // move or roster change between retries must not change who a
+        // post wakes). The `id = ?` branch covers the co-hosted echo:
+        // for a message this node propagated upward, the origin id IS
+        // the original local message id.
+        if let Some(row) = sqlx::query(
+            "SELECT id, content, execution_requested FROM messages
+             WHERE conversation_id = ? AND sender_id = ?
+               AND (idempotency_key = ? OR id = ?)",
+        )
+        .bind(conversation_id)
+        .bind(sender_id)
+        .bind(idempotency_key)
+        .bind(idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let existing_id: String = row.get("id");
+            let existing_content: String = row.get("content");
+            let existing_execution: bool = row.get("execution_requested");
+            if existing_content != content {
+                return Err(StoreError::IdempotencyConflict {
+                    key: idempotency_key.to_string(),
+                });
+            }
+            // A replay means the message is already stored, not that this
+            // recipient's work is done. The delivery loop feeds one
+            // delivery per recipient under the same origin id, so every
+            // recipient after the first reaches this branch: enrol it
+            // and raise its intent here, or the peer silently never
+            // runs.
+            self.assert_member(&mut tx, conversation_id, sender_id)
+                .await?;
+            // Execution authority is committed at first acceptance: a
+            // mail-only message can never become executable via a retry.
+            let requests_execution = recipients.iter().any(|r| r.execution_requested);
+            if requests_execution && !existing_execution {
+                return Err(StoreError::ExecutionAuthorityConflict {
+                    message_id: existing_id,
+                });
+            }
+            for recipient in recipients {
+                self.assert_member(&mut tx, conversation_id, &recipient.peer_id)
+                    .await?;
+                sqlx::query(
+                    "INSERT OR IGNORE INTO message_recipients
+                       (message_id, peer_id, delivery_state)
+                     VALUES (?, ?, ?)",
+                )
+                .bind(&existing_id)
+                .bind(&recipient.peer_id)
+                .bind(DeliveryState::Stored.as_str())
+                .execute(&mut *tx)
+                .await?;
+                if recipient.execution_requested {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO execution_intents
+                           (id, message_id, recipient_id, state, created_at)
+                         VALUES (?, ?, ?, 'queued', ?)",
+                    )
+                    .bind(Uuid::new_v4().to_string())
+                    .bind(&existing_id)
+                    .bind(&recipient.peer_id)
+                    .bind(&now)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            // The stored flag reflects the committed intents, never a
+            // stale first-acceptance snapshot.
+            if requests_execution {
+                sqlx::query("UPDATE messages SET execution_requested = 1 WHERE id = ?")
+                    .bind(&existing_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            return Ok(AcceptOutcome::Replay {
+                message_id: existing_id,
+            });
+        }
+
         // Resolve who this post actually wakes before anything is written: the
         // caller may have named its recipients, or it may only have written
         // `@name` in prose. Both branches below use the same set, so a replay
@@ -48,63 +148,6 @@ impl Store {
             )
             .await?;
         let recipients = recipients.as_slice();
-
-        // Idempotency: same key + same content = replay, same key + different
-        // content = conflict.
-        if let Some(row) = sqlx::query(
-            "SELECT id, content FROM messages
-             WHERE conversation_id = ? AND sender_id = ? AND idempotency_key = ?",
-        )
-        .bind(conversation_id)
-        .bind(sender_id)
-        .bind(idempotency_key)
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            let existing_id: String = row.get("id");
-            let existing_content: String = row.get("content");
-            if existing_content == content {
-                // A replay means the message is already stored, not that this
-                // recipient's work is done. The delivery loop feeds one
-                // delivery per recipient under the same idempotency key, so
-                // every recipient after the first reaches this branch: enrol it
-                // and raise its intent here, or the peer silently never runs.
-                self.assert_member(&mut tx, conversation_id, sender_id)
-                    .await?;
-                for recipient in recipients {
-                    sqlx::query(
-                        "INSERT OR IGNORE INTO message_recipients
-                           (message_id, peer_id, delivery_state)
-                         VALUES (?, ?, ?)",
-                    )
-                    .bind(&existing_id)
-                    .bind(&recipient.peer_id)
-                    .bind(DeliveryState::Stored.as_str())
-                    .execute(&mut *tx)
-                    .await?;
-                    if recipient.execution_requested {
-                        sqlx::query(
-                            "INSERT OR IGNORE INTO execution_intents
-                               (id, message_id, recipient_id, state, created_at)
-                             VALUES (?, ?, ?, 'queued', ?)",
-                        )
-                        .bind(Uuid::new_v4().to_string())
-                        .bind(&existing_id)
-                        .bind(&recipient.peer_id)
-                        .bind(&now)
-                        .execute(&mut *tx)
-                        .await?;
-                    }
-                }
-                tx.commit().await?;
-                return Ok(AcceptOutcome::Replay {
-                    message_id: existing_id,
-                });
-            }
-            return Err(StoreError::IdempotencyConflict {
-                key: idempotency_key.to_string(),
-            });
-        }
 
         self.assert_member(&mut tx, conversation_id, sender_id)
             .await?;
@@ -227,6 +270,7 @@ impl Store {
         };
 
         let mut resolved: Vec<RecipientRequest> = Vec::with_capacity(candidates.len());
+        let explicit = !requested.is_empty();
         for candidate in candidates {
             // An explicit recipient must be a member; the check stays so a
             // typo fails loudly instead of silently reaching nobody.
@@ -238,6 +282,25 @@ impl Store {
                 continue;
             }
             if self.peer_class(tx, &candidate.peer_id).await?.as_deref() == Some(HUMAN_CLASS) {
+                continue;
+            }
+            // Ejected recipients: an explicit address is refused loudly;
+            // a mention never wakes a booted/banned peer (the UI's
+            // mention fallback must not re-introduce a banned target).
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM peers WHERE id = ?")
+                    .bind(&candidate.peer_id)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+            if let Some(status) = status
+                && status != "enrolled"
+            {
+                if explicit {
+                    return Err(StoreError::PeerEjected {
+                        peer_id: candidate.peer_id,
+                        status,
+                    });
+                }
                 continue;
             }
             resolved.push(candidate);

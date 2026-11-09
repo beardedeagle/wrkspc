@@ -66,15 +66,18 @@ impl Store {
         } else {
             // First presence enrols the peer onto the presenting host
             // (append-only assignment history, same shape as
-            // `ensure_peer_on_host`).
+            // `ensure_peer_on_host`). The host-level certificate serial
+            // rides onto the new peer, so a later ban has a certificate
+            // to revoke even though no peer existed at handshake time.
             sqlx::query(
-                "INSERT INTO peers (id, host_id, name, class, enrolled_at)
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO peers (id, host_id, name, class, cert_serial, enrolled_at)
+                 VALUES (?, ?, ?, ?, (SELECT cert_serial FROM hosts WHERE host_id = ?), ?)",
             )
             .bind(peer_id)
             .bind(host_id)
             .bind(name)
             .bind(class)
+            .bind(host_id)
             .bind(&now)
             .execute(&mut *tx)
             .await?;

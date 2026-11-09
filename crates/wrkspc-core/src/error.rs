@@ -72,6 +72,20 @@ pub enum StoreError {
     #[error("ambiguous peer reference: `{reference}` matches more than one peer")]
     AmbiguousPeerRef { reference: String },
 
+    /// The peer's operator-controlled status refuses participation:
+    /// a booted/banned peer can neither post nor be explicitly
+    /// addressed until the operator restores it.
+    #[error("peer `{peer_id}` is {status}; the operator controls its status")]
+    PeerEjected { peer_id: String, status: String },
+
+    /// A replay of an already-committed message attempted to grant
+    /// execution authority the original acceptance did not: execution
+    /// decisions are committed at first acceptance and are immutable.
+    #[error(
+        "message `{message_id}` was accepted without execution; a replay cannot make it executable"
+    )]
+    ExecutionAuthorityConflict { message_id: String },
+
     /// Schema migration failure.
     #[error("migration error: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),

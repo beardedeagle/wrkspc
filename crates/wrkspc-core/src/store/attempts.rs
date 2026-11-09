@@ -81,6 +81,29 @@ impl Store {
             }
         }
 
+        // Session-wide quarantine: an unresolved (unknown) attempt on
+        // ANY intent for this recipient blocks new work for the whole
+        // recipient — the prior turn's side effects are undeterminable
+        // and must not overlap with new execution. The barrier is
+        // durable (attempt rows survive restart) and released only by
+        // operator reconciliation.
+        if let Some(row) = sqlx::query(
+            "SELECT i2.id AS intent_id
+             FROM attempts a
+             JOIN execution_intents i2 ON i2.id = a.intent_id
+             WHERE i2.recipient_id = ? AND a.state = 'unknown'
+             LIMIT 1",
+        )
+        .bind(recipient_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            return Err(StoreError::BlockedByUnknown {
+                intent: row.get("intent_id"),
+                state: "unknown".to_string(),
+            });
+        }
+
         match intent_state.as_str() {
             "queued" => {}
             "claimed" => {
@@ -110,27 +133,19 @@ impl Store {
             }
         }
 
-        // Fence gate: an active pause/hold/block fence on (conversation,
-        // recipient) blocks claiming — moderation is enforced on the
-        // delivery path itself, not just at enumeration time.
-        if let Some(row) = sqlx::query(
-            "SELECT m.conversation_id AS conversation_id, GROUP_CONCAT(f.kind) AS kinds
-             FROM messages m
-             JOIN fences f ON f.conversation_id = m.conversation_id
-               AND f.peer_id = ? AND f.active = 1
-               AND f.kind IN ('pause', 'hold', 'block')
-             WHERE m.id = ?
-             GROUP BY m.conversation_id",
-        )
-        .bind(recipient_id)
-        .bind(message_id)
-        .fetch_optional(&mut *tx)
-        .await?
+        // Gate at the claim — the moderation linearization point: an
+        // active pause/hold/block fence, a held/blocked/expired
+        // recipient delivery state, or an ejected recipient peer each
+        // block the claim in this transaction. Enumeration is not the
+        // gate; the claim is, so a hold committed after `due_intents`
+        // still stops dispatch here.
+        if let Some((conversation_id, kinds)) =
+            crate::moderation::holds::delivery_gate_in_tx(&mut tx, message_id, recipient_id).await?
         {
             return Err(StoreError::BlockedByFence {
-                conversation_id: row.get("conversation_id"),
+                conversation_id,
                 peer_id: recipient_id.to_string(),
-                kinds: row.get("kinds"),
+                kinds,
             });
         }
 
@@ -341,6 +356,12 @@ impl Store {
                 requested: "unknown".to_string(),
             });
         }
+        // An attempt that went unknown never delivered its guidance:
+        // release any claim (C3) so the next usable turn re-rides it.
+        sqlx::query("UPDATE guidance SET claimed_attempt = NULL WHERE claimed_attempt = ?")
+            .bind(attempt_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("UPDATE attempts SET state = 'unknown', stop_reason = ? WHERE id = ?")
             .bind(reason)
             .bind(attempt_id)
@@ -442,6 +463,106 @@ impl Store {
             .bind(&intent_id)
             .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Closes an attempt that a moderation gate stopped BEFORE any
+    /// prompt: the attempt is recorded canceled (the harness never
+    /// ran), and its intent returns to the queue so the delivery stays
+    /// deliverable once the gate clears.
+    ///
+    /// Unlike [`Store::mark_terminal`](Store::mark_terminal) with
+    /// `Canceled`, the intent is NOT terminal — a gate is not an
+    /// operator cancellation, and the delivery must not be lost.
+    ///
+    /// # Arguments
+    ///
+    /// * `attempt_id` — the gated attempt.
+    /// * `reason` — the recorded gate description.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// attempt does not exist,
+    /// [`StoreError::TerminalState`](StoreError::TerminalState) when it
+    /// already left the pre-dispatch states, and
+    /// [`StoreError::Db`](StoreError::Db) on failure.
+    pub async fn gate_attempt(&self, attempt_id: &str, reason: &str) -> Result<()> {
+        Store::retry_on_busy(
+            || self.gate_attempt_inner(attempt_id, reason),
+            "gate_attempt",
+        )
+        .await
+    }
+
+    async fn gate_attempt_inner(&self, attempt_id: &str, reason: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT intent_id, state FROM attempts WHERE id = ?")
+            .bind(attempt_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "attempt",
+                id: attempt_id.to_string(),
+            })?;
+        let intent_id: String = row.get("intent_id");
+        let state: String = row.get("state");
+        // Only pre-dispatch attempts may be gated: once the prompt was
+        // sent, a later gate can never unsend it.
+        if state != "claimed" && state != "dispatched" {
+            return Err(StoreError::TerminalState {
+                attempt: attempt_id.to_string(),
+                state,
+                requested: "gated".to_string(),
+            });
+        }
+        sqlx::query(
+            "UPDATE attempts SET state = 'canceled', stop_reason = ?, terminal_at = ? WHERE id = ?",
+        )
+        .bind(reason)
+        .bind(&now)
+        .bind(attempt_id)
+        .execute(&mut *tx)
+        .await?;
+        let (message_id, recipient_id): (String, String) =
+            sqlx::query("SELECT message_id, recipient_id FROM execution_intents WHERE id = ?")
+                .bind(&intent_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map(|r| (r.get("message_id"), r.get("recipient_id")))?;
+        sqlx::query("UPDATE execution_intents SET state = 'queued' WHERE id = ?")
+            .bind(&intent_id)
+            .execute(&mut *tx)
+            .await?;
+        // The dispatch write may already have advanced the delivery;
+        // return it to the eligible queue for the next claim.
+        sqlx::query(
+            "UPDATE message_recipients SET delivery_state = 'eligible'
+             WHERE message_id = ? AND peer_id = ?
+               AND delivery_state IN ('stored', 'eligible', 'delivered')",
+        )
+        .bind(&message_id)
+        .bind(&recipient_id)
+        .execute(&mut *tx)
+        .await?;
+        let conversation_id: String =
+            sqlx::query_scalar("SELECT conversation_id FROM messages WHERE id = ?")
+                .bind(&message_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        self.append_event_in(
+            &mut tx,
+            &conversation_id,
+            "attempt.gated",
+            &serde_json::json!({
+                "attempt_id": attempt_id,
+                "intent_id": intent_id,
+                "reason": reason,
+            }),
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }

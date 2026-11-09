@@ -45,14 +45,19 @@ pub struct RecipientRequest {
 
 /// The transactional store.
 ///
-/// Owns the SQLite pool and the exclusive dispatcher lock. Dropping the
-/// store closes the pool; release the lock explicitly with
-/// [`Store::release_lock`](Store::release_lock) when handing the database to
-/// another process.
+/// Owns the SQLite pool and the exclusive dispatcher lock (an OS-level
+/// advisory lock on a sidecar file: only ONE exclusive opener may hold
+/// it per database, regardless of role labels, and a crashed process
+/// releases it automatically). Dropping the LAST clone closes the lock
+/// file and releases the lock; use
+/// [`Store::release_lock`](Store::release_lock) when handing the
+/// database to another process without dropping the store.
 #[derive(Clone, Debug)]
 pub struct Store {
     pool: SqlitePool,
     lock_owner: String,
+    /// The held OS lock on the sidecar file (exclusive openers only).
+    lock_file: std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>>,
 }
 
 /// Description of an active fence.
@@ -112,7 +117,14 @@ impl Store {
         loop {
             match op().await {
                 Err(StoreError::Db(sqlx::Error::Database(db)))
-                    if db.code().as_deref() == Some("5") && attempt < 10 =>
+                    if matches!(
+                        db.code().as_deref(),
+                        // SQLITE_BUSY (5) and SQLITE_BUSY_SNAPSHOT
+                        // (517): the snapshot variant is the WAL
+                        // reader's contention form and must retry the
+                        // same way (C11).
+                        Some("5") | Some("517")
+                    ) && attempt < 10 =>
                 {
                     attempt += 1;
                     let delay = std::time::Duration::from_millis(100 * attempt as u64);

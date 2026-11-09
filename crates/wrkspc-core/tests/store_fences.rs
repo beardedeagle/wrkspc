@@ -1,5 +1,6 @@
 //! The event feed cursor, the fence set/ack/clear lifecycle, and
 //! the seeded pilot host row.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 

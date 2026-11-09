@@ -32,7 +32,7 @@ impl Store {
         task_json: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        let result = sqlx::query(
+        let result = match sqlx::query(
             "INSERT INTO a2a_tasks
                (task_id, context_id, state, terminal, task_json, version, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
@@ -45,7 +45,21 @@ impl Store {
         .bind(&now)
         .bind(&now)
         .execute(self.pool())
-        .await?;
+        .await
+        {
+            Ok(result) => result,
+            // SQLite raises a constraint error on a duplicate primary
+            // key; rows_affected() never reports zero here. Match the
+            // violation so callers get the documented AlreadyExists
+            // instead of a generic Db error.
+            Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+                return Err(StoreError::AlreadyExists {
+                    entity: "a2a task",
+                    id: task_id.to_string(),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
         if result.rows_affected() == 0 {
             return Err(StoreError::AlreadyExists {
                 entity: "a2a task",
@@ -179,9 +193,12 @@ impl Store {
         page: Option<(&str, &str)>,
         limit: i64,
     ) -> Result<(Vec<TaskRow>, i64)> {
+        // Logical filters (context/state/status window) scope BOTH the
+        // count and the page; the keyset cursor scopes ONLY the page
+        // (P11 — counting under the cursor made `total_size` shrink to
+        // the remaining suffix on every page).
         let mut filters: Vec<&str> = Vec::new();
         let mut binds: Vec<String> = Vec::new();
-
         if let Some(value) = context_id {
             filters.push("context_id = ?");
             binds.push(value.to_string());
@@ -193,12 +210,6 @@ impl Store {
         if let Some(value) = status_after {
             filters.push("updated_at >= ?");
             binds.push(value.to_string());
-        }
-        if let Some((updated_at, task_id)) = page {
-            filters.push("(updated_at < ? OR (updated_at = ? AND task_id < ?))");
-            binds.push(updated_at.to_string());
-            binds.push(updated_at.to_string());
-            binds.push(task_id.to_string());
         }
 
         let where_clause = if filters.is_empty() {
@@ -214,8 +225,23 @@ impl Store {
         }
         let total: i64 = count_query.fetch_one(self.pool()).await?;
 
+        let mut page_where = where_clause.clone();
+        if let Some((updated_at, task_id)) = page {
+            if page_where.is_empty() {
+                page_where =
+                    "WHERE (updated_at < ? OR (updated_at = ? AND task_id < ?))".to_string();
+            } else {
+                page_where = format!(
+                    "{page_where} AND (updated_at < ? OR (updated_at = ? AND task_id < ?))"
+                );
+            }
+            binds.push(updated_at.to_string());
+            binds.push(updated_at.to_string());
+            binds.push(task_id.to_string());
+        }
+
         let rows_sql = format!(
-            "SELECT * FROM a2a_tasks {where_clause}
+            "SELECT * FROM a2a_tasks {page_where}
              ORDER BY updated_at DESC, task_id DESC LIMIT ?"
         );
         let mut rows_query = sqlx::query(&rows_sql);
@@ -233,19 +259,43 @@ impl Store {
     /// `submitted` literal, and `task_json` carries the delivery payload
     /// the node needs to record and dispatch locally.
     ///
+    /// The task id is DETERMINISTIC in (message, recipient) — see
+    /// [`delivery_task_id`](crate::tasks::delivery_task_id) — so
+    /// re-queueing is idempotent and a partially completed fan-out is
+    /// repairable without duplicates.
+    ///
     /// # Arguments
     ///
     /// * `request` — the delivery to queue.
     ///
     /// # Returns
     ///
-    /// The new task id.
+    /// The task id.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Db`](StoreError::Db) on failure.
     pub async fn task_create_delivery(&self, request: DeliveryTaskRequest<'_>) -> Result<String> {
-        let task_id = uuid::Uuid::new_v4().to_string();
+        let task_id = crate::tasks::delivery_task_id(request.message_id, request.recipient_peer);
+        let now = Utc::now().to_rfc3339();
+        // Pending operator guidance rides the envelope (H-guidance
+        // propagation): the hub's guidance table is authoritative, and
+        // the node ingests these rows before the delivery's turn is
+        // dispatched, so a hub-UI guidance instruction actually reaches
+        // the executing harness. Each node claims/consumes its own copy
+        // and acks the ids back over the outcome report leg.
+        let guidance: Vec<serde_json::Value> = self
+            .undelivered_guidance(request.conversation_id)
+            .await?
+            .into_iter()
+            .map(|g| {
+                serde_json::json!({
+                    "id": g.id,
+                    "author_id": g.author_id,
+                    "text": g.text,
+                })
+            })
+            .collect();
         // The stored blob is a canonical A2A Task serialization (the
         // surface serves `task_json` as the wire Task), with the
         // wrkspc delivery envelope riding in `metadata.delivery`.
@@ -257,6 +307,7 @@ impl Store {
                 "delivery": {
                     "kind": "delivery",
                     "message_id": request.message_id,
+                    "origin_message_id": request.origin_message_id,
                     "conversation_id": request.conversation_id,
                     "sender_peer": request.sender_peer,
                     "sender_name": request.sender_name,
@@ -267,16 +318,21 @@ impl Store {
                     "recipient_class": request.recipient_class,
                     "content": request.content,
                     "execution_requested": request.execution_requested,
+                    "guidance": guidance,
                 },
             },
         });
-        self.task_create(
-            &task_id,
-            request.recipient_host,
-            "submitted",
-            false,
-            &payload.to_string(),
+        sqlx::query(
+            "INSERT OR IGNORE INTO a2a_tasks
+               (task_id, context_id, state, terminal, task_json, version, created_at, updated_at)
+             VALUES (?, ?, 'submitted', 0, ?, 1, ?, ?)",
         )
+        .bind(&task_id)
+        .bind(request.recipient_host)
+        .bind(payload.to_string())
+        .bind(&now)
+        .bind(&now)
+        .execute(self.pool())
         .await?;
         Ok(task_id)
     }
@@ -313,7 +369,7 @@ impl Store {
     ) -> Result<DeliveryClaimOutcome> {
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool().begin().await?;
-        let row = sqlx::query("SELECT terminal FROM a2a_tasks WHERE task_id = ?")
+        let row = sqlx::query("SELECT terminal, task_json FROM a2a_tasks WHERE task_id = ?")
             .bind(task_id)
             .fetch_optional(&mut *tx)
             .await?
@@ -348,6 +404,34 @@ impl Store {
             return Ok(DeliveryClaimOutcome::ForeignClaimed {
                 instance_id: claimant,
                 claimed_at,
+            });
+        }
+        // The moderation boundary: the claim is the linearization point
+        // for hub gates. A fresh claim re-evaluates the recipient's
+        // fences, delivery state, and peer status in the SAME
+        // transaction — a fence or hold that became effective before the
+        // claim must keep the node from ever mirroring an executable
+        // intent ("before anything mirrors"). The delivery identity
+        // (message/conversation/recipient) rides the task payload.
+        let task_json: String = row.get("task_json");
+        let Some(keys) = parse_delivery_gate_keys(&task_json) else {
+            return Err(StoreError::BlockedByFence {
+                conversation_id: String::new(),
+                peer_id: String::new(),
+                kinds: "malformed delivery payload".to_string(),
+            });
+        };
+        if let Some((conversation_id, kinds)) = crate::moderation::holds::delivery_gate_in_tx(
+            &mut tx,
+            &keys.message_id,
+            &keys.recipient_peer,
+        )
+        .await?
+        {
+            return Err(StoreError::BlockedByFence {
+                conversation_id,
+                peer_id: keys.recipient_peer,
+                kinds,
             });
         }
         sqlx::query(
@@ -469,10 +553,101 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        let updated = self
-            .task_get(task_id)
-            .await?
-            .expect("row committed above must exist");
+        // The row was committed in the transaction above; a missing
+        // read-back is a store inconsistency the caller must handle,
+        // not a panic.
+        let updated =
+            self.task_get(task_id)
+                .await?
+                .ok_or_else(|| crate::error::StoreError::NotFound {
+                    entity: "task",
+                    id: task_id.to_string(),
+                })?;
         Ok(updated)
     }
+
+    /// Marks a delivery task canceled (hub-side operator cancel), or
+    /// no-ops when there is nothing to cancel.
+    ///
+    /// A task that was never created (the fan-out has not run yet) and
+    /// a task that is already terminal both yield `Ok(None)`: the
+    /// cancel is satisfied either way. A non-terminal task transitions
+    /// to the terminal canceled state with its record preserved (the
+    /// delivery envelope survives — H-13).
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` — the delivery task to cancel.
+    ///
+    /// # Returns
+    ///
+    /// `Some(row)` when the task was canceled now, `None` when it does
+    /// not exist or was already terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    pub async fn task_mark_canceled(&self, task_id: &str) -> Result<Option<TaskRow>> {
+        let Some(current) = self.task_get(task_id).await? else {
+            return Ok(None);
+        };
+        if current.terminal {
+            return Ok(None);
+        }
+        // Keep the stored blob consistent with the row: the wire Task
+        // must read terminal-canceled, with the delivery envelope and
+        // every other field preserved.
+        let mut blob: serde_json::Value = serde_json::from_str(&current.task_json)
+            .map_err(|error| StoreError::Db(sqlx::Error::Decode(Box::new(error))))?;
+        if let Some(status) = blob
+            .get_mut("status")
+            .and_then(|status| status.as_object_mut())
+        {
+            status.insert(
+                "state".to_string(),
+                serde_json::Value::String("TASK_STATE_CANCELED".to_string()),
+            );
+            status.insert(
+                "timestamp".to_string(),
+                serde_json::Value::String(Utc::now().to_rfc3339()),
+            );
+        }
+        let canceled_json = serde_json::to_string(&blob)
+            .map_err(|error| StoreError::Db(sqlx::Error::Encode(Box::new(error))))?;
+        let canceled = self
+            .task_begin_cancel(task_id, "canceled", &canceled_json)
+            .await?;
+        Ok(Some(canceled))
+    }
+}
+
+/// The delivery identity needed to evaluate a hub-side moderation gate:
+/// the committed message id and the recipient peer, parsed from the
+/// task payload's `metadata.delivery` envelope (written by
+/// [`Store::task_create_delivery`](Store::task_create_delivery)).
+struct DeliveryGateKeys {
+    message_id: String,
+    recipient_peer: String,
+}
+
+/// Parses the gate-relevant keys out of a delivery task's payload blob.
+///
+/// # Arguments
+///
+/// * `task_json` — the stored `a2a_tasks.task_json` blob.
+///
+/// # Returns
+///
+/// The message/recipient identity, or `None` when the blob is not a
+/// well-formed delivery payload.
+fn parse_delivery_gate_keys(task_json: &str) -> Option<DeliveryGateKeys> {
+    let payload: serde_json::Value = serde_json::from_str(task_json).ok()?;
+    let delivery = payload.get("metadata")?.get("delivery")?;
+    if delivery.get("kind")?.as_str()? != "delivery" {
+        return None;
+    }
+    Some(DeliveryGateKeys {
+        message_id: delivery.get("message_id")?.as_str()?.to_string(),
+        recipient_peer: delivery.get("recipient_peer")?.as_str()?.to_string(),
+    })
 }

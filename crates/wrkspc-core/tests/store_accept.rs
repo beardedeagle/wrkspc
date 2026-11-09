@@ -1,5 +1,6 @@
 //! Acceptance, claim, and terminal-state semantics: membership
 //! enforcement, idempotency, unknown-blocking, and immutability.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 
@@ -282,13 +283,16 @@ async fn terminal_state_is_immutable_but_idempotent() {
 #[tokio::test]
 async fn replay_raises_the_second_recipients_intent() {
     let store = Store::open_in_memory("test").await.unwrap();
-    let (operator, agent, conversation) = seeded(&store).await;
+    let (operator, agent, _conversation) = seeded(&store).await;
     store
         .ensure_peer("claude-2", "claude-2", "harness")
         .await
         .unwrap();
-    store
-        .ensure_conversation(&conversation, &[&operator, &agent, "claude-2"])
+    // Membership is granted up front (creation-time enrolment), as the
+    // hub does: `ensure_conversation` never re-grants membership on an
+    // existing room — the hub snapshot is the authority (H-12).
+    let conversation = store
+        .create_conversation(&[&operator, &agent, "claude-2"])
         .await
         .unwrap();
     let idem = key();
@@ -437,6 +441,159 @@ async fn mentions_in_prose_deliver_to_the_named_member() {
         delivered,
         vec![kestrel],
         "only the member named in the text is woken"
+    );
+    assert!(!delivered.contains(&codex));
+}
+
+/// H-4: execution authority is committed at first acceptance — a
+/// replay of a mail-only message can never make it executable, and
+/// the stored flag stays honest either way.
+#[tokio::test]
+async fn replay_cannot_upgrade_mail_only_to_executable() {
+    let store = Store::open_in_memory("authority").await.unwrap();
+    let (operator, agent, conversation) = seeded(&store).await;
+    let idem = key();
+
+    store
+        .accept_message(&conversation, &operator, &idem, "mail only", false, &[])
+        .await
+        .unwrap();
+
+    let replay = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &idem,
+            "mail only",
+            true,
+            &[RecipientRequest {
+                peer_id: agent.clone(),
+                execution_requested: true,
+            }],
+        )
+        .await;
+    assert!(
+        matches!(replay, Err(StoreError::ExecutionAuthorityConflict { .. })),
+        "a mail-only acceptance must not become executable via replay: {replay:?}"
+    );
+    assert!(
+        store.due_intents().await.unwrap().is_empty(),
+        "no intent may exist for the mail-only message"
+    );
+}
+
+/// H-4 (routing half): a replay must reuse the committed routing —
+/// re-sending the same key/content after an alias move must not wake
+/// a different peer.
+#[tokio::test]
+async fn replay_reuses_committed_routing_after_an_alias_move() {
+    let store = Store::open_in_memory("routing").await.unwrap();
+    let (operator, codex, kestrel, conversation) = room(&store).await;
+    let idem = key();
+
+    let outcome = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &idem,
+            "@kestrel please review",
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
+    let message_id = match outcome {
+        AcceptOutcome::Accepted { message_id } | AcceptOutcome::Replay { message_id } => message_id,
+    };
+    assert_eq!(
+        store.message_recipients(&message_id).await.unwrap(),
+        vec![kestrel.clone()]
+    );
+
+    // Move the alias to another member and retry the identical post:
+    // the committed routing stands, the new member is NOT woken.
+    store
+        .set_peer_alias(&codex, Some("kestrel"), "operator")
+        .await
+        .unwrap();
+    let replay = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &idem,
+            "@kestrel please review",
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(replay, AcceptOutcome::Replay { .. }));
+    let delivered = store.message_recipients(&message_id).await.unwrap();
+    assert_eq!(delivered, vec![kestrel], "no re-resolution on replay");
+    assert!(!delivered.contains(&codex));
+}
+
+/// H-7: ejection is enforced at the committed acceptance boundary —
+/// a booted peer can neither post nor be explicitly addressed, and a
+/// mention never wakes one.
+#[tokio::test]
+async fn ejected_peers_cannot_post_and_are_never_addressed() {
+    let store = Store::open_in_memory("ejected").await.unwrap();
+    let (operator, codex, kestrel, conversation) = room(&store).await;
+    store
+        .set_peer_status(&codex, wrkspc_core::PeerStatus::Booted, "operator")
+        .await
+        .unwrap();
+
+    // A booted sender is refused at the acceptance boundary.
+    let post = store
+        .accept_message(&conversation, &codex, &key(), "i am back", false, &[])
+        .await;
+    assert!(
+        matches!(post, Err(StoreError::PeerEjected { .. })),
+        "a booted peer cannot post: {post:?}"
+    );
+
+    // An explicit address to the booted peer is refused loudly.
+    let explicit = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &key(),
+            "work for codex",
+            false,
+            &[RecipientRequest {
+                peer_id: codex.clone(),
+                execution_requested: true,
+            }],
+        )
+        .await;
+    assert!(
+        matches!(explicit, Err(StoreError::PeerEjected { .. })),
+        "a booted peer cannot be addressed explicitly: {explicit:?}"
+    );
+
+    // A mention never wakes the booted peer (the UI's mention
+    // fallback must not re-introduce a banned target).
+    let outcome = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &key(),
+            "ping @codex and @kestrel",
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
+    let message_id = match outcome {
+        AcceptOutcome::Accepted { message_id } | AcceptOutcome::Replay { message_id } => message_id,
+    };
+    let delivered = store.message_recipients(&message_id).await.unwrap();
+    assert_eq!(
+        delivered,
+        vec![kestrel],
+        "only the enrolled member is woken"
     );
     assert!(!delivered.contains(&codex));
 }

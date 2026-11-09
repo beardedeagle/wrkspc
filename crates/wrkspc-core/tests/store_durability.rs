@@ -1,5 +1,6 @@
 //! Restart durability: crash-before-dispatch, unknown persistence,
 //! and the exclusive dispatcher lock across reopens.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 

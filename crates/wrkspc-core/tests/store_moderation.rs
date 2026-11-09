@@ -1,5 +1,6 @@
 //! Peer moderation: alias, status transitions, ban revocations,
 //! the audit log, soft-forget, and first-presented-serial wins.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 

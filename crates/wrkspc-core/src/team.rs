@@ -143,6 +143,14 @@ impl Store {
             })?;
         let mut queued = 0;
         for peer_id in request.recipients {
+            // An operator-canceled intent must not be fanned out (the
+            // delivery task is the node's execution channel).
+            if self
+                .recipient_intent_canceled(request.message_id, peer_id)
+                .await?
+            {
+                continue;
+            }
             let Some((recipient_name, recipient_class, peer_host)) =
                 self.peer_details(peer_id).await?
             else {
@@ -157,6 +165,7 @@ impl Store {
                 recipient_name: &recipient_name,
                 recipient_class: &recipient_class,
                 message_id: request.message_id,
+                origin_message_id: request.origin_message_id,
                 conversation_id: request.conversation_id,
                 sender_peer: request.sender_peer,
                 sender_name: &sender_name,
@@ -170,10 +179,204 @@ impl Store {
         }
         Ok(queued)
     }
+
+    /// Repairs a partially completed remote fan-out: for every
+    /// committed (message, recipient) pair whose recipient lives on a
+    /// remote host, the deterministic delivery task is created when it
+    /// does not exist.
+    ///
+    /// Idempotent and safe to run at startup (or after any replay):
+    /// existing tasks — including terminal, already-acked ones — are
+    /// never touched, and no duplicate can form because the task id is
+    /// a function of (message, recipient).
+    ///
+    /// # Arguments
+    ///
+    /// * `local_host` — the hub's own host id; recipients on it are
+    ///   local and never get a delivery task.
+    ///
+    /// # Returns
+    ///
+    /// The number of delivery tasks (re)created.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    pub async fn repair_remote_fanout(&self, local_host: &str) -> Result<usize> {
+        let rows = sqlx::query(
+            "SELECT m.id AS message_id, m.conversation_id, m.sender_id, m.content,
+                    m.execution_requested, r.peer_id,
+                    p.name AS recipient_name, p.class AS recipient_class,
+                    p.host_id AS recipient_host
+             FROM message_recipients r
+             JOIN messages m ON m.id = r.message_id
+             JOIN peers p ON p.id = r.peer_id
+             WHERE p.host_id != ?",
+        )
+        .bind(local_host)
+        .fetch_all(self.pool())
+        .await?;
+        let mut repaired = 0;
+        for row in rows {
+            let message_id: String = row.get("message_id");
+            let recipient_peer: String = row.get("peer_id");
+            // An operator-canceled turn must never be re-created by a
+            // repair pass (H-10): the fan-out is the execution channel,
+            // and a canceled intent means the recipient must not run it.
+            if self
+                .recipient_intent_canceled(&message_id, &recipient_peer)
+                .await?
+            {
+                continue;
+            }
+            let task_id = crate::tasks::delivery_task_id(&message_id, &recipient_peer);
+            if self.task_get(&task_id).await?.is_some() {
+                continue;
+            }
+            let sender_peer: String = row.get("sender_id");
+            let (sender_name, sender_class, sender_host) = self
+                .peer_details(&sender_peer)
+                .await?
+                .ok_or_else(|| StoreError::NotFound {
+                entity: "peer",
+                id: sender_peer.clone(),
+            })?;
+            let recipient_host: String = row.get("recipient_host");
+            let recipient_name: String = row.get("recipient_name");
+            let recipient_class: String = row.get("recipient_class");
+            let conversation_id: String = row.get("conversation_id");
+            let content: String = row.get("content");
+            let execution_requested: bool = row.get("execution_requested");
+            self.task_create_delivery(DeliveryTaskRequest {
+                recipient_host: &recipient_host,
+                recipient_peer: &recipient_peer,
+                recipient_name: &recipient_name,
+                recipient_class: &recipient_class,
+                message_id: &message_id,
+                origin_message_id: None,
+                conversation_id: &conversation_id,
+                sender_peer: &sender_peer,
+                sender_name: &sender_name,
+                sender_class: &sender_class,
+                sender_host: &sender_host,
+                content: &content,
+                execution_requested,
+            })
+            .await?;
+            repaired += 1;
+        }
+        Ok(repaired)
+    }
+
+    /// Whether the operator canceled the execution intent for a
+    /// (message, recipient) pair. A missing intent (a mail-only
+    /// message) means "not canceled" — it still delivers.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_id` — the message.
+    /// * `recipient_peer` — the recipient.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    pub async fn recipient_intent_canceled(
+        &self,
+        message_id: &str,
+        recipient_peer: &str,
+    ) -> Result<bool> {
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT state FROM execution_intents
+             WHERE message_id = ? AND recipient_id = ?",
+        )
+        .bind(message_id)
+        .bind(recipient_peer)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(state.as_deref() == Some("canceled"))
+    }
+
+    /// Lists terminal attempt outcomes that a hub-originated delivery
+    /// has not yet reported back to the hub (the H-10 outcome leg).
+    ///
+    /// Only attempts whose (message, recipient) pair has a mirrored
+    /// delivery-task row qualify — those are hub-originated deliveries;
+    /// node-local messages have no such row and are never reported.
+    ///
+    /// # Returns
+    ///
+    /// The pending reports in completion order (oldest first).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    pub async fn hub_pending_outcomes(&self) -> Result<Vec<AttemptOutcomeReport>> {
+        let rows = sqlx::query(
+            "SELECT a.id AS attempt_id, a.state,
+                    i.message_id, i.recipient_id, m.conversation_id
+             FROM attempts a
+             JOIN execution_intents i ON i.id = a.intent_id
+             JOIN messages m ON m.id = i.message_id
+             WHERE a.state IN ('completed', 'failed', 'canceled')
+               AND a.id NOT IN (SELECT attempt_id FROM hub_outcome_reports)
+             ORDER BY a.terminal_at ASC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        let mut reports = Vec::with_capacity(rows.len());
+        for row in rows {
+            let message_id: String = row.get("message_id");
+            let recipient_peer: String = row.get("recipient_id");
+            let task_id = crate::tasks::delivery_task_id(&message_id, &recipient_peer);
+            let mirrored: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM a2a_tasks WHERE task_id = ?")
+                    .bind(&task_id)
+                    .fetch_optional(self.pool())
+                    .await?;
+            if mirrored.is_none() {
+                // A local message: no hub delivery task exists to
+                // report against.
+                continue;
+            }
+            reports.push(AttemptOutcomeReport {
+                attempt_id: row.get("attempt_id"),
+                task_id,
+                message_id,
+                recipient_peer,
+                conversation_id: row.get("conversation_id"),
+                state: row.get("state"),
+            });
+        }
+        Ok(reports)
+    }
+
+    /// Records an attempt outcome as reported to the hub. Idempotent.
+    ///
+    /// # Arguments
+    ///
+    /// * `attempt_id` — the attempt whose outcome was reported.
+    /// * `task_id` — the delivery task the report addressed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    pub async fn mark_outcome_reported(&self, attempt_id: &str, task_id: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO hub_outcome_reports (attempt_id, task_id, reported_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(attempt_id)
+        .bind(task_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
 }
 
 /// A delivery fan-out request: the committed message plus the
 /// recipients to fan out to.
+#[derive(Debug)]
 pub struct RemoteFanoutRequest<'a> {
     /// The hub's own host id — recipients on this host are local.
     pub local_host: &'a str,
@@ -181,6 +384,9 @@ pub struct RemoteFanoutRequest<'a> {
     pub conversation_id: &'a str,
     /// The committed message id.
     pub message_id: &'a str,
+    /// The sender's own wire message id (the origin) — see
+    /// [`DeliveryTaskRequest::origin_message_id`](DeliveryTaskRequest::origin_message_id).
+    pub origin_message_id: Option<&'a str>,
     /// The enrolled sender.
     pub sender_peer: &'a str,
     /// The message text.
@@ -189,4 +395,24 @@ pub struct RemoteFanoutRequest<'a> {
     pub execution_requested: bool,
     /// Recipient peer ids.
     pub recipients: &'a [String],
+}
+
+/// A terminal attempt outcome that must be reported to the hub: the
+/// outcome of a hub-originated delivery (H-10 — the hub learns
+/// execution results, it does not infer them from the ack).
+#[derive(Debug)]
+pub struct AttemptOutcomeReport {
+    /// The terminal attempt whose outcome is reported.
+    pub attempt_id: String,
+    /// The hub delivery task the outcome addresses (deterministic id).
+    pub task_id: String,
+    /// The delivered message.
+    pub message_id: String,
+    /// The recipient peer (also the task's queue owner).
+    pub recipient_peer: String,
+    /// The conversation, for the hub-side feed event.
+    pub conversation_id: String,
+    /// The terminal attempt state: `completed`, `failed`, or
+    /// `canceled`.
+    pub state: String,
 }

@@ -24,6 +24,12 @@ impl Store {
                    AND a.state IN ('claimed', 'dispatched', 'unknown')
                )
                AND NOT EXISTS (
+                 SELECT 1 FROM attempts a2
+                 JOIN execution_intents i2 ON i2.id = a2.intent_id
+                 WHERE i2.recipient_id = i.recipient_id
+                   AND a2.state = 'unknown'
+               )
+               AND NOT EXISTS (
                  SELECT 1 FROM fences f
                  WHERE f.active = 1
                    AND f.conversation_id = m.conversation_id
@@ -111,6 +117,43 @@ impl Store {
         Ok(())
     }
 
+    /// Evaluates the dispatch-boundary gates for one delivery in a
+    /// single transaction: an active pause/hold/block fence, a
+    /// held/blocked/expired recipient delivery state, and an ejected
+    /// (booted/banned) recipient peer. Any one of them blocks.
+    ///
+    /// The dispatcher re-evaluates this immediately before the prompt
+    /// (moderation can land after the claim); the delivery claim path
+    /// runs the same checks at the hub's claim boundary.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_id` — the message being delivered.
+    /// * `peer_id` — the recipient.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` when the delivery may proceed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::BlockedByFence`](StoreError::BlockedByFence)
+    /// naming the effective gate, and
+    /// [`StoreError::Db`](StoreError::Db) on failure.
+    pub async fn delivery_gate(&self, message_id: &str, peer_id: &str) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
+        let gate = delivery_gate_in_tx(&mut tx, message_id, peer_id).await?;
+        tx.commit().await?;
+        if let Some((conversation_id, kinds)) = gate {
+            return Err(StoreError::BlockedByFence {
+                conversation_id,
+                peer_id: peer_id.to_string(),
+                kinds,
+            });
+        }
+        Ok(())
+    }
+
     /// Releases a held delivery back into the eligible queue.
     ///
     /// # Arguments
@@ -173,4 +216,83 @@ impl Store {
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// The shared gate predicate, evaluated inside a caller's transaction.
+///
+/// Checks, in order: an active pause/hold/block fence on (conversation,
+/// recipient); a recipient delivery state of `held`/`blocked`/`expired`;
+/// and an ejected recipient peer status. Returns `Some((conversation,
+/// kinds))` describing the first blocking gate, or `None` when the
+/// delivery may proceed.
+///
+/// # Arguments
+///
+/// * `tx` — the open transaction the checks run in.
+/// * `message_id` — the message being delivered.
+/// * `peer_id` — the recipient.
+///
+/// # Returns
+///
+/// The blocking gate description, or `None`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Db`](StoreError::Db) on failure.
+pub(crate) async fn delivery_gate_in_tx(
+    tx: &mut sqlx::SqliteConnection,
+    message_id: &str,
+    peer_id: &str,
+) -> Result<Option<(String, String)>> {
+    if let Some(row) = sqlx::query(
+        "SELECT m.conversation_id AS conversation_id, GROUP_CONCAT(f.kind) AS kinds
+         FROM messages m
+         JOIN fences f ON f.conversation_id = m.conversation_id
+           AND f.peer_id = ? AND f.active = 1
+           AND f.kind IN ('pause', 'hold', 'block')
+         WHERE m.id = ?
+         GROUP BY m.conversation_id",
+    )
+    .bind(peer_id)
+    .bind(message_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        return Ok(Some((
+            row.get("conversation_id"),
+            format!("fence:{}", row.get::<String, _>("kinds")),
+        )));
+    }
+    let delivery_state: Option<String> = sqlx::query(
+        "SELECT delivery_state FROM message_recipients WHERE message_id = ? AND peer_id = ?",
+    )
+    .bind(message_id)
+    .bind(peer_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .map(|r| r.get("delivery_state"));
+    if let Some(state) = delivery_state.as_deref()
+        && matches!(state, "held" | "blocked" | "expired")
+    {
+        let conversation_id: String =
+            sqlx::query_scalar("SELECT conversation_id FROM messages WHERE id = ?")
+                .bind(message_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        return Ok(Some((conversation_id, format!("delivery:{state}"))));
+    }
+    if let Some(status) = sqlx::query_scalar::<_, String>("SELECT status FROM peers WHERE id = ?")
+        .bind(peer_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        && status != "enrolled"
+    {
+        let conversation_id: String =
+            sqlx::query_scalar("SELECT conversation_id FROM messages WHERE id = ?")
+                .bind(message_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        return Ok(Some((conversation_id, format!("peer:{status}"))));
+    }
+    Ok(None)
 }

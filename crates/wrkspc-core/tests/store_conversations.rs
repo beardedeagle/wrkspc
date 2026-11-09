@@ -3,6 +3,7 @@
 //! A name is display metadata: nullable, non-unique, and never a key. Nodes
 //! learn rooms from deliveries, so the mirror is what makes a room set and its
 //! names agree across machines.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use wrkspc_core::Store;
 use wrkspc_core::views::ConversationView;
@@ -177,4 +178,56 @@ async fn mirror_conversations_fills_names_and_members_without_deleting() {
         mirrored.name, None,
         "clearing the hub name clears the mirror"
     );
+}
+
+/// UI-19: the transcript's bounded window returns the LATEST messages
+/// oldest-first and never more than asked, while the full list is
+/// unchanged.
+#[tokio::test]
+async fn list_messages_window_returns_the_latest_bounded_oldest_first() {
+    let store = Store::open_in_memory("window-test").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    let room = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+
+    for n in 0..5 {
+        store
+            .accept_message(
+                &room,
+                "operator",
+                &format!("key-{n}"),
+                &format!("m{n}"),
+                false,
+                &[wrkspc_core::RecipientRequest {
+                    peer_id: "codex".to_string(),
+                    execution_requested: false,
+                }],
+            )
+            .await
+            .unwrap();
+    }
+
+    let window = store.list_messages_window(&room, 2).await.unwrap();
+    assert_eq!(window.len(), 2, "the window is bounded: {window:#?}");
+    assert_eq!(window[0].content, "m3", "oldest first within the window");
+    assert_eq!(window[1].content, "m4");
+    // Each windowed message still carries its delivery rows.
+    assert!(window.iter().all(|m| !m.deliveries.is_empty()));
+
+    let full = store.list_messages(&room).await.unwrap();
+    assert_eq!(full.len(), 5, "the unbounded list is untouched");
+    assert_eq!(full[0].content, "m0");
+
+    // A window larger than the room degrades to the whole room.
+    let all = store.list_messages_window(&room, 50).await.unwrap();
+    assert_eq!(all.len(), 5);
 }

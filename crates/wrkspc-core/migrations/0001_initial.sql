@@ -4,9 +4,14 @@
 -- database applies this one script and lands on the final schema.
 
 -- Machines that host peers. host_id is the node's certificate SAN.
+-- cert_serial records the serial the host last presented (latest wins
+-- across short-TTL renewals), independent of peer enrolment, so a ban
+-- always has a certificate to revoke even when no peer row existed at
+-- handshake time.
 CREATE TABLE hosts (
     host_id     TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
+    cert_serial TEXT,
     created_at  TEXT NOT NULL
 );
 
@@ -198,6 +203,16 @@ CREATE TABLE hub_outbound (
     sent_at    TEXT NOT NULL
 );
 
+-- Node→hub outcome ledger: terminal attempt outcomes already reported
+-- for hub-originated deliveries (those with a mirrored delivery-task
+-- row). Lets the hub's delivery task learn execution results instead
+-- of reporting completion at ack time (H-10).
+CREATE TABLE hub_outcome_reports (
+    attempt_id  TEXT PRIMARY KEY REFERENCES attempts(id),
+    task_id     TEXT NOT NULL,
+    reported_at TEXT NOT NULL
+);
+
 -- Per-peer presence state as the hub last observed it.
 CREATE TABLE presence (
     peer_id    TEXT PRIMARY KEY REFERENCES peers(id),
@@ -218,11 +233,15 @@ CREATE TABLE roster (
 );
 
 -- Certificate serial revocations: the runtime ban source alongside the
--- operator's --revoke-list file.
+-- operator's --revoke-list file. Keyed by (serial, peer): hosts share
+-- one certificate, so a ban reason is recorded PER PEER and the
+-- effective deny-set is the union of remaining reasons — restoring one
+-- peer never lifts another peer's ban on the shared certificate.
 CREATE TABLE cert_revocations (
-    serial     TEXT PRIMARY KEY,
-    peer_id    TEXT NOT NULL,
-    revoked_at TEXT NOT NULL
+    serial     TEXT NOT NULL,
+    peer_id    TEXT NOT NULL REFERENCES peers(id),
+    revoked_at TEXT NOT NULL,
+    PRIMARY KEY (serial, peer_id)
 );
 
 -- The moderation audit: actor, action, before/after, newest first.

@@ -1,5 +1,6 @@
 //! wrkspc-core — the transactional store, fence flows, moderation state,
 //! and the committed event feed for the wrkspc pilot.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod error;
 pub mod model;

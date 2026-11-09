@@ -62,6 +62,11 @@ impl Store {
 
     /// Reads events after `after_seq` (exclusive) up to `limit`.
     ///
+    /// The limit is CLAMPED defensively to `1..=1000` (P07): a
+    /// negative or oversized caller value must never become an
+    /// unbounded `LIMIT -1` fetch. Callers that need the contract
+    /// enforced loudly validate before calling.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Db`](StoreError::Db) on failure.
@@ -71,6 +76,7 @@ impl Store {
         after_seq: i64,
         limit: i64,
     ) -> Result<Vec<Event>> {
+        let limit = limit.clamp(1, 1000);
         let rows = sqlx::query(
             "SELECT seq, conversation_id, kind, payload, created_at
              FROM events

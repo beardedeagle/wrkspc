@@ -1,6 +1,7 @@
 //! The D-6 delivery contract's store half: pollable delivery tasks,
 //! append-only host assignments, the pilot cutover, per-instance
 //! claims, remote fanout, and the hub outbound ledger.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 
@@ -32,6 +33,7 @@ async fn delivery_tasks_are_pollable_by_host_context() {
             recipient_name: "codex",
             recipient_class: "harness",
             message_id: "msg-1",
+            origin_message_id: None,
             conversation_id: &conversation,
             sender_peer: "operator",
             sender_name: "operator",
@@ -174,6 +176,7 @@ async fn delivery_claims_are_first_wins_per_instance_and_releasable() {
             recipient_name: "codex",
             recipient_class: "harness",
             message_id: "hub-msg-1",
+            origin_message_id: None,
             conversation_id: "hub-conv-1",
             sender_peer: "operator",
             sender_name: "operator",
@@ -273,6 +276,7 @@ async fn queue_remote_deliveries_targets_only_remote_hosts() {
             local_host: wrkspc_core::PILOT_HOST_ID,
             conversation_id: &conversation,
             message_id: "m-1",
+            origin_message_id: None,
             sender_peer: "operator",
             content: "hello team",
             execution_requested: true,
@@ -298,6 +302,7 @@ async fn queue_remote_deliveries_targets_only_remote_hosts() {
             local_host: wrkspc_core::PILOT_HOST_ID,
             conversation_id: &conversation,
             message_id: "m-2",
+            origin_message_id: None,
             sender_peer: "operator",
             content: "hello team",
             execution_requested: true,
@@ -380,5 +385,504 @@ async fn hub_outbound_tracks_only_local_harness_messages() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+/// Seeds a hub store: an operator, a remote-host harness recipient,
+/// one committed conversation, and one accepted+queued delivery task.
+/// Returns `(store, conversation_id, message_id, task_id)`.
+async fn seeded_hub_delivery(label: &str) -> (Store, String, String, String) {
+    let store = Store::open_in_memory(label).await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer_on_host("codex", "codex", "harness", "node-work-mac")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+    let message_id = match store
+        .accept_message(
+            &conversation,
+            "operator",
+            "k-1",
+            "hello from the hub",
+            true,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "codex".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap()
+    {
+        wrkspc_core::AcceptOutcome::Accepted { message_id } => message_id,
+        other => panic!("expected acceptance, got {other:?}"),
+    };
+    let queued = store
+        .queue_remote_deliveries(wrkspc_core::RemoteFanoutRequest {
+            local_host: wrkspc_core::PILOT_HOST_ID,
+            conversation_id: &conversation,
+            message_id: &message_id,
+            origin_message_id: None,
+            sender_peer: "operator",
+            content: "hello from the hub",
+            execution_requested: true,
+            recipients: &["codex".to_string()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(queued, 1);
+    let (tasks, _) = store
+        .task_list(Some("node-work-mac"), None, None, None, 10)
+        .await
+        .unwrap();
+    let task_id = tasks[0].task_id.clone();
+    (store, conversation, message_id, task_id)
+}
+
+/// The claim is the hub's moderation linearization point: a pause
+/// fence, a held delivery, or an ejected recipient each block the
+/// delivery claim in its own transaction, and the claim succeeds once
+/// the gate clears — nothing can mirror before it.
+#[tokio::test]
+async fn fence_hold_and_ejection_block_the_delivery_claim() {
+    // A pause fence set before the claim blocks it; clearing the fence
+    // admits the claim.
+    let (store, conversation, _, task_id) = seeded_hub_delivery("claim-gate-fence").await;
+    let fence = store
+        .set_fence(
+            &conversation,
+            "codex",
+            wrkspc_core::FenceKind::Pause,
+            "operator",
+        )
+        .await
+        .unwrap();
+    match store
+        .claim_delivery(&task_id, "node-work-mac", "inst-1")
+        .await
+    {
+        Err(wrkspc_core::StoreError::BlockedByFence { kinds, .. }) => {
+            assert!(kinds.contains("pause"), "gate names the fence: {kinds}");
+        }
+        other => panic!("fenced claim must be blocked, got {other:?}"),
+    }
+    // No claim row was written while gated.
+    assert!(store.delivery_claim(&task_id).await.unwrap().is_none());
+    store.clear_fence(&fence, "operator").await.unwrap();
+    assert!(matches!(
+        store
+            .claim_delivery(&task_id, "node-work-mac", "inst-1")
+            .await,
+        Ok(wrkspc_core::DeliveryClaimOutcome::Claimed)
+    ));
+
+    // A held delivery blocks the claim; the release admits it.
+    let (store, _, message_id, task_id) = seeded_hub_delivery("claim-gate-hold").await;
+    store
+        .hold_delivery(&message_id, "codex", "operator")
+        .await
+        .unwrap();
+    match store
+        .claim_delivery(&task_id, "node-work-mac", "inst-1")
+        .await
+    {
+        Err(wrkspc_core::StoreError::BlockedByFence { kinds, .. }) => {
+            assert!(kinds.contains("held"), "gate names the hold: {kinds}");
+        }
+        other => panic!("held claim must be blocked, got {other:?}"),
+    }
+    store
+        .release_delivery(&message_id, "codex", "operator")
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .claim_delivery(&task_id, "node-work-mac", "inst-1")
+            .await,
+        Ok(wrkspc_core::DeliveryClaimOutcome::Claimed)
+    ));
+
+    // An ejected recipient blocks the claim; the restore admits it.
+    let (store, _, _, task_id) = seeded_hub_delivery("claim-gate-boot").await;
+    store
+        .set_peer_status("codex", wrkspc_core::PeerStatus::Booted, "operator")
+        .await
+        .unwrap();
+    match store
+        .claim_delivery(&task_id, "node-work-mac", "inst-1")
+        .await
+    {
+        Err(wrkspc_core::StoreError::BlockedByFence { kinds, .. }) => {
+            assert!(kinds.contains("booted"), "gate names the status: {kinds}");
+        }
+        other => panic!("ejected recipient claim must be blocked, got {other:?}"),
+    }
+    store
+        .set_peer_status("codex", wrkspc_core::PeerStatus::Enrolled, "operator")
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .claim_delivery(&task_id, "node-work-mac", "inst-1")
+            .await,
+        Ok(wrkspc_core::DeliveryClaimOutcome::Claimed)
+    ));
+}
+
+/// A duplicate task id surfaces as AlreadyExists (the documented
+/// contract), not as a generic database error (P2: SQLite raises a
+/// constraint violation, which rows_affected() never sees).
+#[tokio::test]
+async fn duplicate_task_create_is_already_exists() {
+    let store = Store::open_in_memory("task-create-duplicate")
+        .await
+        .unwrap();
+    store
+        .task_create("task-dup", "ctx", "submitted", false, "{}")
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .task_create("task-dup", "ctx", "submitted", false, "{}")
+            .await,
+        Err(wrkspc_core::StoreError::AlreadyExists {
+            entity: "a2a task",
+            ..
+        })
+    ));
+}
+
+/// A task whose payload is not a well-formed delivery never claims: a
+/// malformed envelope cannot describe executable work.
+#[tokio::test]
+async fn malformed_delivery_payload_is_not_claimable() {
+    let store = Store::open_in_memory("claim-gate-malformed").await.unwrap();
+    store
+        .task_create(
+            "task-bad",
+            "node-work-mac",
+            "submitted",
+            false,
+            r#"{"id":"task-bad","contextId":"node-work-mac","status":{"state":"TASK_STATE_SUBMITTED"}}"#,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .claim_delivery("task-bad", "node-work-mac", "inst-1")
+            .await,
+        Err(wrkspc_core::StoreError::BlockedByFence { .. })
+    ));
+}
+
+/// An operator cancel marks the delivery task terminal-canceled with
+/// the envelope preserved (H-10 hub-cancel half): an unclaimed
+/// delivery can then never be claimed, so the node never mirrors it.
+#[tokio::test]
+async fn canceled_delivery_task_is_terminal_and_not_claimable() {
+    let store = Store::open_in_memory("hub-cancel-test").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer_on_host("codex", "codex", "harness", "node-work-mac")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+    let message_id = store
+        .accept_message(
+            &conversation,
+            "operator",
+            "key-cancel-1",
+            "work to cancel",
+            true,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "codex".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .map(|outcome| match outcome {
+            wrkspc_core::AcceptOutcome::Accepted { message_id }
+            | wrkspc_core::AcceptOutcome::Replay { message_id } => message_id,
+        })
+        .unwrap();
+    let task_id = store
+        .task_create_delivery(wrkspc_core::DeliveryTaskRequest {
+            recipient_host: "node-work-mac",
+            recipient_peer: "codex",
+            recipient_name: "codex",
+            recipient_class: "harness",
+            message_id: &message_id,
+            origin_message_id: None,
+            conversation_id: &conversation,
+            sender_peer: "operator",
+            sender_name: "operator",
+            sender_class: "human",
+            sender_host: wrkspc_core::PILOT_HOST_ID,
+            content: "work to cancel",
+            execution_requested: true,
+        })
+        .await
+        .unwrap();
+
+    // Cancel before any claim: terminal-canceled with the record
+    // intact.
+    let canceled = store
+        .task_mark_canceled(&task_id)
+        .await
+        .unwrap()
+        .expect("a non-terminal task is canceled now");
+    assert!(canceled.terminal);
+    assert_eq!(canceled.state, "canceled");
+    let payload: serde_json::Value = serde_json::from_str(&canceled.task_json).unwrap();
+    assert_eq!(payload["status"]["state"], "TASK_STATE_CANCELED");
+    assert_eq!(
+        payload["metadata"]["delivery"]["message_id"],
+        serde_json::Value::String(message_id.clone()),
+        "the delivery envelope survives the cancel"
+    );
+
+    // The canceled task can never be claimed: the node never mirrors
+    // it.
+    assert!(matches!(
+        store
+            .claim_delivery(&task_id, "node-work-mac", "inst-1")
+            .await,
+        Err(wrkspc_core::StoreError::TaskTerminal { .. })
+    ));
+
+    // Idempotent: a second cancel (and a cancel of an unknown task)
+    // is a satisfied no-op.
+    assert!(store.task_mark_canceled(&task_id).await.unwrap().is_none());
+    assert!(
+        store
+            .task_mark_canceled("no-such-task")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// The fan-out and its repair skip operator-canceled intents (H-10):
+/// a canceled turn must never create the delivery task the node polls.
+#[tokio::test]
+async fn fanout_and_repair_skip_canceled_intents() {
+    let store = Store::open_in_memory("fanout-cancel-test").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer_on_host("codex", "codex", "harness", "node-work-mac")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+    let message_id = store
+        .accept_message(
+            &conversation,
+            "operator",
+            "key-fanout-1",
+            "cancel me",
+            true,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "codex".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .map(|outcome| match outcome {
+            wrkspc_core::AcceptOutcome::Accepted { message_id }
+            | wrkspc_core::AcceptOutcome::Replay { message_id } => message_id,
+        })
+        .unwrap();
+
+    // Operator cancels the queued turn BEFORE the fan-out runs.
+    assert!(matches!(
+        store.request_cancel(&message_id, "codex", "operator").await,
+        Ok(wrkspc_core::CancelOutcome::IntentCanceled)
+    ));
+
+    // The fan-out must skip the canceled recipient.
+    let queued = store
+        .queue_remote_deliveries(wrkspc_core::RemoteFanoutRequest {
+            local_host: wrkspc_core::PILOT_HOST_ID,
+            conversation_id: &conversation,
+            message_id: &message_id,
+            origin_message_id: None,
+            sender_peer: "operator",
+            content: "cancel me",
+            execution_requested: true,
+            recipients: &["codex".to_string()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(queued, 0, "a canceled intent must not fan out");
+
+    // The startup repair must not resurrect the canceled delivery
+    // either.
+    assert_eq!(
+        store
+            .repair_remote_fanout(wrkspc_core::PILOT_HOST_ID)
+            .await
+            .unwrap(),
+        0,
+        "the repair pass must not re-create a canceled delivery"
+    );
+    let task_id = wrkspc_core::tasks::delivery_task_id(&message_id, "codex");
+    assert!(
+        store.task_get(&task_id).await.unwrap().is_none(),
+        "no delivery task exists for the canceled turn"
+    );
+}
+
+/// The H-10 outcome outbox: only terminal attempts whose (message,
+/// recipient) pair has a mirrored delivery-task row are reported to
+/// the hub; node-local messages are never reported.
+#[tokio::test]
+async fn hub_pending_outcomes_lists_only_mirrored_terminal_attempts() {
+    let store = Store::open_in_memory("outcome-outbox-test").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer_on_host("codex", "codex", "harness", "node-work-mac")
+        .await
+        .unwrap();
+    store
+        .ensure_peer_on_host("agy", "agy", "harness", "node-work-mac")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "codex", "agy"])
+        .await
+        .unwrap();
+
+    // A hub-originated delivery: the node recorded the mirrored task
+    // marker (its local a2a_tasks row under the deterministic id).
+    let mirrored_id = store
+        .accept_message(
+            &conversation,
+            "operator",
+            "key-mirror-1",
+            "from the hub",
+            true,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "codex".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .map(|outcome| match outcome {
+            wrkspc_core::AcceptOutcome::Accepted { message_id }
+            | wrkspc_core::AcceptOutcome::Replay { message_id } => message_id,
+        })
+        .unwrap();
+    let task_id = wrkspc_core::tasks::delivery_task_id(&mirrored_id, "codex");
+    store
+        .task_create(&task_id, "node-work-mac", "completed", true, "{}")
+        .await
+        .unwrap();
+    let attempt_id = store.claim_intent(&mirrored_id, "codex").await.unwrap();
+    store
+        .mark_terminal(
+            &attempt_id,
+            wrkspc_core::AttemptState::Completed,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // A node-local message: same store, no mirrored task row. It
+    // targets a harness peer (human peers never take a delivery), so
+    // its attempt exists — but with no mirrored task it must never be
+    // reported.
+    let local_id = store
+        .accept_message(
+            &conversation,
+            "codex",
+            "key-local-1",
+            "local post",
+            true,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "agy".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .map(|outcome| match outcome {
+            wrkspc_core::AcceptOutcome::Accepted { message_id }
+            | wrkspc_core::AcceptOutcome::Replay { message_id } => message_id,
+        })
+        .unwrap();
+    let local_attempt = store.claim_intent(&local_id, "agy").await.unwrap();
+    store
+        .mark_terminal(
+            &local_attempt,
+            wrkspc_core::AttemptState::Completed,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Only the hub-originated delivery is reported.
+    let pending = store.hub_pending_outcomes().await.unwrap();
+    assert_eq!(pending.len(), 1, "only the mirrored delivery reports");
+    assert_eq!(pending[0].task_id, task_id);
+    assert_eq!(pending[0].attempt_id, attempt_id);
+    assert_eq!(pending[0].state, "completed");
+    assert_eq!(pending[0].recipient_peer, "codex");
+
+    // Ledgering removes it; re-running lists nothing.
+    store
+        .mark_outcome_reported(&attempt_id, &task_id)
+        .await
+        .unwrap();
+    assert!(store.hub_pending_outcomes().await.unwrap().is_empty());
+
+    // Non-terminal attempts are never reported.
+    let second = store
+        .accept_message(
+            &conversation,
+            "operator",
+            "key-mirror-2",
+            "still running",
+            true,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "codex".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .map(|outcome| match outcome {
+            wrkspc_core::AcceptOutcome::Accepted { message_id }
+            | wrkspc_core::AcceptOutcome::Replay { message_id } => message_id,
+        })
+        .unwrap();
+    let second_task = wrkspc_core::tasks::delivery_task_id(&second, "codex");
+    store
+        .task_create(&second_task, "node-work-mac", "completed", true, "{}")
+        .await
+        .unwrap();
+    store.claim_intent(&second, "codex").await.unwrap();
+    assert!(
+        store.hub_pending_outcomes().await.unwrap().is_empty(),
+        "a claimed, non-terminal attempt is not reported"
     );
 }

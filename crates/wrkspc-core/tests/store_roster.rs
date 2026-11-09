@@ -1,5 +1,6 @@
 //! Presence and the roster: first-report enrolment, state updates,
 //! cross-host refusal, and full mirror replacement.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 

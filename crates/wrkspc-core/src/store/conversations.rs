@@ -36,17 +36,22 @@ impl Store {
         Ok(id)
     }
 
-    /// Ensures a conversation with a caller-supplied id exists and has
-    /// exactly `members` enrolled (node-side mirror of a hub-owned
-    /// conversation: the hub id is preserved so records line up across
-    /// stores). Idempotent — re-running never duplicates rows or rewrites
-    /// membership.
+    /// Ensures a conversation with a caller-supplied id exists and, when
+    /// it is being CREATED here, enrols `members` (node-side mirror of a
+    /// hub-owned conversation: the hub id is preserved so records line
+    /// up across stores). Idempotent — re-running never duplicates rows.
+    ///
+    /// Membership on an EXISTING room is never re-granted here: the hub
+    /// snapshot is the authority, and a stale queued delivery must not
+    /// re-enrol a peer the operator removed (H-12). Only the
+    /// authoritative mirror ([`Store::mirror_conversations`]) and local
+    /// creation add members.
     ///
     /// # Arguments
     ///
     /// * `conversation_id` — the conversation id to ensure (the hub id
     ///   when mirroring).
-    /// * `members` — the peers to enrol.
+    /// * `members` — the peers to enrol (on creation only).
     ///
     /// # Returns
     ///
@@ -74,17 +79,17 @@ impl Store {
                 .bind(&now)
                 .execute(&mut *tx)
                 .await?;
-        }
-        for member in members {
-            sqlx::query(
-                "INSERT OR IGNORE INTO conversation_members (conversation_id, peer_id, role, joined_at)
-                 VALUES (?, ?, 'member', ?)",
-            )
-            .bind(conversation_id)
-            .bind(member)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await?;
+            for member in members {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO conversation_members (conversation_id, peer_id, role, joined_at)
+                     VALUES (?, ?, 'member', ?)",
+                )
+                .bind(conversation_id)
+                .bind(member)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         tx.commit().await?;
         Ok(created)
@@ -175,18 +180,58 @@ impl Store {
     /// waking peers on every poll. Removal is transactional and ordered
     /// children-first so the foreign keys hold.
     ///
+    /// The conversation's remote delivery tasks are deleted by the
+    /// conversation's committed message ids — never by treating the
+    /// requested string as a host queue id (H-8: a host id must not
+    /// wipe an unrelated host's queue, and deleting a room must not
+    /// leave its remote tasks live).
+    ///
     /// # Arguments
     ///
     /// * `conversation_id` — the conversation to delete.
     ///
     /// # Returns
     ///
-    /// `true` when a conversation was removed, `false` when it did not exist.
+    /// `true` when a conversation was removed, `false` when it did not exist
+    /// (a nonexistent id deletes NOTHING — it is not a host queue).
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Db`](StoreError::Db) on failure.
     pub async fn delete_conversation(&self, conversation_id: &str) -> Result<bool> {
+        // Existence FIRST: a nonexistent id deletes nothing, so a host
+        // id string can never be mistaken for a room and wipe that
+        // host's delivery queue.
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM conversations WHERE id = ?")
+            .bind(conversation_id)
+            .fetch_optional(self.pool())
+            .await?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+
+        // The room's delivery-task ids: deterministic for current rows
+        // and envelope-matched for legacy random-id rows — both keyed
+        // on the conversation's committed message ids.
+        let pairs: Vec<(String, String)> = sqlx::query(
+            "SELECT r.message_id, r.peer_id
+             FROM message_recipients r
+             JOIN messages m ON m.id = r.message_id
+             WHERE m.conversation_id = ?",
+        )
+        .bind(conversation_id)
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .map(|r| (r.get("message_id"), r.get("peer_id")))
+        .collect();
+        let mut message_ids: Vec<String> = Vec::new();
+        for (message_id, _) in &pairs {
+            if !message_ids.contains(message_id) {
+                message_ids.push(message_id.clone());
+            }
+        }
+
         let mut tx = self.pool.begin().await?;
         // attempts -> intents -> recipients -> messages -> events/fences/members
         sqlx::query(
@@ -211,8 +256,8 @@ impl Store {
         .bind(conversation_id)
         .execute(&mut *tx)
         .await?;
-        // The outbound ledger points at messages, and guidance / A2A tasks
-        // are scoped by conversation even without a foreign key.
+        // The outbound ledger points at messages, and guidance is
+        // scoped by conversation even without a foreign key.
         sqlx::query(
             "DELETE FROM hub_outbound WHERE message_id IN
                (SELECT id FROM messages WHERE conversation_id = ?)",
@@ -224,17 +269,39 @@ impl Store {
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query(
-            "DELETE FROM delivery_claims WHERE task_id IN
-               (SELECT task_id FROM a2a_tasks WHERE context_id = ?)",
-        )
-        .bind(conversation_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DELETE FROM a2a_tasks WHERE context_id = ?")
-            .bind(conversation_id)
+        // The room's delivery tasks (claims first, then rows): the
+        // deterministic ids of this room's committed (message,
+        // recipient) pairs, plus any legacy row whose envelope names
+        // one of the room's messages.
+        for (message_id, recipient_peer) in &pairs {
+            let task_id = crate::tasks::delivery_task_id(message_id, recipient_peer);
+            sqlx::query("DELETE FROM delivery_claims WHERE task_id = ?")
+                .bind(&task_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM a2a_tasks WHERE task_id = ?")
+                .bind(&task_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for message_id in &message_ids {
+            let envelope = format!("%\"message_id\":\"{message_id}\"%");
+            let kind = "%\"kind\":\"delivery\"%";
+            sqlx::query(
+                "DELETE FROM delivery_claims WHERE task_id IN
+                   (SELECT task_id FROM a2a_tasks
+                    WHERE task_json LIKE ? AND task_json LIKE ?)",
+            )
+            .bind(&envelope)
+            .bind(kind)
             .execute(&mut *tx)
             .await?;
+            sqlx::query("DELETE FROM a2a_tasks WHERE task_json LIKE ? AND task_json LIKE ?")
+                .bind(&envelope)
+                .bind(kind)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query("DELETE FROM messages WHERE conversation_id = ?")
             .bind(conversation_id)
             .execute(&mut *tx)
@@ -297,8 +364,12 @@ impl Store {
     ///
     /// Nodes learn rooms from deliveries; this fills in the rest — the room set,
     /// its members, and the operator's name — so a room list agrees across
-    /// machines. It never deletes: a room the hub omits stays as the node last
-    /// knew it, because a node that missed one poll must not lose a transcript.
+    /// machines. Membership is AUTHORITATIVE: a member the hub omits was
+    /// removed and its local read/write grant is revoked here (H-12 —
+    /// a successful snapshot is a removal, not a fetch failure). Rooms
+    /// the hub omits stay as the node last knew them: a node that
+    /// missed one poll must not lose a transcript, and node-local rooms
+    /// are never touched.
     ///
     /// # Arguments
     ///
@@ -339,6 +410,27 @@ impl Store {
                 .bind(member)
                 .execute(&mut *tx)
                 .await?;
+            }
+            // The authoritative reconcile: local member rows the hub
+            // snapshot omits are revoked. Only rows this node itself
+            // knew are affected (membership rows reference enrolled
+            // peers), so unrelated state is never touched.
+            if conversation.members.is_empty() {
+                sqlx::query("DELETE FROM conversation_members WHERE conversation_id = ?")
+                    .bind(&conversation.id)
+                    .execute(&mut *tx)
+                    .await?;
+            } else {
+                let placeholders = vec!["?"; conversation.members.len()].join(",");
+                let sql = format!(
+                    "DELETE FROM conversation_members
+                     WHERE conversation_id = ? AND peer_id NOT IN ({placeholders})"
+                );
+                let mut query = sqlx::query(&sql).bind(&conversation.id);
+                for member in &conversation.members {
+                    query = query.bind(member);
+                }
+                query.execute(&mut *tx).await?;
             }
         }
         tx.commit().await?;

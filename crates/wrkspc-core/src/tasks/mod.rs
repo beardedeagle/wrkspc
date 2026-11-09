@@ -45,6 +45,12 @@ pub struct DeliveryTaskRequest<'a> {
     pub recipient_class: &'a str,
     /// The hub-committed message this delivery belongs to.
     pub message_id: &'a str,
+    /// The sender's own wire message id (the origin): for a message a
+    /// node propagated upward, this is the node's LOCAL message id. The
+    /// recipient node mirrors under this id, so a co-hosted echo maps
+    /// back onto the original local row instead of creating a second
+    /// message and execution intent. `None` for hub-originated posts.
+    pub origin_message_id: Option<&'a str>,
     /// The conversation the message belongs to.
     pub conversation_id: &'a str,
     /// The message's author.
@@ -91,4 +97,20 @@ pub(crate) fn task_row_from_sql(row: sqlx::sqlite::SqliteRow) -> TaskRow {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
+}
+
+/// The deterministic delivery-task id for a (message, recipient) pair.
+///
+/// Fan-out is idempotent because the id is a function of the committed
+/// message and recipient: re-queueing the same pair re-creates the
+/// SAME row (never a duplicate), so a partially completed fan-out — or
+/// a crash between acceptance and queueing — is repairable by simply
+/// re-running the fan-out (the hub does this on every send replay and
+/// once at startup).
+pub fn delivery_task_id(message_id: &str, recipient_peer: &str) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("{message_id}/{recipient_peer}").as_bytes(),
+    )
+    .to_string()
 }
