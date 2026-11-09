@@ -168,10 +168,12 @@ docs-serve:
 no-user-paths:
     #!/usr/bin/env bash
     set -euo pipefail
+    # Build the release profile with the gate's own remapped RUSTFLAGS
+    # (see the header export): the audit examines the artifact these
+    # flags produce, never a stale binary left by an ad-hoc build.
+    cargo +{{toolchain}} build --locked --release -p wrkspc-cli --bin wrkspc
     # The binary's real artifact path: a user-supplied CARGO_TARGET_DIR
     # must not leave this recipe scanning a stale default location.
-    # The recipe itself builds the release profile, so that is what it
-    # audits.
     profile_dir="release"
     if [ -n "${CARGO_TARGET_DIR:-}" ]; then
         binary="$CARGO_TARGET_DIR/$profile_dir/wrkspc"
