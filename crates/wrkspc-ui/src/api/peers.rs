@@ -130,7 +130,13 @@ pub(crate) async fn patch_peer(
             .store
             .set_peer_status(&id, parsed, "operator")
             .await
-            .map_err(store_error)?;
+            .map_err(|error| {
+                // A 500 body names the store error for the operator;
+                // log it server-side too so the diagnosis survives
+                // even where the response body is discarded.
+                tracing::error!(peer_id = %id, %error, "peer status change failed");
+                store_error(error)
+            })?;
         if !updated {
             return Err((
                 StatusCode::NOT_FOUND,

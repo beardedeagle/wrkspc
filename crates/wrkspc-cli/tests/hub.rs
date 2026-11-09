@@ -375,11 +375,16 @@ fn revocation_denies_the_next_request_on_a_pooled_connection() {
         .json(&serde_json::json!({ "status": "banned" }))
         .send()
         .unwrap();
+    // The response body carries the store error text on a 500; assert
+    // with it so a flake names its own cause instead of just a status.
+    let ban_status = ban.status();
+    let ban_body = ban.text().unwrap_or_default();
     assert_eq!(
-        ban.status().as_u16(),
+        ban_status.as_u16(),
         200,
-        "ban must succeed: {}",
-        ban.status()
+        "ban must succeed: {} {}",
+        ban_status,
+        ban_body
     );
 
     // The NEXT request over the pooled connection is denied by the
