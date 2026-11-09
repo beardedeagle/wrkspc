@@ -27,6 +27,29 @@ jobs:
         with:
           install-cargo-deny: "true"
           install-cargo-audit: "true"
+      # Hand-rolled cargo cache (the two-step split): the registry/git
+      # checkout cache and the per-job target cache are separate entries
+      # so target churn never evicts the registry. Official SHA-pinned
+      # actions only.
+      - name: Cache Cargo registry and tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache Cargo target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: target
+          key: ${{ runner.os }}-gate-target-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'Justfile', 'rust-toolchain.toml', '.github/workflows/release.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-gate-target-
+
       - name: just quality
         run: just quality
 
@@ -60,6 +83,28 @@ jobs:
           # and the zig/cargo-zigbuild provisioning in the action covers the
           # `just release-tarball` zigbuild call.
           targets: ${{ matrix.target == 'native' && '' || matrix.target }}
+      # Hand-rolled cargo cache (the two-step split): registry/git and
+      # the per-leg target cache as separate entries so target churn
+      # never evicts the registry. Official SHA-pinned actions only.
+      - name: Cache Cargo registry and tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache Cargo target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: target
+          key: ${{ runner.os }}-package-${{ matrix.name }}-target-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'Justfile', 'rust-toolchain.toml', '.github/workflows/release.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-package-${{ matrix.name }}-target-
+
       - name: build + tarball
         run: just release-tarball ${{ matrix.target }}
       # v7.0.2
