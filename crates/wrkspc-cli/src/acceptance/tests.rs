@@ -127,7 +127,7 @@ async fn accepted_events(store: &Store, conversation: &str) -> usize {
 #[tokio::test]
 async fn ejected_peer_send_is_refused_until_restored() {
     let (store, conversation) = seeded().await;
-    let identity = Some("CN=codex SAN=node-test-1");
+    let identity = Some("node-test-1");
     // Boot codex: its send is refused with a parseable envelope and
     // nothing commits.
     store
@@ -175,7 +175,7 @@ async fn attributed_send_commits_and_queues_remote_delivery() {
     // The operator (hub host) sends to codex on a remote host.
     let (status, body) = post(
         router,
-        Some("CN=node-local SAN=wrkspc-pilot-host"),
+        Some("wrkspc-pilot-host"),
         &send_body("m-1", &conversation, "operator", &["codex"]),
     )
     .await;
@@ -202,7 +202,7 @@ async fn attributed_send_commits_and_queues_remote_delivery() {
     let router = router_under_test(store.clone()).await;
     let (status, _) = post(
         router,
-        Some("CN=node-local SAN=wrkspc-pilot-host"),
+        Some("wrkspc-pilot-host"),
         &send_body("m-1", &conversation, "operator", &["codex"]),
     )
     .await;
@@ -242,7 +242,7 @@ async fn unaddressed_send_commits_and_wakes_nobody() {
 
     let (status, _) = post(
         router,
-        Some("CN=node-test-1 SAN=node-test-1"),
+        Some("node-test-1"),
         &send_body("m-nobody", &conversation, "codex", &[]),
     )
     .await;
@@ -268,7 +268,7 @@ async fn jsonrpc_error_envelope_is_not_translated() {
     // must honor that verdict instead of translating the send.
     let (status, body) = post_versioned(
         router,
-        Some("CN=node-local SAN=wrkspc-pilot-host"),
+        Some("wrkspc-pilot-host"),
         &send_body("m-noversion", &conversation, "operator", &["codex"]),
         None,
     )
@@ -290,7 +290,7 @@ async fn sender_asserted_from_wrong_host_is_rejected_before_acceptance() {
     // presented a certificate for node-test-1.
     let (status, body) = post(
         router,
-        Some("CN=node-test-1 SAN=node-test-1"),
+        Some("node-test-1"),
         &send_body("m-spoof", &conversation, "operator", &["codex"]),
     )
     .await;
@@ -328,7 +328,7 @@ async fn send_without_sender_metadata_is_rejected() {
         },
     })
     .to_string();
-    let (status, _) = post(router, Some("CN=node-local SAN=wrkspc-pilot-host"), &body).await;
+    let (status, _) = post(router, Some("wrkspc-pilot-host"), &body).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
     assert_eq!(accepted_events(&store, &conversation).await, 0);
 }
@@ -368,20 +368,14 @@ async fn replay_send_returns_parseable_success() {
     let router = router_under_test(store.clone()).await;
     let body = send_body("m-replay", &conversation, "codex", &["operator"]);
 
-    let (first_status, first_body) = post(
-        router.clone(),
-        Some("CN=node-test-1 SAN=node-test-1"),
-        &body,
-    )
-    .await;
+    let (first_status, first_body) = post(router.clone(), Some("node-test-1"), &body).await;
     assert_eq!(first_status, axum::http::StatusCode::OK);
     assert!(
         first_body.contains("\"result\""),
         "first send must carry a result member: {first_body}"
     );
 
-    let (second_status, second_body) =
-        post(router, Some("CN=node-test-1 SAN=node-test-1"), &body).await;
+    let (second_status, second_body) = post(router, Some("node-test-1"), &body).await;
     assert_eq!(second_status, axum::http::StatusCode::OK);
     let envelope: serde_json::Value =
         serde_json::from_str(&second_body).expect("replay response must be JSON");
@@ -393,4 +387,185 @@ async fn replay_send_returns_parseable_success() {
         envelope.get("result").is_some(),
         "replay must carry a parseable result: {second_body}"
     );
+}
+
+/// Seeds a delivery task in `host`'s queue on the shared store and
+/// returns its task id.
+async fn seeded_delivery(
+    store: &Store,
+    conversation: &str,
+    host: &str,
+    message_id: &str,
+) -> String {
+    store
+        .task_create_delivery(wrkspc_core::DeliveryTaskRequest {
+            recipient_host: host,
+            recipient_peer: "codex",
+            recipient_name: "codex",
+            recipient_class: "harness",
+            message_id,
+            origin_message_id: None,
+            conversation_id: conversation,
+            sender_peer: "operator",
+            sender_name: "operator",
+            sender_class: "human",
+            sender_host: wrkspc_core::PILOT_HOST_ID,
+            content: "private delivery content",
+            execution_requested: true,
+        })
+        .await
+        .unwrap()
+}
+
+/// C-1: task reads and cancels are scoped to the presenting host's own
+/// delivery queue. Another host's task — or any task under a foreign
+/// or missing context — is refused with a parseable JSON-RPC error
+/// envelope before the SDK handler ever sees it, and the refusal
+/// confirms nothing about the task's existence.
+#[tokio::test]
+async fn task_reads_and_cancels_are_scoped_to_the_presenting_host_queue() {
+    let (store, conversation) = seeded().await;
+    let foreign = seeded_delivery(&store, &conversation, "node-other", "msg-foreign").await;
+    let own = seeded_delivery(&store, &conversation, "node-test-1", "msg-own").await;
+    let router = router_under_test(store.clone()).await;
+
+    // GetTask/CancelTask/SubscribeToTask on another host's queue: 403
+    // with a parseable JSON-RPC error envelope.
+    for method in ["GetTask", "CancelTask", "SubscribeToTask"] {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": method,
+            "params": { "id": foreign },
+        })
+        .to_string();
+        let (status, text) = post(router.clone(), Some("node-test-1"), &body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "{method} on a foreign host's task"
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_str(&text).expect("rejection must be JSON");
+        assert!(
+            envelope.get("error").is_some(),
+            "{method} rejection must carry an error envelope: {text}"
+        );
+    }
+
+    // ListTasks with a foreign contextId — and with none at all — is
+    // refused: the queue name must be the presenting host.
+    for params in [
+        serde_json::json!({ "contextId": "node-other" }),
+        serde_json::json!({}),
+    ] {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "ListTasks",
+            "params": params,
+        })
+        .to_string();
+        let (status, _) = post(router.clone(), Some("node-test-1"), &body).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    // A nonexistent task id fails closed too: no existence oracle for
+    // other hosts' queues.
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "GetTask",
+        "params": { "id": "ghost-task" },
+    })
+    .to_string();
+    let (status, _) = post(router.clone(), Some("node-test-1"), &body).await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+
+    // The presenting host's OWN queue is served normally, and the
+    // foreign task remains untouched.
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "GetTask",
+        "params": { "id": own },
+    })
+    .to_string();
+    let (status, text) = post(router.clone(), Some("node-test-1"), &body).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let envelope: serde_json::Value = serde_json::from_str(&text).expect("response must be JSON");
+    assert!(
+        envelope.get("error").is_none(),
+        "own task must not error: {text}"
+    );
+    assert_eq!(envelope["result"]["id"], own);
+    assert!(
+        store.task_get(&foreign).await.unwrap().is_some(),
+        "the refused foreign task was never mutated"
+    );
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "ListTasks",
+        "params": { "contextId": "node-test-1" },
+    })
+    .to_string();
+    let (status, text) = post(router.clone(), Some("node-test-1"), &body).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(
+        text.contains("\"result\""),
+        "own queue list must carry a result: {text}"
+    );
+}
+
+/// C-1 (REST twin): the HTTP+JSON task routes enforce the same
+/// host-queue scoping as their JSON-RPC counterparts.
+#[tokio::test]
+async fn rest_task_routes_are_host_queue_scoped() {
+    let (store, conversation) = seeded().await;
+    let foreign = seeded_delivery(&store, &conversation, "node-other", "msg-rest-foreign").await;
+    let own = seeded_delivery(&store, &conversation, "node-test-1", "msg-rest-own").await;
+    let router = router_under_test(store.clone()).await;
+
+    let request = |method: &str, uri: String| {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-wrkspc-peer", "node-test-1")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+
+    let response = router
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/rest/tasks?contextId=node-other".to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+
+    let response = router
+        .clone()
+        .oneshot(request("GET", format!("/rest/tasks/{foreign}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+
+    let response = router
+        .clone()
+        .oneshot(request("POST", format!("/rest/tasks/{foreign}/cancel")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+
+    // The own queue passes through to the SDK.
+    let response = router
+        .clone()
+        .oneshot(request("GET", format!("/rest/tasks/{own}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
 }

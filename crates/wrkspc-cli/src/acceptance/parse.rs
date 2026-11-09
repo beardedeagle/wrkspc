@@ -76,8 +76,13 @@ pub(crate) fn parse_send(parsed: &serde_json::Value) -> Result<Option<ParsedSend
     }))
 }
 
-/// Extracts the host id from a stamped identity string of the form
-/// `CN=... SAN=node-<host-id>` (built by `wrkspc_a2a::peer_identity`).
+/// Returns the stamped host id.
+///
+/// The TLS accept loop stamps the certificate's FIRST DNS SAN alone as
+/// `x-wrkspc-peer` (built by `wrkspc_a2a::host_identity` from the parsed
+/// SAN extension — never from CN text). The header value is therefore
+/// already the authenticated host; this function only validates that it
+/// is non-empty.
 ///
 /// # Arguments
 ///
@@ -85,12 +90,8 @@ pub(crate) fn parse_send(parsed: &serde_json::Value) -> Result<Option<ParsedSend
 ///
 /// # Returns
 ///
-/// The first SAN value, or `None` when the identity carries no SAN.
+/// The host id, or `None` when the stamp is empty.
 pub(crate) fn host_from_identity(identity: &str) -> Option<String> {
-    let san = identity.split("SAN=").nth(1)?;
-    san.split(',')
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+    let host = identity.trim();
+    (!host.is_empty()).then(|| host.to_string())
 }

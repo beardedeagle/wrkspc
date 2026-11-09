@@ -1,5 +1,6 @@
 //! Moderation-gate recovery drills: serialization, cancel, held
 //! durability, and the mid-flight fence race (checks 3, 6, 7, 13).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 use common::*;

@@ -17,7 +17,7 @@ pub mod presence;
 mod tests;
 
 pub use client::{build_hub_client, build_hub_client_with_timeout};
-pub use delivery::{Delivery, PollOutcome, process_deliveries};
+pub use delivery::{ClaimOutcome, Delivery, PollOutcome, process_deliveries};
 pub(crate) use outbound::sync_outbound;
 pub use poll_loop::{PollLoopConfig, run_poll_loop};
 pub use presence::{PresenceDecl, PresenceSource};

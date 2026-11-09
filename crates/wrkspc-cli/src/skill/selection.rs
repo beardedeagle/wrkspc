@@ -99,9 +99,10 @@ pub(crate) fn select_install_targets(
     let detected = detect(home);
     for (index, entry) in detected.iter().enumerate() {
         let marker = match status(home, entry) {
-            SkillStatus::Installed => " [installed]",
-            SkillStatus::Stale => " [stale]",
-            SkillStatus::Missing => "",
+            Ok(SkillStatus::Installed) => " [installed]",
+            Ok(SkillStatus::Stale) => " [stale]",
+            Ok(SkillStatus::Missing) => "",
+            Err(_) => " [unreadable]",
         };
         writeln!(output, "{:>2}. {}{}", index + 1, entry.name, marker)?;
     }

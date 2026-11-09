@@ -6,13 +6,18 @@
 //! override so the platform secret store (macOS Keychain) is never
 //! touched by tests. Scratch dirs survive when `WRKSPC_KEEP_DRILL`
 //! is set.
+//!
+//! The helpers below are consumed by whichever drill needs them —
+//! each integration-test binary compiles this module on its own, so a
+//! helper unused by one binary reads as dead code there.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// A spawned wrkspc node, killed on drop.
-pub struct NodeProc(Child);
+pub struct NodeProc(pub Child);
 
 impl Drop for NodeProc {
     fn drop(&mut self) {

@@ -180,17 +180,24 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
         let home = std::path::PathBuf::from(home);
         for entry in crate::skill::detect(&home) {
             match crate::skill::status(&home, entry) {
-                crate::skill::SkillStatus::Installed => {}
-                crate::skill::SkillStatus::Stale => {
+                Ok(crate::skill::SkillStatus::Installed) => {}
+                Ok(crate::skill::SkillStatus::Stale) => {
                     tracing::warn!(
                         harness = entry.name,
                         "wrkspc skill is stale; run `wrkspc skill install`"
                     );
                 }
-                crate::skill::SkillStatus::Missing => {
+                Ok(crate::skill::SkillStatus::Missing) => {
                     tracing::warn!(
                         harness = entry.name,
                         "wrkspc skill is not installed; run `wrkspc skill install` before starting conversations"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        harness = entry.name,
+                        %error,
+                        "wrkspc skill state could not be read"
                     );
                 }
             }
@@ -205,6 +212,7 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
             token: Some(token),
             queue_remote_deliveries: false,
             hub_role: false,
+            hub_connected: args.hub.is_some(),
         },
         None,
     );
@@ -213,16 +221,15 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
 
     let a2a_task = match args.a2a {
         Some(addr) => {
+            // Bind BEFORE announcing readiness: a requested A2A endpoint
+            // that cannot bind must not leave the node looking ready
+            // (E12).
+            let listener = TcpListener::bind(&addr)
+                .await
+                .map_err(|error| format!("A2A bind on {addr} failed before startup: {error}"))?;
             let store = store.clone();
             let mut rx = shutdown_rx.clone();
             Some(tokio::spawn(async move {
-                let listener = match TcpListener::bind(&addr).await {
-                    Ok(listener) => listener,
-                    Err(error) => {
-                        tracing::error!(%error, "A2A bind failed");
-                        return;
-                    }
-                };
                 let surface = wrkspc_a2a::A2aSurface::new(store);
                 let _ = surface
                     .serve(listener, async move {
@@ -307,13 +314,26 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
     tracing::info!("shutdown requested");
     let _ = shutdown_tx.send(true);
 
-    let _ = dispatcher_task.await;
+    // Component supervision at teardown: the dispatcher's result is
+    // observed (a restart reconciliation failure is surfaced, never
+    // silently discarded — E12), and the readiness marker is removed so
+    // a stale marker can never outlive this process.
+    match dispatcher_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "dispatcher exited with an error"),
+        Err(error) => tracing::warn!(%error, "dispatcher task aborted"),
+    }
     let _ = ui_task.await;
     if let Some(task) = poll_task {
         let _ = task.await;
     }
     if let Some(task) = a2a_task {
         let _ = task.await;
+    }
+    if let Err(error) = tokio::fs::remove_file(format!("{}.ready", db.display())).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%error, "readiness marker removal failed");
     }
     Ok(())
 }

@@ -64,7 +64,12 @@ pub fn platform_store() -> Box<dyn TokenStore> {
 ///
 /// # Errors
 ///
-/// Returns the store's own error, or the timeout message.
+/// Returns the store's own error. A TIMEOUT ENDS THE PROCESS (CU-01):
+/// a started blocking task cannot be aborted and the runtime would
+/// otherwise wait on it indefinitely at shutdown, defeating the
+/// service's retry loop. The error is reported and the process exits
+/// immediately — the service manager restarts it, and the next start
+/// re-uses the now-answered dialog.
 async fn bounded_store_op<T, F>(label: &str, operation: F) -> Result<T, String>
 where
     T: Send + 'static,
@@ -78,9 +83,72 @@ where
     {
         Ok(Ok(result)) => result,
         Ok(Err(join_error)) => Err(format!("{label} failed: {join_error}")),
-        Err(_) => Err(format!(
-            "{label} timed out — a macOS keychain approval dialog may be pending; answer it or set WRKSPC_UI_TOKEN"
-        )),
+        Err(_) => {
+            tracing::error!(
+                "{label} timed out — a macOS keychain approval dialog may be pending; answer it or set WRKSPC_UI_TOKEN; exiting so the service can restart"
+            );
+            // Flush the tracing layer so the message survives the exit.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Loads a legacy `<db>.ui-token` file for migration. A symlink or a
+/// non-regular file is refused, never followed (CU-05: only the
+/// intended plaintext file may be consumed).
+async fn load_legacy_token_file(path: &std::path::Path) -> Result<Option<String>, String> {
+    let meta = match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "cannot stat legacy token file {}: {e}",
+                path.display()
+            ));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        tracing::warn!(
+            "legacy token path {} is not a regular file — leaving it alone",
+            path.display()
+        );
+        return Ok(None);
+    }
+    let contents = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| format!("cannot read legacy token file {}: {e}", path.display()))?;
+    let token = contents.trim().to_string();
+    Ok((!token.is_empty()).then_some(token))
+}
+
+/// Removes the legacy plaintext token file, but ONLY when it still
+/// holds the value now stored elsewhere (CU-05): a file that changed
+/// since migration is left alone with a warning, and every failure —
+/// stat, read, mismatch, removal — is logged, never silent.
+async fn cleanup_legacy_token_file(path: &std::path::Path, stored: &str) {
+    let Some(current) = (match load_legacy_token_file(path).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "legacy token cleanup failed");
+            return;
+        }
+    }) else {
+        // Already gone (or refused as a link) — nothing to do.
+        return;
+    };
+    if current != stored {
+        tracing::warn!(
+            "legacy token file {} holds a different value than the store — leaving it for the operator to inspect",
+            path.display()
+        );
+        return;
+    }
+    if let Err(error) = tokio::fs::remove_file(path).await {
+        tracing::warn!(
+            %error,
+            "legacy token file cleanup failed — the credential remains on disk; it will be retried on the next start"
+        );
     }
 }
 
@@ -107,26 +175,29 @@ pub async fn resolve_ui_token(identity: &str, db: &Path) -> Result<String, Strin
         return Ok(token);
     }
     let account = token_account(identity, db);
+    let legacy = std::path::PathBuf::from(format!("{}.ui-token", db.display()));
     if let Some(token) =
         bounded_store_op("keychain read", move || platform_store().load(&account)).await?
     {
+        // Retry the legacy-file cleanup on EVERY start (CU-05): a
+        // previous migration whose deletion failed (read-only
+        // directory) must not leave the live credential on disk
+        // forever — the Keychain-hit return used to precede all
+        // cleanup, so the failure was never revisited.
+        cleanup_legacy_token_file(&legacy, &token).await;
         return Ok(token);
     }
     // Migrate a legacy plaintext file into the platform store, then
     // remove it so the token never lingers on disk in the clear.
-    let legacy = std::path::PathBuf::from(format!("{}.ui-token", db.display()));
-    if let Ok(contents) = tokio::fs::read_to_string(&legacy).await {
-        let token = contents.trim().to_string();
-        if !token.is_empty() {
-            let stored = token.clone();
-            let account = token_account(identity, db);
-            bounded_store_op("keychain write", move || {
-                platform_store().store(&account, &stored)
-            })
-            .await?;
-            let _ = tokio::fs::remove_file(&legacy).await;
-            return Ok(token);
-        }
+    if let Some(token) = load_legacy_token_file(&legacy).await? {
+        let stored = token.clone();
+        let account = token_account(identity, db);
+        bounded_store_op("keychain write", move || {
+            platform_store().store(&account, &stored)
+        })
+        .await?;
+        cleanup_legacy_token_file(&legacy, &token).await;
+        return Ok(token);
     }
     // Migrate a database-path-keyed Keychain entry (pre-host-identity
     // builds) into the node-named entry, then drop the old one.
@@ -164,6 +235,16 @@ pub async fn resolve_ui_token(identity: &str, db: &Path) -> Result<String, Strin
         platform_store().store(&account, &stored)
     })
     .await?;
+    // A concurrent first-start may have won the create race: the
+    // STORED value is the credential the UI will accept, so it is
+    // what this caller reports (CU-02 — every caller agrees on one
+    // stable value).
+    let account = token_account(identity, db);
+    if let Some(existing) =
+        bounded_store_op("keychain read", move || platform_store().load(&account)).await?
+    {
+        return Ok(existing);
+    }
     Ok(token)
 }
 
@@ -228,8 +309,37 @@ pub async fn run_ui_token(
     node: Option<String>,
     db: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let account =
-        resolve_ui_token_account(node, db).map_err(Into::<Box<dyn std::error::Error>>::into)?;
+    // The environment override has the SAME precedence here as at
+    // runtime (CU-06): with WRKSPC_UI_TOKEN set, that token is the
+    // active credential and is copied/reported AS SUCH — the stored
+    // entry is never presented as authoritative, and the override is
+    // never written into persistent storage as a side effect.
+    if let Some(override_token) = std::env::var("WRKSPC_UI_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+    {
+        #[cfg(target_os = "macos")]
+        {
+            let scheduled = copy_to_clipboard(&override_token)?;
+            println!(
+                "the active token (from WRKSPC_UI_TOKEN) was copied to the clipboard — {}",
+                clear_promise(scheduled)
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // The token value itself is never printed: it is a
+            // credential, and the message reports only its SOURCE.
+            let _ = override_token;
+            println!(
+                "the active token comes from the WRKSPC_UI_TOKEN environment override (no stored file is authoritative while it is set)"
+            );
+        }
+        return Ok(());
+    }
+    let account = resolve_ui_token_account(node, db)
+        .await
+        .map_err(Into::<Box<dyn std::error::Error>>::into)?;
     #[cfg(target_os = "macos")]
     {
         let account_for_load = account.clone();
@@ -238,37 +348,10 @@ pub async fn run_ui_token(
         })
         .await?
         .ok_or_else(|| format!("no UI token stored for {} — start the node first", account))?;
-        use std::io::Write;
-        let mut child = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("cannot spawn pbcopy: {error}"))?;
-        child
-            .stdin
-            .take()
-            .expect("piped stdin was requested")
-            .write_all(token.as_bytes())?;
-        child.wait()?;
-        // The clearer only wipes the clipboard when it still holds OUR
-        // token — anything the operator copied after the token stays
-        // untouched. The token rides the pipe (never an argv, never a
-        // temp file): the child sleeps 30s, then compares the current
-        // pasteboard against the pipe and clears only on a match.
-        let mut clearer = std::process::Command::new("sh")
-            .args([
-                "-c",
-                "sleep 30; [ \"$(pbpaste)\" = \"$(cat)\" ] && pbcopy < /dev/null",
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok();
-        if let Some(mut stdin) = clearer.as_mut().and_then(|child| child.stdin.take()) {
-            let _ = stdin.write_all(token.as_bytes());
-        }
+        let scheduled = copy_to_clipboard(&token)?;
         println!(
-            "token copied to the clipboard — it clears itself in 30s (only if it's still the token); paste it into the wrkspc login screen"
+            "token copied to the clipboard — {}; paste it into the wrkspc login screen",
+            clear_promise(scheduled)
         );
     }
     #[cfg(not(target_os = "macos"))]
@@ -289,6 +372,77 @@ pub async fn run_ui_token(
     Ok(())
 }
 
+/// The self-clear promise, phrased only when it was actually
+/// scheduled (CU-07): a copy whose clearer failed must not advertise
+/// an automatic clear that will never run.
+#[cfg(target_os = "macos")]
+fn clear_promise(scheduled: bool) -> &'static str {
+    if scheduled {
+        "it clears itself in 30s (only if it's still the token)"
+    } else {
+        "NOTE: the automatic 30s clear could not be scheduled — clear the clipboard manually after pasting"
+    }
+}
+
+/// Copies a token into the pasteboard through `pbcopy` and schedules
+/// the 30-second self-clear — reporting the ACTUAL outcomes (CU-07):
+/// a failing copy is an error, and the caller learns whether the
+/// self-clear was actually scheduled.
+#[cfg(target_os = "macos")]
+fn copy_to_clipboard(token: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot spawn pbcopy: {error}"))?;
+    // Stdio::piped() was requested above, so the handle is present by
+    // construction; a missing handle is reported as an error, never a
+    // panic.
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or("piped stdin was requested but not provided")?;
+    stdin.write_all(token.as_bytes())?;
+    // Close the pipe BEFORE waiting: pbcopy drains stdin to EOF, and
+    // an open handle here deadlocks the wait forever.
+    drop(stdin);
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(format!("pbcopy failed with {status} — the token was NOT copied").into());
+    }
+    // The clearer only wipes the clipboard when it still holds OUR
+    // token — anything the operator copied after the token stays
+    // untouched. The token rides the pipe (never an argv, never a
+    // temp file): the child sleeps 30s, then compares the current
+    // pasteboard against the pipe and clears only on a match.
+    let clearer = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "sleep 30; [ \"$(pbpaste)\" = \"$(cat)\" ] && pbcopy < /dev/null",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match clearer {
+        Ok(mut clearer) => {
+            if let Some(mut stdin) = clearer.stdin.take()
+                && stdin.write_all(token.as_bytes()).is_err()
+            {
+                tracing::warn!(
+                    "could not hand the token to the clipboard clearer — the clipboard will not self-clear"
+                );
+                return Ok(false);
+            }
+            Ok(true)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not schedule the clipboard clearer — the clipboard will not self-clear");
+            Ok(false)
+        }
+    }
+}
+
 /// Resolves which stored token `wrkspc ui-token` should copy. With an
 /// explicit `--node`, the account is that node's Keychain name. Without
 /// one, the keychain is enumerated: a single stored token is used
@@ -303,14 +457,19 @@ pub async fn run_ui_token(
 ///
 /// Returns the missing/ambiguous-token message.
 #[cfg(target_os = "macos")]
-fn resolve_ui_token_account(
+async fn resolve_ui_token_account(
     node: Option<String>,
     db: Option<std::path::PathBuf>,
 ) -> Result<String, String> {
     let _ = db;
     match node {
         Some(node) => Ok(ui_token_account(&node)),
-        None => match keychain_accounts("wrkspc")?.as_slice() {
+        // Enumeration is a Keychain operation and gets the SAME
+        // process-bounding timeout as every other store call (CU-01).
+        None => match bounded_store_op("keychain search", move || keychain_accounts("wrkspc"))
+            .await?
+            .as_slice()
+        {
             [] => Err("no wrkspc UI token stored — start the node first".to_string()),
             [single] => Ok(single.clone()),
             many => {
@@ -330,7 +489,7 @@ fn resolve_ui_token_account(
 /// Non-macOS: the account is the 0600 token file next to the database
 /// (`node.db` in the current directory by default).
 #[cfg(not(target_os = "macos"))]
-fn resolve_ui_token_account(
+async fn resolve_ui_token_account(
     node: Option<String>,
     db: Option<std::path::PathBuf>,
 ) -> Result<String, String> {
@@ -402,6 +561,17 @@ fn keychain_accounts(service: &str) -> Result<Vec<String>, String> {
 #[cfg(target_os = "macos")]
 impl TokenStore for KeychainStore {
     fn load(&self, account: &str) -> Result<Option<String>, String> {
+        // Test seam (CU-01): debug builds honor
+        // WRKSPC_TEST_KEYCHAIN_BLOCK_MS so the process-exit bound is
+        // testable without a real approval dialog. Release binaries
+        // never carry the branch.
+        #[cfg(debug_assertions)]
+        if let Some(millis) = std::env::var("WRKSPC_TEST_KEYCHAIN_BLOCK_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(millis));
+        }
         match security_framework::passwords::get_generic_password(self.service, account) {
             Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
             Err(error) if error.code() == security_framework_sys::base::errSecItemNotFound => {
@@ -434,42 +604,51 @@ struct FileStore;
 impl TokenStore for FileStore {
     fn load(&self, account: &str) -> Result<Option<String>, String> {
         let path = std::path::PathBuf::from(account);
-        match std::fs::read_to_string(&path) {
-            Ok(token) if !token.trim().is_empty() => Ok(Some(token.trim().to_string())),
-            Ok(_) => Ok(None),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(format!("cannot read {path:?}: {error}")),
-        }
+        // The audited helper (CU-02): symlinks refused, foreign
+        // owners refused, permissive modes tightened, read errors
+        // reported — never folded into "absent, generate".
+        crate::util::load_existing_token_sync(&path)
     }
 
     fn store(&self, account: &str, token: &str) -> Result<(), String> {
         let path = std::path::PathBuf::from(account);
-        // Mode 0600 at open: the credential must never exist world-
-        // readable, not even between a write and a later chmod.
-        #[cfg(unix)]
-        let mut file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)
-                .map_err(|error| format!("cannot open {path:?}: {error}"))?
-        };
-        #[cfg(not(unix))]
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .map_err(|error| format!("cannot open {path:?}: {error}"))?;
-        {
-            use std::io::Write;
-            file.write_all(token.as_bytes())
-                .map_err(|error| format!("cannot write {path:?}: {error}"))?;
+        // Reuse the audited create path (CU-02): O_NOFOLLOW, 0600 at
+        // open, synced before returning, symlink/owner/mode policy on
+        // the pre-existing file; an existing stable value WINS — the
+        // store never rotates a token another caller already wrote.
+        if crate::util::load_existing_token_sync(&path)?.is_some() {
+            return Ok(());
         }
-        Ok(())
+        let mut options = std::fs::OpenOptions::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.write(true).create_new(true).mode(0o600);
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        options.write(true).create_new(true);
+        match options.open(&path) {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(token.as_bytes())
+                    .map_err(|e| format!("cannot write {path:?}: {e}"))?;
+                file.sync_all()
+                    .map_err(|e| format!("cannot sync {path:?}: {e}"))?;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A concurrent creator won: its value stands.
+                if crate::util::load_existing_token_sync(&path)?.is_some() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "token file {path:?} appeared during creation — refusing to rotate it"
+                    ))
+                }
+            }
+            Err(e) => Err(format!("cannot create {path:?}: {e}")),
+        }
     }
 
     fn delete(&self, account: &str) -> Result<(), String> {

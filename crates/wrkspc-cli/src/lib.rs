@@ -8,11 +8,13 @@
 //! The library target exposes the role modules so integration tests can
 //! drive the real poll client and hub wiring; the binary is a thin
 //! entrypoint over it.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod acceptance;
 pub mod bindings;
 pub mod bridge;
 pub mod delivery;
+pub mod harden;
 pub mod hub;
 pub mod node;
 pub mod poll;
@@ -80,7 +82,10 @@ pub enum SkillCommand {
         #[arg(long)]
         harness: Option<Vec<String>>,
         /// Install into every detected harness without prompting.
-        #[arg(long)]
+        /// Conflicts with `--harness`: the previous silent precedence
+        /// (explicit list wins, `--all` ignored) looked like an all-
+        /// target install while skipping everything else (CU-12).
+        #[arg(long, conflicts_with = "harness")]
         all: bool,
     },
     /// Removes the skill and the wrkspc-marked sections added by

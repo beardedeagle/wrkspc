@@ -1,6 +1,7 @@
 //! Installer integration tests against a synthetic `$HOME`: install,
 //! uninstall, and status must be idempotent, wrkspc-marked, and never
 //! disturb user content outside the marked sections.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::Path;
 
@@ -69,7 +70,10 @@ fn install_is_idempotent_and_refresh_updates_stale_skill() {
     // Tamper with the skill; the next install refreshes it.
     let skill_file = home.join(".codex/skills/wrkspc/SKILL.md");
     std::fs::write(&skill_file, "stale").expect("tamper");
-    assert_eq!(skill::status(&home, entry("codex")), SkillStatus::Stale);
+    assert_eq!(
+        skill::status(&home, entry("codex")).unwrap(),
+        SkillStatus::Stale
+    );
     assert_eq!(
         skill::install(&home, entry("codex")).expect("refresh"),
         InstallOutcome::Refreshed
@@ -78,7 +82,10 @@ fn install_is_idempotent_and_refresh_updates_stale_skill() {
         std::fs::read_to_string(&skill_file).expect("skill file"),
         skill::SKILL_MD
     );
-    assert_eq!(skill::status(&home, entry("codex")), SkillStatus::Installed);
+    assert_eq!(
+        skill::status(&home, entry("codex")).unwrap(),
+        SkillStatus::Installed
+    );
 }
 
 /// An unreadable pointer file is an error, never an empty file: the
@@ -123,7 +130,10 @@ fn uninstall_removes_exactly_what_install_added() {
         "# My notes\n",
         "user content restored untouched"
     );
-    assert_eq!(skill::status(&home, entry("codex")), SkillStatus::Missing);
+    assert_eq!(
+        skill::status(&home, entry("codex")).unwrap(),
+        SkillStatus::Missing
+    );
     assert_eq!(
         skill::uninstall(&home, entry("codex")).expect("second uninstall"),
         UninstallOutcome::NothingToRemove
@@ -219,11 +229,148 @@ fn status_reports_missing_for_absent_harness_files() {
     let home = temp_home("status");
     std::fs::create_dir_all(home.join(".claude")).expect("claude dir");
     assert_eq!(
-        skill::status(&home, entry("claude-code")),
+        skill::status(&home, entry("claude-code")).unwrap(),
         SkillStatus::Missing
     );
     assert_eq!(
-        skill::status(Path::new("/nonexistent-wrkspc-home"), entry("gemini-cli")),
+        skill::status(Path::new("/nonexistent-wrkspc-home"), entry("gemini-cli")).unwrap(),
         SkillStatus::Missing
     );
+}
+
+/// CU-09: a read failure (directory in place of the skill file) is
+/// EXPOSED, never collapsed into Missing.
+#[test]
+fn status_reports_unreadable_instead_of_missing() {
+    let home = temp_home("unreadable");
+    let skill_file = home.join(".claude/skills/wrkspc/SKILL.md");
+    std::fs::create_dir_all(skill_file.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&skill_file).unwrap(); // a DIRECTORY where the file goes
+    let error = skill::status(&home, entry("claude-code")).unwrap_err();
+    assert!(!error.is_empty());
+}
+
+/// CU-04: installing through a symlinked SKILL leaf is refused and
+/// the link's target is untouched.
+#[test]
+fn install_refuses_a_symlinked_skill_leaf() {
+    let home = temp_home("symlink-leaf");
+    let skill_file = home.join(".claude/skills/wrkspc/SKILL.md");
+    std::fs::create_dir_all(skill_file.parent().unwrap()).unwrap();
+    let victim = home.join("victim.md");
+    std::fs::write(&victim, "unrelated user text").unwrap();
+    std::os::unix::fs::symlink(&victim, &skill_file).unwrap();
+
+    let error = skill::install(&home, entry("claude-code")).unwrap_err();
+    assert!(error.to_string().contains("symlink"), "got: {error}");
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "unrelated user text",
+        "the link target must not be replaced"
+    );
+}
+
+/// CU-04: uninstalling through a symlinked parent directory is
+/// refused, never followed.
+#[test]
+fn uninstall_refuses_a_symlinked_skill_directory() {
+    let home = temp_home("symlink-dir");
+    std::fs::create_dir_all(home.join(".claude/skills")).unwrap();
+    let outside = temp_home("outside-dir");
+    std::fs::create_dir_all(outside.join("skills/wrkspc")).unwrap();
+    std::fs::write(outside.join("skills/wrkspc/SKILL.md"), skill::SKILL_MD).unwrap();
+    std::os::unix::fs::symlink(
+        outside.join("skills/wrkspc"),
+        home.join(".claude/skills/wrkspc"),
+    )
+    .unwrap();
+
+    let error = skill::uninstall(&home, entry("claude-code")).unwrap_err();
+    assert!(
+        error.to_string().contains("resolves outside"),
+        "got: {error}"
+    );
+    assert!(
+        outside.join("skills/wrkspc/SKILL.md").exists(),
+        "the external target must survive"
+    );
+}
+
+/// The physical skill target two entries share (reconstructed from
+/// the public registry fields — the same formula the installer uses).
+fn physical_target(home: &Path, entry: &wrkspc_cli::skill::HarnessEntry) -> std::path::PathBuf {
+    home.join(entry.skills_dir).join("wrkspc").join("SKILL.md")
+}
+
+/// CU-08: uninstalling one harness whose skill path is shared is
+/// refused with the affected harnesses named.
+#[tokio::test]
+async fn shared_skill_uninstall_is_refused_when_partial() {
+    let home = temp_home("shared-uninstall");
+    // Find two registry entries sharing one skill path.
+    let sharers: Vec<&wrkspc_cli::skill::HarnessEntry> = wrkspc_cli::skill::HARNESSES
+        .iter()
+        .filter(|entry| {
+            wrkspc_cli::skill::HARNESSES.iter().any(|other| {
+                other.id != entry.id
+                    && physical_target(&home, other) == physical_target(&home, entry)
+            })
+        })
+        .collect();
+    let first = sharers[0];
+    let sharer_ids: Vec<&str> = wrkspc_cli::skill::HARNESSES
+        .iter()
+        .filter(|other| {
+            other.id != first.id && physical_target(&home, other) == physical_target(&home, first)
+        })
+        .map(|other| other.id)
+        .collect();
+    assert!(
+        !sharer_ids.is_empty(),
+        "the registry must contain shared paths"
+    );
+
+    // Install the shared copy, then attempt a partial uninstall: it
+    // must be refused with the affected harnesses named.
+    skill::install(&home, first).unwrap();
+    let error = wrkspc_cli::skill::run_skill(wrkspc_cli::SkillCommand::Uninstall {
+        harness: Some(vec![first.id.to_string()]),
+    })
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("shared"), "got: {error}");
+    for id in &sharer_ids {
+        assert!(
+            error.to_string().contains(*id),
+            "the refusal must name {}: {error}",
+            id
+        );
+    }
+}
+
+/// A pointer write that fails AFTER the skill copy succeeded rolls the
+/// copy back: an install must never persist a half-install (new skill,
+/// missing pointer). The prior skill content is restored byte-for-byte.
+#[test]
+fn pointer_failure_rolls_the_skill_copy_back() {
+    let home = temp_home("rollback");
+    std::fs::create_dir_all(home.join(".codex/skills/wrkspc")).unwrap();
+    let skill_file = home.join(".codex/skills/wrkspc/SKILL.md");
+    std::fs::write(&skill_file, "user's own skill content").unwrap();
+    // The pointer's parent becomes read-only: the skill copy writes
+    // fine (its own directory stays writable), the AGENTS.md write
+    // fails.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(home.join(".codex"), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let error = skill::install(&home, entry("codex")).unwrap_err();
+    assert!(!error.to_string().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(&skill_file).unwrap(),
+        "user's own skill content",
+        "the failed install must restore the prior skill copy"
+    );
+
+    // Restore permissions so cleanup can remove the scratch dir.
+    std::fs::set_permissions(home.join(".codex"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }

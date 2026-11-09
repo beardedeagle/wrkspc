@@ -1,6 +1,7 @@
 //! Smoke tests for the wrkspc binary: the subcommand surface parses and
 //! help text renders. Component behavior is covered by the crate-level
 //! integration tests; these prove the CLI shell is intact.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use assert_cmd::Command;
 
@@ -48,4 +49,25 @@ fn version_and_help_render() {
     assert!(stdout.contains("--tls-ca"), "got: {stdout}");
     assert!(stdout.contains("--revoke-list"), "got: {stdout}");
     assert!(stdout.contains("--a2a-addr-file"), "got: {stdout}");
+}
+
+/// CU-12: `--all` and `--harness` conflict at parse time — the
+/// previous silent precedence (explicit list wins, --all ignored) is
+/// now a loud refusal.
+#[test]
+fn all_and_harness_conflict_at_parse_time() {
+    use clap::Parser;
+    let error = wrkspc_cli::Cli::try_parse_from([
+        "wrkspc",
+        "skill",
+        "install",
+        "--all",
+        "--harness",
+        "codex",
+    ])
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("cannot be used with"),
+        "the conflict must be reported: {error}"
+    );
 }

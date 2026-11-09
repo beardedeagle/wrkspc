@@ -3,6 +3,7 @@
 //!
 //! The TLS handshake contract itself is tested in `wrkspc-a2a`; these
 //! tests prove the CLI wiring: flags → acceptor → per-connection policy.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -291,4 +292,148 @@ fn mtls_hub_requests_certs_and_route_gates_the_bare_client() {
         tls_card(&hub.addr, &ca, Some(&client)).is_err(),
         "the deny-list must drop the listed identity"
     );
+}
+
+/// Revocation bites an ESTABLISHED connection: the deny gate is
+/// per-request (H-11), so banning a peer denies its NEXT request over
+/// the same pooled connection — not just fresh handshakes.
+#[test]
+fn revocation_denies_the_next_request_on_a_pooled_connection() {
+    let pki_dir = scratch_dir("pki");
+    // The serial is exercised implicitly: the final 403 proves the
+    // deny gate matched THIS certificate's serial against the live
+    // revocation set — not merely the peer id.
+    let (ca, cert, key, client, _serial) = write_pki(&pki_dir);
+    let ca_s = ca.to_str().unwrap().to_string();
+    let cert_s = cert.to_str().unwrap().to_string();
+    let key_s = key.to_str().unwrap().to_string();
+
+    let dir = scratch_dir("pooled-revocation");
+    // Seed the peer row BEFORE the hub starts (a card GET does not
+    // enroll): the ban revokes by peer, and the first cert-bearing
+    // request records the host-level serial the ban falls back to.
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = wrkspc_core::Store::open(&dir.join("hub.db"), "pooled-seed")
+                .await
+                .unwrap();
+            // The peer enrolls ON the host the certificate presents
+            // (the SAN), so the ban's host-level serial fallback can
+            // find the serial the handshake recorded.
+            store
+                .ensure_peer_on_host("node-hubtest", "node-hubtest", "harness", "node-hubtest")
+                .await
+                .unwrap();
+            store.release_lock().await.unwrap();
+        });
+    }
+    let hub = spawn_hub(
+        &[
+            "--tls-cert",
+            &cert_s,
+            "--tls-key",
+            &key_s,
+            "--tls-ca",
+            &ca_s,
+        ],
+        &dir,
+        "hub.db",
+    );
+
+    // One client for BOTH requests: reqwest keeps the connection
+    // pooled, so the second request reuses the first one's TCP/TLS
+    // session.
+    let pem = std::fs::read(&client).unwrap();
+    let client_http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .identity(reqwest::Identity::from_pem(&pem).unwrap())
+        .add_root_certificate(reqwest::Certificate::from_pem(&std::fs::read(&ca).unwrap()).unwrap())
+        .build()
+        .unwrap();
+    let url = format!("https://{}/.well-known/agent-card.json", hub.addr);
+    assert_eq!(
+        client_http.get(&url).send().unwrap().status().as_u16(),
+        200,
+        "first presence is served"
+    );
+
+    // Ban the peer through the operator UI. The hub runs with the
+    // pinned test token (spawn_hub sets WRKSPC_UI_TOKEN so the
+    // platform secret store is never touched).
+    let token = "wrkspc-test-token";
+    let ban = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .patch(format!("https://{}/api/peers/node-hubtest", hub.addr))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "status": "banned" }))
+        .send()
+        .unwrap();
+    assert_eq!(
+        ban.status().as_u16(),
+        200,
+        "ban must succeed: {}",
+        ban.status()
+    );
+
+    // The NEXT request over the pooled connection is denied by the
+    // per-request gate — the serial {serial} is in the live deny set.
+    assert_eq!(
+        client_http.get(&url).send().unwrap().status().as_u16(),
+        403,
+        "the pooled connection must be denied after the ban"
+    );
+}
+
+/// Sends a bare (cert-less) GET to the A2A subtree with a forged
+/// `x-wrkspc-peer` stamp header.
+fn tls_forged_stamp(addr: &str, ca: &PathBuf, forged: &str) -> Result<u16, String> {
+    let builder = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(10))
+        .add_root_certificate(reqwest::Certificate::from_pem(&std::fs::read(ca).unwrap()).unwrap());
+    let client = builder.build().map_err(|e| e.to_string())?;
+    let url = format!("https://{addr}/roster");
+    match client.get(&url).header("x-wrkspc-peer", forged).send() {
+        Ok(response) => Ok(response.status().as_u16()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// C-3: a client-supplied `x-wrkspc-peer` header never survives the
+/// accept loop — a cert-less connection carrying a forged stamp is
+/// refused on the A2A routes exactly like any bare client.
+#[test]
+fn forged_peer_stamp_is_cleared_for_certless_connections() {
+    let pki_dir = scratch_dir("pki-forged");
+    let (ca, cert, key, _client, _serial) = write_pki(&pki_dir);
+    let ca_s = ca.to_str().unwrap().to_string();
+    let cert_s = cert.to_str().unwrap().to_string();
+    let key_s = key.to_str().unwrap().to_string();
+
+    let dir = scratch_dir("mtls-forged");
+    let hub = spawn_hub(
+        &[
+            "--tls-cert",
+            &cert_s,
+            "--tls-key",
+            &key_s,
+            "--tls-ca",
+            &ca_s,
+        ],
+        &dir,
+        "hub.db",
+    );
+    assert_eq!(
+        tls_forged_stamp(&hub.addr, &ca, "node-hubtest"),
+        Ok(403),
+        "a forged stamp must not pass the stamp gate"
+    );
+    drop(hub);
 }

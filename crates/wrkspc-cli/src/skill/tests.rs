@@ -46,16 +46,16 @@ fn binding_cohort_has_pointer_files() {
 fn section_insert_and_replace_are_idempotent() {
     let original = "# User notes\n\nkeep this\n";
     let body = "wrkspc pointer";
-    let (first, changed) = with_section(original, body);
+    let (first, changed) = with_section(original, body).unwrap();
     assert!(changed);
     assert!(first.starts_with("# User notes\n\nkeep this\n\n"));
     assert!(first.contains(SECTION_START) && first.contains(SECTION_END));
 
-    let (second, changed) = with_section(&first, body);
+    let (second, changed) = with_section(&first, body).unwrap();
     assert!(!changed, "second write must be a no-op");
     assert_eq!(first, second);
 
-    let (updated, changed) = with_section(&second, "new body");
+    let (updated, changed) = with_section(&second, "new body").unwrap();
     assert!(changed);
     assert!(updated.contains("new body"));
     assert!(!updated.contains("wrkspc pointer"));
@@ -65,17 +65,81 @@ fn section_insert_and_replace_are_idempotent() {
 #[test]
 fn section_removal_preserves_user_content() {
     let original = "# User notes\n\nkeep this\n";
-    let (with, _) = with_section(original, "wrkspc pointer");
-    let (removed, found) = without_section(&with);
+    let (with, _) = with_section(original, "wrkspc pointer").unwrap();
+    let (removed, found) = without_section(&with).unwrap();
     assert!(found);
     assert_eq!(removed, original);
 }
 
 #[test]
 fn section_removal_when_absent_is_a_no_op() {
-    let (removed, found) = without_section("plain content\n");
+    let (removed, found) = without_section("plain content\n").unwrap();
     assert!(!found);
     assert_eq!(removed, "plain content\n");
+}
+
+/// CU-03: a file WITHOUT a final newline round-trips byte-exactly
+/// (install then uninstall restores the original text).
+#[test]
+fn no_final_newline_round_trips_exactly() {
+    let original = "keep user text";
+    let (with, _) = with_section(original, "wrkspc pointer").unwrap();
+    let (removed, found) = without_section(&with).unwrap();
+    assert!(found);
+    assert_eq!(removed, original);
+}
+
+/// CU-03: an orphaned START marker must never be "completed" by a
+/// later install deleting user text — it is refused outright.
+#[test]
+fn orphan_start_marker_is_refused_not_repaired() {
+    let content = format!("# Notes\n\nkeep me\n\n{SECTION_START}\nstale body\n");
+    assert!(with_section(&content, "wrkspc pointer").is_err());
+    assert!(without_section(&content).is_err());
+    // The refusal leaves the ambiguous content intact for the operator.
+}
+
+/// CU-03: an orphaned END marker refuses both install and uninstall
+/// instead of appending a second section.
+#[test]
+fn orphan_end_marker_is_refused_not_appended() {
+    let content = format!("# Notes\n\n{SECTION_END}\n");
+    assert!(with_section(&content, "wrkspc pointer").is_err());
+    assert!(without_section(&content).is_err());
+}
+
+/// CU-03: duplicate start markers (an earlier interrupted install)
+/// are refused, never silently re-paired.
+#[test]
+fn duplicate_start_markers_are_refused() {
+    let content = format!("# Notes\n\n{SECTION_START}\nold\n{SECTION_START}\nnew\n{SECTION_END}\n");
+    assert!(with_section(&content, "wrkspc pointer").is_err());
+}
+
+/// CU-03: reversed markers are refused, not treated as an empty
+/// section that swallows the content between them.
+#[test]
+fn reversed_markers_are_refused() {
+    let content = format!("keep me\n\n{SECTION_END}\nbody\n{SECTION_START}\n");
+    assert!(with_section(&content, "wrkspc pointer").is_err());
+    assert!(without_section(&content).is_err());
+}
+
+/// CU-03: marker TEXT inside prose is not a delimiter — install
+/// appends one section and uninstall removes only it.
+#[test]
+fn marker_text_in_prose_is_not_a_delimiter() {
+    let content = format!("The docs mention {SECTION_START} in prose.\n\nkeep\n");
+    let (with, changed) = with_section(&content, "wrkspc pointer").unwrap();
+    assert!(changed);
+    assert_eq!(
+        with.matches(SECTION_START).count(),
+        2,
+        "prose copy + one real marker"
+    );
+    let (removed, found) = without_section(&with).unwrap();
+    assert!(found);
+    assert_eq!(removed, content);
 }
 
 #[test]
@@ -210,4 +274,30 @@ fn select_install_targets_honors_harness_and_all_flags() {
     )
     .unwrap();
     assert_eq!(all, detect(&home));
+}
+
+/// CU-11: unset, empty, and relative HOME values are refused by the
+/// pure validation core; a valid absolute (even nonexistent) root
+/// passes — the supported synthetic-home case.
+#[test]
+fn home_validation_rejects_unset_empty_and_relative() {
+    assert!(
+        super::validated_home_from(None)
+            .unwrap_err()
+            .to_string()
+            .contains("not set")
+    );
+    assert!(
+        super::validated_home_from(Some("".into()))
+            .unwrap_err()
+            .to_string()
+            .contains("empty")
+    );
+    assert!(
+        super::validated_home_from(Some("relative/home".into()))
+            .unwrap_err()
+            .to_string()
+            .contains("absolute")
+    );
+    assert!(super::validated_home_from(Some("/nonexistent/absolute".into())).is_ok());
 }

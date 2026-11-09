@@ -29,6 +29,67 @@ pub(crate) fn pointer_section(entry: &HarnessEntry) -> String {
     }
 }
 
+/// Byte offsets of every line whose trimmed content is exactly `marker`
+/// — marker text embedded in unrelated prose is never a delimiter.
+fn marker_lines(content: &str, marker: &str) -> Vec<usize> {
+    content
+        .match_indices(marker)
+        .filter(|&(offset, _)| {
+            let line_start = content[..offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
+            let line_end = content[offset..]
+                .find('\n')
+                .map(|p| offset + p)
+                .unwrap_or(content.len());
+            content[line_start..line_end].trim_end() == marker
+        })
+        .map(|(offset, _)| offset)
+        .collect()
+}
+
+/// Locates the wrkspc section as a strictly ordered, unique marker
+/// pair on whole lines (CU-03).
+///
+/// Orphaned, duplicate, nested, or reversed markers are REFUSED
+/// before either file is modified — ambiguous user content is
+/// preserved and the operator is told to pair or remove the markers
+/// by hand.
+///
+/// # Returns
+///
+/// `Ok(Some((start, end)))` with the span from the START line's first
+/// byte through the END line's trailing newline (inclusive, clamped);
+/// `Ok(None)` when no markers exist.
+///
+/// # Errors
+///
+/// Returns the malformed-marker message.
+fn section_span(content: &str) -> Result<Option<(usize, usize)>, String> {
+    let starts = marker_lines(content, SECTION_START);
+    let ends = marker_lines(content, SECTION_END);
+    match (starts.len(), ends.len()) {
+        (0, 0) => Ok(None),
+        (1, 1) => {
+            let start = starts[0];
+            let end_line_start = ends[0];
+            if start > end_line_start {
+                return Err(
+                    "wrkspc markers are reversed (end before start) — pair or remove them manually before reinstalling"
+                        .to_string(),
+                );
+            }
+            let end = content[end_line_start..]
+                .find('\n')
+                .map(|p| end_line_start + p + 1)
+                .unwrap_or(content.len());
+            Ok(Some((start, end)))
+        }
+        _ => Err(
+            "orphaned, duplicate, or nested wrkspc markers — pair or remove them manually before reinstalling"
+                .to_string(),
+        ),
+    }
+}
+
 /// Replaces the wrkspc-marked section of a file's content with `body`
 /// (inserting it when absent) and returns the new content plus whether
 /// anything changed.
@@ -42,35 +103,29 @@ pub(crate) fn pointer_section(entry: &HarnessEntry) -> String {
 /// # Returns
 ///
 /// The updated content and a `changed` flag.
-pub(crate) fn with_section(content: &str, body: &str) -> (String, bool) {
-    let start = content.find(SECTION_START);
-    let end = content.find(SECTION_END);
-    match (start, end) {
-        (Some(start), Some(end)) if start < end => {
-            let wanted = format!("{SECTION_START}\n{body}\n{SECTION_END}");
-            let current = &content[start..end + SECTION_END.len()];
-            if current == wanted {
-                (content.to_string(), false)
-            } else {
-                let mut replaced = content.to_string();
-                replaced.replace_range(start..end + SECTION_END.len(), &wanted);
-                (replaced, true)
+///
+/// # Errors
+///
+/// Returns the malformed-marker message when the file carries markers
+/// this code cannot safely own.
+pub(crate) fn with_section(content: &str, body: &str) -> Result<(String, bool), String> {
+    let wanted_block = format!("{SECTION_START}\n{body}\n{SECTION_END}\n");
+    match section_span(content)? {
+        Some((start, end)) => {
+            if content[start..end] == wanted_block {
+                return Ok((content.to_string(), false));
             }
+            let mut replaced = content.to_string();
+            replaced.replace_range(start..end, &wanted_block);
+            Ok((replaced, true))
         }
-        _ => {
-            // Append only: a blank line separates the section from the
-            // user's content (uninstall removes exactly this boundary).
-            let separator = if content.is_empty() {
-                ""
-            } else if content.ends_with('\n') {
-                "\n"
-            } else {
-                "\n\n"
-            };
-            (
-                format!("{content}{separator}{SECTION_START}\n{body}\n{SECTION_END}\n"),
-                true,
-            )
+        None => {
+            // Exactly one separator newline for non-empty content: the
+            // uninstall removes exactly one newline before the START
+            // marker, so the round trip is byte-exact (CU-03's
+            // trailing-newline defect).
+            let separator = if content.is_empty() { "" } else { "\n" };
+            Ok((format!("{content}{separator}{wanted_block}"), true))
         }
     }
 }
@@ -85,25 +140,22 @@ pub(crate) fn with_section(content: &str, body: &str) -> (String, bool) {
 /// # Returns
 ///
 /// The updated content and a `removed` flag.
-pub(crate) fn without_section(content: &str) -> (String, bool) {
-    let start = content.find(SECTION_START);
-    let end = content.find(SECTION_END);
-    match (start, end) {
-        (Some(start), Some(end)) if start < end => {
-            let mut tail = end + SECTION_END.len();
-            if content[tail..].starts_with('\n') {
-                tail += 1;
-            }
-            // Mirror the install-time separator: exactly one newline of
-            // the blank line before the section is wrkspc-owned.
-            let mut head = start;
-            if head > 0 && content[..head].ends_with('\n') {
-                head -= 1;
-            }
-            let mut removed = content.to_string();
-            removed.replace_range(head..tail, "");
-            (removed, true)
-        }
-        _ => (content.to_string(), false),
+///
+/// # Errors
+///
+/// Returns the malformed-marker message when the file carries markers
+/// this code cannot safely own.
+pub(crate) fn without_section(content: &str) -> Result<(String, bool), String> {
+    let Some((start, end)) = section_span(content)? else {
+        return Ok((content.to_string(), false));
+    };
+    // Mirror the install-time separator: exactly one newline before
+    // the START marker is wrkspc-owned.
+    let mut head = start;
+    if head > 0 && content[..head].ends_with('\n') {
+        head -= 1;
     }
+    let mut removed = content.to_string();
+    removed.replace_range(head..end, "");
+    Ok((removed, true))
 }

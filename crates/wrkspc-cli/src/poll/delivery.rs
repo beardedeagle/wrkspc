@@ -9,8 +9,14 @@ use wrkspc_core::{Store, TaskRow};
 pub struct Delivery {
     /// The hub task id (the ack handle).
     pub task_id: String,
-    /// The hub-committed message id (the local idempotency key).
+    /// The hub-committed message id (the hub-side record).
     pub message_id: String,
+    /// The sender's own wire message id: when the delivery is an echo
+    /// of a message THIS node propagated upward, this equals the local
+    /// message id and the mirror must map back onto that row (never a
+    /// second message/execution intent). `None` for hub-originated
+    /// posts.
+    pub origin_message_id: Option<String>,
     /// The hub conversation id (preserved in the local mirror).
     pub conversation_id: String,
     /// The message's author.
@@ -31,6 +37,10 @@ pub struct Delivery {
     pub content: String,
     /// Whether the harness should be prompted.
     pub execution_requested: bool,
+    /// Pending hub guidance riding the envelope (hub→node propagation):
+    /// `(id, author_id, text)` — the node ingests these before the
+    /// delivery's turn is dispatched.
+    pub guidance: Vec<(String, String, String)>,
 }
 
 impl Delivery {
@@ -61,6 +71,10 @@ impl Delivery {
         Some(Self {
             task_id: task.task_id.clone(),
             message_id: field("message_id")?,
+            origin_message_id: delivery
+                .get("origin_message_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             conversation_id: field("conversation_id")?,
             sender_peer: field("sender_peer")?,
             sender_name: field("sender_name").unwrap_or_default(),
@@ -74,6 +88,22 @@ impl Delivery {
                 .get("execution_requested")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            guidance: delivery
+                .get("guidance")
+                .and_then(|v| v.as_array())
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| {
+                            Some((
+                                entry.get("id")?.as_str()?.to_string(),
+                                entry.get("author_id")?.as_str()?.to_string(),
+                                entry.get("text")?.as_str()?.to_string(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -86,6 +116,22 @@ pub struct PollOutcome {
     /// Deliveries left unacked (retried on the next poll — the hub
     /// keeps them visible as "not enforced").
     pub failed: usize,
+    /// Deliveries the hub refused to claim because a moderation gate
+    /// (fence, hold, or peer status) is effective — left untouched and
+    /// unacked, so they stay pollable until the gate clears.
+    pub gated: usize,
+}
+
+/// The hub's verdict for one delivery claim attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// This node holds the exclusive claim; mirroring may proceed.
+    Claimed,
+    /// Another node instance holds the claim; skip without mirroring.
+    ForeignClaimed,
+    /// A hub moderation gate blocks the claim; skip without mirroring
+    /// (the delivery stays pollable until the gate clears).
+    Gated,
 }
 
 /// Processes one page of hub delivery tasks against the node's local
@@ -95,9 +141,12 @@ pub struct PollOutcome {
 /// mirror peers + conversation → record the message (`accept_message`,
 /// idempotent on the hub message id) → ack → local processed marker.
 /// A delivery the caller fails to claim belongs to another node and is
-/// skipped, not failed. The local marker is written only after the ack,
-/// so a crash anywhere in the chain re-runs the whole delivery
-/// idempotently on the next poll.
+/// skipped, not failed — and a delivery the hub refuses to claim
+/// (moderation gate) is skipped WITHOUT mirroring: the hub is the
+/// authority on fences and holds, and nothing may become locally
+/// executable against its verdict. The local marker is written only
+/// after the ack, so a crash anywhere in the chain re-runs the whole
+/// delivery idempotently on the next poll.
 ///
 /// # Arguments
 ///
@@ -106,8 +155,7 @@ pub struct PollOutcome {
 ///   recipient peer is enrolled on it.
 /// * `tasks` — the hub's delivery task rows for this host.
 /// * `claim` — the claim callback (`POST /delivery-claim` over the
-///   mTLS client); returns `true` when this node holds the exclusive
-///   claim (or already held it), `false` when another host does.
+///   mTLS client); returns the hub's claim verdict.
 /// * `ack` — the ack callback (`POST /delivery-ack` over the mTLS
 ///   client); returns `true` on success.
 ///
@@ -123,7 +171,7 @@ pub async fn process_deliveries<CF, CFut, AF, AFut>(
 ) -> PollOutcome
 where
     CF: FnMut(&str) -> CFut,
-    CFut: Future<Output = bool>,
+    CFut: Future<Output = ClaimOutcome>,
     AF: FnMut(&str) -> AFut,
     AFut: Future<Output = bool>,
 {
@@ -147,9 +195,26 @@ where
 
         // The exclusive claim comes FIRST: without it, two node
         // processes sharing one cert would both mirror and dispatch.
-        if !claim(&delivery.task_id).await {
-            tracing::info!(task_id = %delivery.task_id, "delivery claimed by another node; skipping");
-            continue;
+        // A gate verdict skips WITHOUT mirroring — the hub's moderation
+        // is authoritative and nothing becomes locally executable
+        // against it.
+        match claim(&delivery.task_id).await {
+            ClaimOutcome::Claimed => {}
+            ClaimOutcome::ForeignClaimed => {
+                tracing::info!(
+                    task_id = %delivery.task_id,
+                    "delivery claim unavailable (foreign instance or transport failure); skipping"
+                );
+                continue;
+            }
+            ClaimOutcome::Gated => {
+                tracing::info!(
+                    task_id = %delivery.task_id,
+                    "delivery gated by hub moderation; skipping until the gate clears"
+                );
+                outcome.gated += 1;
+                continue;
+            }
         }
 
         // Mirror the peers exactly as the hub enrolled them; the
@@ -221,15 +286,36 @@ where
             continue;
         }
 
-        // The local record (hub message id as the idempotency key, so
-        // re-polls after a crash replay instead of duplicating). With
-        // execution requested this also raises the intent the local
-        // dispatcher claims.
+        // Hub guidance rides in FIRST: the ingest must land before the
+        // dispatcher claims the intent this mirror creates, so the
+        // hub-UI guidance reaches the very next prompt (idempotent on
+        // redelivery — the hub's ids are the keys).
+        if !delivery.guidance.is_empty()
+            && let Err(error) = store
+                .ingest_guidance(&delivery.conversation_id, &delivery.guidance)
+                .await
+        {
+            tracing::error!(%error, task_id = %delivery.task_id, "guidance ingest failed");
+            outcome.failed += 1;
+            continue;
+        }
+
+        // The local record. The idempotency key is the delivery's
+        // ORIGIN id: for a message this node propagated upward, the
+        // origin is the original LOCAL message id, so a co-hosted echo
+        // replays that row instead of creating a second message and
+        // execution intent. Hub-originated posts keep the hub id as
+        // the key. With execution requested this also raises the
+        // intent the local dispatcher claims.
+        let accept_key = delivery
+            .origin_message_id
+            .clone()
+            .unwrap_or_else(|| delivery.message_id.clone());
         let record = store
             .accept_message(
                 &delivery.conversation_id,
                 &delivery.sender_peer,
-                &delivery.message_id,
+                &accept_key,
                 &delivery.content,
                 delivery.execution_requested,
                 &[wrkspc_core::RecipientRequest {

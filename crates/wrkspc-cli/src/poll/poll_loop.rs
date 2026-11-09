@@ -2,8 +2,8 @@
 //! presence upload, and roster mirroring on one tick cadence.
 
 use super::{
-    PresenceSource, process_deliveries, sync_conversations, sync_outbound, sync_roster,
-    upload_presence,
+    ClaimOutcome, PresenceSource, process_deliveries, sync_conversations, sync_outbound,
+    sync_roster, upload_presence,
 };
 use std::time::Duration;
 use wrkspc_core::{Store, TaskRow};
@@ -25,6 +25,19 @@ pub struct PollLoopConfig {
     pub interval: Duration,
     /// The presence source (session registry); `None` skips uploads.
     pub presence: Option<std::sync::Arc<dyn PresenceSource>>,
+}
+
+// The presence source is a trait object without Debug; the summary
+// carries the observable configuration instead.
+impl std::fmt::Debug for PollLoopConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PollLoopConfig")
+            .field("hub_url", &self.hub_url)
+            .field("host_id", &self.host_id)
+            .field("interval", &self.interval)
+            .field("has_presence", &self.presence.is_some())
+            .finish_non_exhaustive()
+    }
 }
 /// Runs the node's poll loop: delivery claim/mirror/ack, node → hub
 /// message propagation, presence upload, and roster mirroring.
@@ -120,7 +133,7 @@ pub async fn run_poll_loop(
                     let claim_url = claim_url.clone();
                     let instance_id = instance_id.clone();
                     async move {
-                        client
+                        match client
                             .post(&claim_url)
                             .json(&serde_json::json!({
                                 "taskId": task_id,
@@ -128,7 +141,16 @@ pub async fn run_poll_loop(
                             }))
                             .send()
                             .await
-                            .is_ok_and(|response| response.status().is_success())
+                        {
+                            Ok(response) if response.status().is_success() => ClaimOutcome::Claimed,
+                            Ok(response) if response.status() == reqwest::StatusCode::LOCKED => {
+                                ClaimOutcome::Gated
+                            }
+                            // Foreign claim (409) and every failure are the
+                            // same skip: this node never mirrors work it
+                            // could not durably claim.
+                            _ => ClaimOutcome::ForeignClaimed,
+                        }
                     }
                 },
                 |task_id| {
@@ -150,10 +172,11 @@ pub async fn run_poll_loop(
                 },
             )
             .await;
-            if outcome.processed > 0 || outcome.failed > 0 {
+            if outcome.processed > 0 || outcome.failed > 0 || outcome.gated > 0 {
                 tracing::info!(
                     processed = outcome.processed,
                     failed = outcome.failed,
+                    gated = outcome.gated,
                     "hub poll pass",
                 );
             }
@@ -175,5 +198,60 @@ pub async fn run_poll_loop(
         }
         let _refreshed = sync_roster(&client, &hub_url, &store).await;
         let _rooms = sync_conversations(&client, &hub_url, &store).await;
+
+        // Node → hub outcome leg (H-10): terminal attempt results for
+        // hub-originated deliveries ride a stamped `delivery-report`
+        // back, so the hub's task learns execution outcomes instead of
+        // reading completion from the ack. Retried until the hub
+        // confirms (or answers "unknown task" — then the report is
+        // dropped; there is no task to fold it into).
+        for report in store.hub_pending_outcomes().await.unwrap_or_default() {
+            // Guidance consumed locally rides the report: the hub marks
+            // its authoritative rows delivered (idempotent; unknown ids
+            // are no-ops), closing the propagation loop.
+            let guidance_delivered = store
+                .delivered_guidance_ids(&report.conversation_id)
+                .await
+                .unwrap_or_default();
+            let response = client
+                .post(format!("{hub_url}/delivery-report"))
+                .json(&serde_json::json!({
+                    "taskId": report.task_id,
+                    "instanceId": instance_id,
+                    "attemptId": report.attempt_id,
+                    "state": report.state,
+                    "recordedAt": chrono::Utc::now().to_rfc3339(),
+                    "guidanceDelivered": guidance_delivered,
+                }))
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => {}
+                // The hub has no task for this pair: a local message,
+                // or a repaired ledger — nothing to report against.
+                Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {}
+                // A conflicting terminal state: the hub already holds
+                // an outcome record; the report is satisfied.
+                Ok(response) if response.status() == reqwest::StatusCode::CONFLICT => {}
+                Ok(response) => {
+                    tracing::warn!(
+                        status = %response.status(),
+                        task_id = %report.task_id,
+                        "outcome report rejected; retrying next poll"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, task_id = %report.task_id, "outcome report failed; retrying");
+                    continue;
+                }
+            }
+            if let Err(error) = store
+                .mark_outcome_reported(&report.attempt_id, &report.task_id)
+                .await
+            {
+                tracing::warn!(%error, attempt_id = %report.attempt_id, "outcome ledger write failed");
+            }
+        }
     }
 }

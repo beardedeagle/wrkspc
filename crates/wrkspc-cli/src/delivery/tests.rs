@@ -45,6 +45,7 @@ async fn seeded_delivery(store: &Store) -> (String, String) {
             recipient_name: "codex",
             recipient_class: "harness",
             message_id: &message_id,
+            origin_message_id: None,
             conversation_id: &conversation,
             sender_peer: "operator",
             sender_name: "operator",
@@ -68,7 +69,11 @@ async fn router_under_test(store: Store) -> axum::Router {
         )
         .route(
             "/delivery-ack",
-            axum::routing::post(delivery_ack).with_state(DeliveryState::new(store)),
+            axum::routing::post(delivery_ack).with_state(DeliveryState::new(store.clone())),
+        )
+        .route(
+            "/delivery-report",
+            axum::routing::post(delivery_report).with_state(DeliveryState::new(store)),
         )
 }
 
@@ -99,8 +104,28 @@ async fn post_delivery(
     response.status()
 }
 
+async fn post_json(
+    router: axum::Router,
+    route: &str,
+    identity: Option<&str>,
+    body: serde_json::Value,
+) -> axum::http::StatusCode {
+    let mut builder = axum::http::Request::builder()
+        .method("POST")
+        .uri(route)
+        .header(CONTENT_TYPE, "application/json");
+    if let Some(identity) = identity {
+        builder = builder.header("x-wrkspc-peer", identity);
+    }
+    let response = router
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    response.status()
+}
+
 #[tokio::test]
-async fn owning_host_ack_completes_the_delivery() {
+async fn owning_host_ack_marks_the_delivery_received_not_completed() {
     let store = Store::open_in_memory("ack-test").await.unwrap();
     let (task_id, conversation_id) = seeded_delivery(&store).await;
     let router = router_under_test(store.clone()).await;
@@ -109,7 +134,7 @@ async fn owning_host_ack_completes_the_delivery() {
     let status = post_delivery(
         router,
         "/delivery-ack",
-        Some("CN=node-test-1 SAN=node-test-1"),
+        Some("node-test-1"),
         &task_id,
         "i-a",
     )
@@ -121,7 +146,7 @@ async fn owning_host_ack_completes_the_delivery() {
     let status = post_delivery(
         router,
         "/delivery-claim",
-        Some("CN=node-test-1 SAN=node-test-1"),
+        Some("node-test-1"),
         &task_id,
         "i-a",
     )
@@ -131,21 +156,22 @@ async fn owning_host_ack_completes_the_delivery() {
     let status = post_delivery(
         router,
         "/delivery-ack",
-        Some("CN=node-test-1 SAN=node-test-1"),
+        Some("node-test-1"),
         &task_id,
         "i-a",
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
 
-    // The task is terminal-completed and the delivery is marked
-    // delivered hub-side.
+    // The ack is a RECEIPT (H-10): the delivery is marked delivered
+    // hub-side (mailbox handoff) but the task is WORKING — it must
+    // never read completed before an attempt outcome is reported.
     let task = store.task_get(&task_id).await.unwrap().unwrap();
-    assert!(task.terminal);
-    assert_eq!(task.state, "completed");
+    assert!(!task.terminal, "an ack must not complete the task");
+    assert_eq!(task.state, "working");
     let payload: serde_json::Value = serde_json::from_str(&task.task_json).unwrap();
     assert!(payload["metadata"]["delivery"].get("acked_at").is_some());
-    assert_eq!(payload["status"]["state"], "TASK_STATE_COMPLETED");
+    assert_eq!(payload["status"]["state"], "TASK_STATE_WORKING");
 
     // The feed records the fence-ack.
     let events = store.events_since(&conversation_id, 0, 100).await.unwrap();
@@ -156,7 +182,7 @@ async fn owning_host_ack_completes_the_delivery() {
     let status = post_delivery(
         router,
         "/delivery-ack",
-        Some("CN=node-test-1 SAN=node-test-1"),
+        Some("node-test-1"),
         &task_id,
         "i-a",
     )
@@ -173,7 +199,7 @@ async fn foreign_host_cannot_ack_another_hosts_delivery() {
     let status = post_delivery(
         router,
         "/delivery-ack",
-        Some("CN=node-other SAN=node-other"),
+        Some("node-other"),
         &task_id,
         "i-other",
     )
@@ -193,7 +219,7 @@ async fn claim_is_first_wins_idempotent_and_visible() {
     let status = post_delivery(
         router,
         "/delivery-claim",
-        Some("CN=node-test-1 SAN=node-test-1"),
+        Some("node-test-1"),
         &task_id,
         "i-a",
     )
@@ -218,7 +244,7 @@ async fn claim_is_first_wins_idempotent_and_visible() {
     let status = post_delivery(
         router,
         "/delivery-claim",
-        Some("CN=node-test-1 SAN=node-test-1"),
+        Some("node-test-1"),
         &task_id,
         "i-b",
     )
@@ -230,7 +256,7 @@ async fn claim_is_first_wins_idempotent_and_visible() {
     let status = post_delivery(
         router,
         "/delivery-claim",
-        Some("CN=node-test-1 SAN=node-test-1"),
+        Some("node-test-1"),
         &task_id,
         "i-a",
     )
@@ -252,11 +278,186 @@ async fn unstamped_and_unknown_requests_are_rejected() {
         post_delivery(
             router,
             "/delivery-ack",
-            Some("CN=node-test-1 SAN=node-test-1"),
+            Some("node-test-1"),
             "no-such-task",
             "i-a",
         )
         .await,
         axum::http::StatusCode::NOT_FOUND
+    )
+}
+
+/// The H-10 outcome leg: a terminal attempt report transitions the
+/// working delivery task to the reported terminal state, preserves the
+/// delivery envelope, lands a feed event, and is idempotent for the
+/// same state.
+#[tokio::test]
+async fn outcome_report_completes_the_delivery_task() {
+    let store = Store::open_in_memory("report-test").await.unwrap();
+    let (task_id, conversation_id) = seeded_delivery(&store).await;
+
+    // Claim + ack: the task is working.
+    let router = router_under_test(store.clone()).await;
+    post_delivery(
+        router,
+        "/delivery-claim",
+        Some("node-test-1"),
+        &task_id,
+        "i-a",
+    )
+    .await;
+    let router = router_under_test(store.clone()).await;
+    let status = post_delivery(
+        router,
+        "/delivery-ack",
+        Some("node-test-1"),
+        &task_id,
+        "i-a",
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    // The node reports the attempt result: completed.
+    let router = router_under_test(store.clone()).await;
+    let status = post_json(
+        router,
+        "/delivery-report",
+        Some("node-test-1"),
+        serde_json::json!({
+            "taskId": task_id,
+            "instanceId": "i-a",
+            "attemptId": "attempt-1",
+            "state": "completed",
+            "recordedAt": "2026-11-08T00:00:00Z",
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    let task = store.task_get(&task_id).await.unwrap().unwrap();
+    assert!(task.terminal, "the report makes the task terminal");
+    assert_eq!(task.state, "completed");
+    let payload: serde_json::Value = serde_json::from_str(&task.task_json).unwrap();
+    assert_eq!(payload["status"]["state"], "TASK_STATE_COMPLETED");
+    // The delivery envelope survives (H-13): the outcome does not
+    // replace the record.
+    let seeded = store
+        .list_messages(&conversation_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one message");
+    assert_eq!(
+        payload["metadata"]["delivery"]["message_id"],
+        serde_json::Value::String(seeded.id)
     );
+    assert_eq!(payload["metadata"]["attempt"]["state"], "completed");
+
+    // The feed records the outcome.
+    let events = store.events_since(&conversation_id, 0, 100).await.unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "delivery.attempt" && event.payload["state"] == "completed"
+    }));
+
+    // A repeated report of the SAME terminal state is idempotent.
+    let router = router_under_test(store.clone()).await;
+    let status = post_json(
+        router,
+        "/delivery-report",
+        Some("node-test-1"),
+        serde_json::json!({
+            "taskId": task_id,
+            "instanceId": "i-a",
+            "attemptId": "attempt-1",
+            "state": "completed",
+            "recordedAt": "2026-11-08T00:00:01Z",
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    // A CONFLICTING outcome is refused: the first terminal state
+    // stands.
+    let router = router_under_test(store.clone()).await;
+    let status = post_json(
+        router,
+        "/delivery-report",
+        Some("node-test-1"),
+        serde_json::json!({
+            "taskId": task_id,
+            "instanceId": "i-a",
+            "attemptId": "attempt-1",
+            "state": "failed",
+            "recordedAt": "2026-11-08T00:00:02Z",
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        store.task_get(&task_id).await.unwrap().unwrap().state,
+        "completed"
+    );
+}
+
+/// The report leg enforces the same attribution discipline as the
+/// claim/ack: only the queue-owning host may report, the state must be
+/// a terminal attempt state, and unstamped requests are refused.
+#[tokio::test]
+async fn outcome_report_validation() {
+    let store = Store::open_in_memory("report-validation-test")
+        .await
+        .unwrap();
+    let (task_id, _conversation_id) = seeded_delivery(&store).await;
+
+    // Another host cannot report on this queue.
+    let router = router_under_test(store.clone()).await;
+    let status = post_json(
+        router,
+        "/delivery-report",
+        Some("node-other"),
+        serde_json::json!({
+            "taskId": task_id,
+            "instanceId": "i-other",
+            "attemptId": "attempt-1",
+            "state": "completed",
+            "recordedAt": "2026-11-08T00:00:00Z",
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+
+    // A non-terminal state is refused.
+    let router = router_under_test(store.clone()).await;
+    let status = post_json(
+        router,
+        "/delivery-report",
+        Some("node-test-1"),
+        serde_json::json!({
+            "taskId": task_id,
+            "instanceId": "i-a",
+            "attemptId": "attempt-1",
+            "state": "dispatched",
+            "recordedAt": "2026-11-08T00:00:00Z",
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+    // Unstamped requests are refused.
+    let router = router_under_test(store.clone()).await;
+    let status = post_json(
+        router,
+        "/delivery-report",
+        None,
+        serde_json::json!({
+            "taskId": task_id,
+            "instanceId": "i-a",
+            "attemptId": "attempt-1",
+            "state": "completed",
+            "recordedAt": "2026-11-08T00:00:00Z",
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
 }

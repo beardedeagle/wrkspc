@@ -16,7 +16,7 @@ pub(crate) mod routes;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use routes::{delivery_ack, delivery_claim};
+pub(crate) use routes::{delivery_ack, delivery_claim, delivery_report};
 
 /// Shared state for the delivery-ack route.
 #[derive(Clone)]
@@ -45,6 +45,32 @@ pub(crate) struct AckRequest {
     /// per-instance: a copied cert on a second machine loses the claim).
     #[serde(rename = "instanceId")]
     instance_id: String,
+}
+
+/// The attempt-outcome report body (H-10): the node reports a terminal
+/// attempt state for a hub-originated delivery it mirrored, so the
+/// hub's task learns the execution result.
+#[derive(Deserialize)]
+pub(crate) struct DeliveryReport {
+    /// The hub delivery task the outcome addresses.
+    #[serde(rename = "taskId")]
+    task_id: String,
+    /// The reporting node's stable local identity.
+    #[serde(rename = "instanceId")]
+    instance_id: String,
+    /// The terminal attempt.
+    #[serde(rename = "attemptId")]
+    attempt_id: String,
+    /// The terminal state: `completed`, `failed`, or `canceled`.
+    state: String,
+    /// When the attempt reached the terminal state (RFC 3339).
+    #[serde(rename = "recordedAt")]
+    recorded_at: String,
+    /// Guidance ids the node consumed (rode a successful prompt): the
+    /// hub marks its authoritative rows delivered. Optional, default
+    /// empty.
+    #[serde(default, rename = "guidanceDelivered")]
+    guidance_delivered: Vec<String>,
 }
 
 /// Extracts the presenting host from the stamped identity header.

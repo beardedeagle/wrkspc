@@ -11,6 +11,7 @@
 //! unit tests; driving the binary itself would additionally require an
 //! ACP-speaking child process for the bindings, which is not this
 //! test's seam.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -194,6 +195,7 @@ async fn seed_hub_db(db: &Path) -> (String, String) {
             recipient_name: "codex",
             recipient_class: "harness",
             message_id: &message_id,
+            origin_message_id: None,
             conversation_id: &conversation,
             sender_peer: "operator",
             sender_name: "operator",

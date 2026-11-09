@@ -64,6 +64,9 @@ pub struct HubRunArgs {
 /// # Errors
 ///
 /// Returns a boxed error on store, bind, or TLS-material failures.
+// The default bind address is a compile-time constant (same
+// reviewed allowance as the UiConfig Default impl).
+#[allow(clippy::expect_used)]
 pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let db = canonical_db_path(&args.db)?;
     let store = Store::open(&db, "wrkspc-hub").await?;
@@ -80,6 +83,18 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
         )
         .await?;
 
+    // Repair any partially completed remote fan-out from a previous
+    // run: delivery-task ids are deterministic in (message, recipient),
+    // so re-creating missing rows is idempotent and never duplicates
+    // (H-5 — a crash between acceptance and fan-out must not lose the
+    // delivery).
+    let repaired = store
+        .repair_remote_fanout(wrkspc_core::PILOT_HOST_ID)
+        .await?;
+    if repaired > 0 {
+        tracing::warn!(repaired, "repaired incomplete remote fan-out at startup");
+    }
+
     let tls = match (&args.tls_cert, &args.tls_key, &args.tls_ca) {
         (Some(cert), Some(key), Some(ca)) => Some((cert, key, ca)),
         (None, None, None) => None,
@@ -88,6 +103,24 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
     if args.revoke_list.is_some() && tls.is_none() {
         return Err("--revoke-list requires TLS mode".into());
     }
+
+    // The live revocation service: ONE set shared by every operator
+    // surface and the TLS per-request gate (H-11 — a ban through any
+    // listener must bite, and an established connection must re-check
+    // per request). The `--revoke-list` file is the floor; store-
+    // persisted per-peer bans ride on top.
+    let revocation = match tls.as_ref() {
+        Some(_) => {
+            let floor = load_deny_list(args.revoke_list.as_deref())?;
+            let mut live = floor.clone();
+            live.extend(store.cert_revocations().await?);
+            Some(wrkspc_ui::RevocationSet {
+                live: Arc::new(std::sync::RwLock::new(live)),
+                floor: Arc::new(floor),
+            })
+        }
+        None => None,
+    };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown_future = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
@@ -101,18 +134,23 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
 
     // Operator UI (optional): same surface as the node role; the cancel
     // seam is a no-op here — the hub has no local sessions to interrupt.
+    // It shares the TLS surface's revocation set, so bans/restores
+    // through EITHER listener update the same live deny set.
     if let Some(bind) = args.ui {
         let token = resolve_ui_token(&db).await?;
         let ui = UiServer::new(
             store.clone(),
-            Arc::new(NoOpCancel),
+            Arc::new(HubCancel {
+                store: store.clone(),
+            }),
             UiConfig {
                 bind: bind.parse()?,
                 token: Some(token),
                 queue_remote_deliveries: true,
                 hub_role: true,
+                hub_connected: true,
             },
-            None,
+            revocation.clone(),
         );
         let listener = TcpListener::bind(&bind).await?;
         tracing::info!(%bind, "hub UI bound");
@@ -135,13 +173,15 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
         Some((cert, key, ca)) => {
             let acceptor = build_acceptor(cert, key, ca)?;
             // The live deny set: the operator's --revoke-list file plus
-            // store-persisted runtime bans (the operator UI writes both
-            // the store and this set, so revocations bite on the next
-            // handshake without a hub restart).
-            let mut denied: std::collections::HashSet<String> =
-                load_deny_list(args.revoke_list.as_deref())?;
-            denied.extend(store.cert_revocations().await?);
-            let denied = Arc::new(std::sync::RwLock::new(denied));
+            // The shared revocation service built above: the handshake
+            // drops denied serials pre-HTTP, and the per-request gate
+            // below re-checks established connections.
+            // The revocation service is always built in TLS mode; this
+            // branch IS the TLS mode, so absence would be a bug in the
+            // arm's setup.
+            let Some(denied) = revocation.clone() else {
+                unreachable!("TLS mode always builds the revocation service")
+            };
             // For the handshake callback's fire-and-forget serial
             // recording.
             let store_for_serial = store.clone();
@@ -162,17 +202,24 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
             let ui_token = resolve_ui_token(&db).await?;
             let ui_app = UiServer::new(
                 store.clone(),
-                Arc::new(NoOpCancel),
+                Arc::new(HubCancel {
+                    store: store.clone(),
+                }),
                 UiConfig {
                     bind: "127.0.0.1:0".parse().expect("static address parses"),
                     token: Some(ui_token.clone()),
                     queue_remote_deliveries: true,
                     hub_role: true,
+                    hub_connected: true,
                 },
-                Some(denied.clone()),
+                Some(match revocation.clone() {
+                    Some(denied) => denied,
+                    None => unreachable!("TLS mode always builds the revocation service"),
+                }),
             )
             .into_app(ui_token);
             tokio::spawn(async move {
+                let denied_for_requests = denied.clone();
                 let _ = surface
                     .serve_tls(
                         listener,
@@ -185,10 +232,12 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                             // it unstamped — the stamp gate keeps it off
                             // the A2A routes. Presented chains that
                             // resolve to a serial on the deny-list are
-                            // still dropped. The returned identity is
-                            // stamped as `x-wrkspc-peer` on every request
-                            // a stamped connection makes.
-                            let Some(identity) = certs.first().and_then(wrkspc_a2a::peer_identity)
+                            // still dropped. The stamped identity is the
+                            // certificate's first DNS SAN alone (never
+                            // text parsed out of the CN), and is stamped
+                            // as `x-wrkspc-peer` on every request a
+                            // stamped connection makes.
+                            let Some(identity) = certs.first().and_then(wrkspc_a2a::host_identity)
                             else {
                                 return wrkspc_a2a::PeerDecision::Unstamped;
                             };
@@ -201,16 +250,12 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                             // short-TTL renewals keep the ban working.
                             if let Some(serial) = certs.first().and_then(cert_serial_hex) {
                                 let store = store_for_serial.clone();
-                                let host_for_serial =
-                                    crate::acceptance::host_from_identity(&identity);
+                                let host_for_serial = identity.clone();
                                 let identity_for_serial = identity.clone();
                                 tokio::spawn(async move {
-                                    let result = match host_for_serial {
-                                        Some(host) => {
-                                            store.record_host_cert_serial(&host, &serial).await
-                                        }
-                                        None => Ok(()),
-                                    };
+                                    let result = store
+                                        .record_host_cert_serial(&host_for_serial, &serial)
+                                        .await;
                                     if let Err(error) = result {
                                         tracing::warn!(%error, %identity_for_serial, "cert serial recording failed");
                                     }
@@ -219,12 +264,7 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                             let denied = certs
                                 .first()
                                 .and_then(cert_serial_hex)
-                                .is_some_and(|serial| {
-                                    denied
-                                        .read()
-                                        .expect("deny lock poisoned")
-                                        .contains(&serial)
-                                });
+                                .is_some_and(|serial| read_deny(&denied).contains(&serial));
                             if denied {
                                 wrkspc_a2a::PeerDecision::Deny
                             } else {
@@ -246,7 +286,12 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                                     .route(
                                         "/delivery-ack",
                                         axum::routing::post(crate::delivery::delivery_ack)
-                                            .with_state(delivery),
+                                            .with_state(delivery.clone()),
+                                    )
+                                    .route(
+                                        "/delivery-report",
+                                        axum::routing::post(crate::delivery::delivery_report)
+                                            .with_state(delivery.clone()),
                                     )
                                     .route(
                                         "/presence",
@@ -268,6 +313,40 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                                         axum::routing::get(crate::presence::peer_card)
                                             .with_state(presence),
                                     )
+                                    // Per-request revocation: an established
+                                    // connection re-checks its serial against
+                                    // the live deny set on EVERY request, so a
+                                    // ban bites without waiting for the next
+                                    // handshake (H-11).
+                                    .layer(axum::middleware::from_fn(
+                                        move |request: axum::extract::Request,
+                                              next: axum::middleware::Next| {
+                                            let revoked = denied_for_requests.clone();
+                                            async move {
+                                                if let Some(serial) = request
+                                                    .headers()
+                                                    .get("x-wrkspc-serial")
+                                                    .and_then(|value| value.to_str().ok())
+                                                    && read_deny(&revoked).contains(serial)
+                                                {
+                                                    return match axum::response::Response::builder()
+                                                        .status(axum::http::StatusCode::FORBIDDEN)
+                                                        .body(axum::body::Body::from(
+                                                            "client certificate required",
+                                                        ))
+                                                    {
+                                                        Ok(response) => response,
+                                                        // Static status and body cannot
+                                                        // fail; guards misuse.
+                                                        Err(error) => unreachable!(
+                                                            "static forbidden response failed: {error}"
+                                                        ),
+                                                    };
+                                                }
+                                                next.run(request).await
+                                            }
+                                        },
+                                    ))
                                     // Outermost on the A2A subtree: cert-less
                                     // connections (the browser) must not
                                     // reach any A2A route.
@@ -314,6 +393,23 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
 ///
 /// Returns an error when PEM material cannot be loaded or the rustls
 /// config cannot be built.
+/// Reads the live deny set.
+///
+/// Poison here is an unrecoverable invariant violation — a writer
+/// panicked mid-update — and reading possibly torn set state could
+/// MISS a revoked serial (allowing a denied peer), so the read panics
+/// deliberately instead of recovering. This is the hub's single
+/// reviewed invariant-panic site.
+#[allow(clippy::panic)]
+fn read_deny(
+    denied: &wrkspc_ui::RevocationSet,
+) -> std::sync::RwLockReadGuard<'_, std::collections::HashSet<String>> {
+    match denied.live.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => panic!("deny lock poisoned: {poisoned}"),
+    }
+}
+
 fn build_acceptor(
     cert: &Path,
     key: &Path,
@@ -370,10 +466,14 @@ async fn require_peer_stamp(
     if request.headers().contains_key("x-wrkspc-peer") {
         next.run(request).await
     } else {
-        axum::response::Response::builder()
+        match axum::response::Response::builder()
             .status(axum::http::StatusCode::FORBIDDEN)
             .body(axum::body::Body::from("client certificate required"))
-            .expect("static response builds")
+        {
+            Ok(response) => response,
+            // Static status and body cannot fail; guards misuse.
+            Err(error) => unreachable!("static forbidden response failed: {error}"),
+        }
     }
 }
 
@@ -405,23 +505,52 @@ fn load_deny_list(path: Option<&Path>) -> Result<HashSet<String>, Box<dyn std::e
     Ok(set)
 }
 
-/// Cancel seam for the hub UI: the hub has no local sessions, so
-/// cancellation is always refused with an explanation.
-#[derive(Debug)]
-struct NoOpCancel;
+/// Cancel seam for the hub UI (H-10): cancellation is enforced where
+/// the hub holds authority — the hub-side execution intent (the
+/// operator's record of the turn) and the delivery task the recipient's
+/// node polls. A canceled task is terminal, so an unclaimed delivery
+/// never mirrors or executes on the node; work the node has ALREADY
+/// claimed is beyond the poll-only channel (D-6 — the hub never calls
+/// nodes) and falls to the node-side gates.
+#[derive(Clone, Debug)]
+struct HubCancel {
+    store: Store,
+}
 
-impl wrkspc_ui::CancelRequester for NoOpCancel {
+impl wrkspc_ui::CancelRequester for HubCancel {
     fn request_cancel(
         &self,
-        _message_id: &str,
-        _recipient_id: &str,
-        _set_by: &str,
+        message_id: &str,
+        recipient_id: &str,
+        set_by: &str,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<CancelOutcome, String>> + Send + '_>> {
-        Box::pin(async {
-            Err(
-                "the hub role owns no local sessions; cancel the node that executes the attempt"
-                    .to_string(),
-            )
+        let store = self.store.clone();
+        let message_id = message_id.to_string();
+        let recipient_id = recipient_id.to_string();
+        let set_by = set_by.to_string();
+        Box::pin(async move {
+            // The hub-side intent (queued → canceled, with the feed
+            // event). A mail-only message has no intent and nothing to
+            // cancel here.
+            let outcome = match store
+                .request_cancel(&message_id, &recipient_id, &set_by)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(wrkspc_core::StoreError::NotFound { .. }) => {
+                    // No intent to cancel; fall through to the task.
+                    wrkspc_core::CancelOutcome::IntentCanceled
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            // The delivery task the node polls: canceling it stops an
+            // unclaimed delivery from ever executing.
+            let task_id = wrkspc_core::tasks::delivery_task_id(&message_id, &recipient_id);
+            store
+                .task_mark_canceled(&task_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(outcome)
         })
     }
 }

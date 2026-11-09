@@ -4,6 +4,8 @@ use clap::Parser;
 use wrkspc_cli::{Cli, Command, HubCommand, NodeCommand};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything reads a key: no core dump may ever capture one.
+    let hardened = wrkspc_cli::harden::forbid_core_dumps();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -14,6 +16,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // harness that parses stdout strictly.
         .with_writer(std::io::stderr)
         .init();
+    if let Err(error) = hardened {
+        tracing::warn!(
+            %error,
+            "core dumps could not be disabled; a crash could write key material to a dump"
+        );
+    }
 
     let cli = Cli::parse();
     match cli.command {

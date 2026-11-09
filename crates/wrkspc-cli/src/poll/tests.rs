@@ -1,4 +1,5 @@
 use super::*;
+use crate::poll::delivery::ClaimOutcome;
 use std::sync::Arc;
 
 /// Builds a hub-side delivery task row payload for tests.
@@ -57,7 +58,7 @@ async fn delivery_is_mirrored_dispatched_and_acked() {
         &store,
         "node-test-1",
         std::slice::from_ref(&row),
-        |_| std::future::ready(true),
+        |_| std::future::ready(ClaimOutcome::Claimed),
         |task_id| {
             acked.push(task_id.to_string());
             std::future::ready(true)
@@ -68,7 +69,8 @@ async fn delivery_is_mirrored_dispatched_and_acked() {
         outcome,
         PollOutcome {
             processed: 1,
-            failed: 0
+            failed: 0,
+            gated: 0,
         }
     );
     assert_eq!(acked, vec!["task-1"]);
@@ -114,7 +116,7 @@ async fn failed_ack_leaves_delivery_pollable_and_replayable() {
         &store,
         "node-test-1",
         std::slice::from_ref(&row),
-        |_| std::future::ready(true),
+        |_| std::future::ready(ClaimOutcome::Claimed),
         |_| std::future::ready(false),
     )
     .await;
@@ -122,7 +124,8 @@ async fn failed_ack_leaves_delivery_pollable_and_replayable() {
         outcome,
         PollOutcome {
             processed: 0,
-            failed: 1
+            failed: 1,
+            gated: 0,
         }
     );
     // No processed marker: the hub task stays pollable.
@@ -135,7 +138,7 @@ async fn failed_ack_leaves_delivery_pollable_and_replayable() {
         &store,
         "node-test-1",
         &[row],
-        |_| std::future::ready(true),
+        |_| std::future::ready(ClaimOutcome::Claimed),
         |task_id| {
             acked.push(task_id.to_string());
             std::future::ready(true)
@@ -146,7 +149,8 @@ async fn failed_ack_leaves_delivery_pollable_and_replayable() {
         outcome,
         PollOutcome {
             processed: 1,
-            failed: 0
+            failed: 0,
+            gated: 0,
         }
     );
     assert!(store.task_get("task-2").await.unwrap().is_some());
@@ -178,7 +182,7 @@ async fn terminal_and_non_delivery_rows_are_skipped() {
         &store,
         "node-test-1",
         &[terminal, not_delivery],
-        |_| std::future::ready(true),
+        |_| std::future::ready(ClaimOutcome::Claimed),
         |_| std::future::ready(true),
     )
     .await;
@@ -186,7 +190,8 @@ async fn terminal_and_non_delivery_rows_are_skipped() {
         outcome,
         PollOutcome {
             processed: 0,
-            failed: 0
+            failed: 0,
+            gated: 0,
         }
     );
 }
@@ -210,7 +215,13 @@ async fn two_nodes_sharing_one_cert_cannot_double_dispatch() {
         |task_id| {
             let claims = Arc::clone(&claims);
             let task_id = task_id.to_string();
-            async move { claims.lock().await.insert(task_id) }
+            async move {
+                if claims.lock().await.insert(task_id) {
+                    ClaimOutcome::Claimed
+                } else {
+                    ClaimOutcome::ForeignClaimed
+                }
+            }
         },
         |_| std::future::ready(true),
     )
@@ -231,7 +242,13 @@ async fn two_nodes_sharing_one_cert_cannot_double_dispatch() {
         |task_id| {
             let claims = Arc::clone(&claims);
             let task_id = task_id.to_string();
-            async move { claims.lock().await.insert(task_id) }
+            async move {
+                if claims.lock().await.insert(task_id) {
+                    ClaimOutcome::Claimed
+                } else {
+                    ClaimOutcome::ForeignClaimed
+                }
+            }
         },
         |_| std::future::ready(true),
     )
@@ -240,7 +257,8 @@ async fn two_nodes_sharing_one_cert_cannot_double_dispatch() {
         outcome_b,
         PollOutcome {
             processed: 0,
-            failed: 0
+            failed: 0,
+            gated: 0,
         }
     );
     assert!(store_b.task_get("task-double").await.unwrap().is_none());
@@ -250,6 +268,160 @@ async fn two_nodes_sharing_one_cert_cannot_double_dispatch() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+/// C-2 (node half): a hub moderation gate refuses the claim, and the
+/// node skips WITHOUT mirroring — nothing becomes locally executable
+/// against the hub's verdict, and the ack never runs.
+#[tokio::test]
+async fn gated_delivery_never_mirrors_or_acks() {
+    let store = Store::open_in_memory("poll-gated").await.unwrap();
+    store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+
+    let row = hub_delivery_row("task-gated");
+    let mut acked = Vec::new();
+    let outcome = process_deliveries(
+        &store,
+        "node-test-1",
+        std::slice::from_ref(&row),
+        |_| std::future::ready(ClaimOutcome::Gated),
+        |task_id| {
+            acked.push(task_id.to_string());
+            std::future::ready(true)
+        },
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        PollOutcome {
+            processed: 0,
+            failed: 0,
+            gated: 1,
+        }
+    );
+    // Nothing mirrored: no local task marker, no message record, no
+    // execution intent — and the ack callback never ran.
+    assert!(store.task_get("task-gated").await.unwrap().is_none());
+    assert!(
+        store
+            .events_since("hub-conv-1", 0, 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a gated delivery must leave the local store untouched"
+    );
+    assert!(acked.is_empty(), "a gated delivery is never acked");
+}
+
+/// H-2: a co-hosted echo — a message this node propagated upward
+/// returning as a hub delivery — maps back onto the ORIGINAL local
+/// row: no second message, no second execution intent.
+#[tokio::test]
+async fn cohosted_echo_maps_back_to_the_original_local_message() {
+    let store = Store::open_in_memory("poll-echo").await.unwrap();
+    store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    store.ensure_peer("agy", "agy", "harness").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["codex", "agy", "operator"])
+        .await
+        .unwrap();
+
+    // The local origin: codex posts to agy with execution — one
+    // eligible intent.
+    let origin_id = match store
+        .accept_message(
+            &conversation,
+            "codex",
+            "local-origin-key",
+            "hello agy",
+            true,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "agy".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap()
+    {
+        wrkspc_core::AcceptOutcome::Accepted { message_id }
+        | wrkspc_core::AcceptOutcome::Replay { message_id } => message_id,
+    };
+    assert_eq!(store.due_intents().await.unwrap().len(), 1);
+
+    // The hub echo: a delivery for the same conversation carrying the
+    // origin id (the local message id) and the hub's own message id.
+    let row = TaskRow {
+        task_id: "task-echo".to_string(),
+        context_id: "node-test-1".to_string(),
+        state: "submitted".to_string(),
+        terminal: false,
+        version: 1,
+        task_json: serde_json::json!({
+            "id": "task-echo",
+            "contextId": "node-test-1",
+            "status": {"state": "TASK_STATE_SUBMITTED"},
+            "metadata": {
+                "delivery": {
+                    "kind": "delivery",
+                    "message_id": "hub-assigned-uuid",
+                    "origin_message_id": origin_id,
+                    "conversation_id": conversation,
+                    "sender_peer": "codex",
+                    "sender_name": "codex",
+                    "sender_class": "harness",
+                    "sender_host": "node-test-1",
+                    "recipient_peer": "agy",
+                    "recipient_name": "agy",
+                    "recipient_class": "harness",
+                    "content": "hello agy",
+                    "execution_requested": true,
+                },
+            },
+        })
+        .to_string(),
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    let outcome = process_deliveries(
+        &store,
+        "node-test-1",
+        std::slice::from_ref(&row),
+        |_| std::future::ready(ClaimOutcome::Claimed),
+        |_| std::future::ready(true),
+    )
+    .await;
+    assert_eq!(outcome.processed, 1);
+
+    // Still exactly ONE eligible intent, one accepted message — the
+    // echo did not mint a second execution.
+    assert_eq!(
+        store.due_intents().await.unwrap().len(),
+        1,
+        "the echo must not create a second execution intent"
+    );
+    let events = store.events_since(&conversation, 0, 100).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "message.accepted")
+            .count(),
+        1,
+        "the echo must not create a second message record"
     );
 }
 /// Seeds a node store with one harness-originated message and
@@ -385,7 +557,7 @@ async fn roster_sync_and_presence_upload_ride_the_stamped_routes() {
             |mut request: axum::extract::Request, next: axum::middleware::Next| async move {
                 request.headers_mut().insert(
                     "x-wrkspc-peer",
-                    axum::http::HeaderValue::from_static("CN=test,SAN=node-test-1"),
+                    axum::http::HeaderValue::from_static("node-test-1"),
                 );
                 next.run(request).await
             },
@@ -475,7 +647,7 @@ async fn conversation_mirror_carries_room_names_and_members() {
             |mut request: axum::extract::Request, next: axum::middleware::Next| async move {
                 request.headers_mut().insert(
                     "x-wrkspc-peer",
-                    axum::http::HeaderValue::from_static("CN=test,SAN=node-test-1"),
+                    axum::http::HeaderValue::from_static("node-test-1"),
                 );
                 next.run(request).await
             },

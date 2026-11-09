@@ -43,13 +43,25 @@ pub struct SessionConfig {
 }
 
 /// A live session plus the background tasks that keep it alive.
+#[derive(Debug)]
 struct PeerSession {
     binding: SessionBinding,
+    /// The session handle (its `closed` watch drives dead-session
+    /// eviction — E04/H-15).
+    handle: SessionHandle,
     /// The loopback HTTP listener task for `mcp_http` peers.
-    _http_task: Option<tokio::task::JoinHandle<()>>,
+    http_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl PeerSession {
+    /// Whether the session's transport has ended.
+    fn is_closed(&self) -> bool {
+        self.handle.closed().borrow().is_some()
+    }
 }
 
 /// Shared registry state.
+#[derive(Debug)]
 struct Inner {
     configs: HashMap<String, SessionConfig>,
     sessions: tokio::sync::Mutex<HashMap<String, Arc<PeerSession>>>,
@@ -63,7 +75,7 @@ struct Inner {
 }
 
 /// Spawns ACP sessions on demand with per-peer backoff.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SessionRegistry {
     inner: Arc<Inner>,
 }
@@ -139,8 +151,24 @@ impl Inner {
         if !self.configs.contains_key(peer_id) {
             return None;
         }
-        if let Some(session) = self.sessions.lock().await.get(peer_id).cloned() {
-            return Some(session.binding.clone());
+        let cached = self.sessions.lock().await.get(peer_id).cloned();
+        if let Some(session) = cached {
+            if session.is_closed() {
+                // A dead cached session must be evicted, never
+                // re-promoted: every prompt to it would go unknown and
+                // presence would keep reporting connected (E04/H-15).
+                tracing::warn!(
+                    %peer_id,
+                    reason = %session.handle.closed().borrow().as_deref().unwrap_or("unknown"),
+                    "cached session is dead; evicting",
+                );
+                if let Some(task) = &session.http_task {
+                    task.abort();
+                }
+                self.sessions.lock().await.remove(peer_id);
+            } else {
+                return Some(session.binding.clone());
+            }
         }
         // Fail fast while a previous spawn failure is still backing off.
         if let Some((deadline, _)) = self.backoff.lock().await.get(peer_id)
@@ -150,10 +178,13 @@ impl Inner {
         }
         // One spawn at a time per peer; a concurrent claim that loses
         // the race re-checks the cache inside the lock.
+        // The map is insert-only (entries are never mutated after
+        // creation — mutation happens under each entry's own lock), so
+        // recovering a poisoned guard is safe.
         let spawn_lock = self
             .spawn_locks
             .lock()
-            .expect("spawn lock map")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(peer_id.to_string())
             .or_default()
             .clone();
@@ -161,7 +192,10 @@ impl Inner {
         if let Some(session) = self.sessions.lock().await.get(peer_id).cloned() {
             return Some(session.binding.clone());
         }
-        let config = self.configs.get(peer_id).expect("config checked").clone();
+        // The config was checked above; a missing entry is the
+        // conservative outcome (no binding → the dispatcher records
+        // unknown), never a panic.
+        let config = self.configs.get(peer_id)?.clone();
         match spawn_session(&config, &self.store, &self.db, self.shutdown.clone()).await {
             Ok(session) => {
                 let binding = session.binding.clone();
@@ -223,6 +257,7 @@ async fn spawn_session(
     db: &Path,
     shutdown: watch::Receiver<bool>,
 ) -> Result<PeerSession, String> {
+    tracing::debug!(peer_id = %config.peer_id, "spawning session transport");
     let (handle, _events) = SessionHandle::spawn(StdioTransport::new(config.command.clone()));
     let mcp: Vec<agent_client_protocol::schema::v1::McpServer> = if config.mcp_http {
         // The ACP injection is a dead path for adapters without
@@ -244,7 +279,7 @@ async fn spawn_session(
         );
         let url = format!("http://{addr}/mcp");
         let bearer_header = format!("Authorization: Bearer {}", token);
-        tokio::process::Command::new("agy")
+        let status = tokio::process::Command::new("agy")
             .args([
                 "mcp",
                 "add",
@@ -258,6 +293,15 @@ async fn spawn_session(
             .status()
             .await
             .map_err(|e| format!("agy mcp add failed: {e}"))?;
+        if !status.success() {
+            // A registration that exits nonzero must not be reported as
+            // success: the session would look healthy with no usable
+            // wrkspc tools (E10).
+            return Err(format!(
+                "agy mcp add exited {} for {}",
+                status, config.peer_id
+            ));
+        }
         tracing::info!(
             peer_id = %config.peer_id,
             %url,
@@ -275,21 +319,36 @@ async fn spawn_session(
                 })
                 .await;
         });
-        let session_id = handle
+        let session_id = match handle
             .new_session_with_mcp(config.cwd.clone(), Vec::new())
             .await
-            .map_err(|e| format!("session/new for {} failed: {e}", config.peer_id))?;
-        if let Some(model) = &config.model {
-            pin_model(&handle, &config.peer_id, &session_id, model).await?;
+        {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                // The owned listener must not outlive a failed setup:
+                // close and join it before reporting the failure (E10).
+                task.abort();
+                return Err(format!(
+                    "session/new for {} failed: {error}",
+                    config.peer_id
+                ));
+            }
+        };
+        if let Some(model) = &config.model
+            && let Err(error) = pin_model(&handle, &config.peer_id, &session_id, model).await
+        {
+            task.abort();
+            return Err(error);
         }
         tracing::info!(peer_id = %config.peer_id, %session_id, "session bound (mcp_http)");
         return Ok(PeerSession {
             binding: SessionBinding {
                 peer_id: config.peer_id.clone(),
                 session_id,
-                driver: Arc::new(handle),
+                driver: Arc::new(handle.clone()),
             },
-            _http_task: Some(task),
+            handle,
+            http_task: Some(task),
         });
     } else {
         vec![bridge_injection(db, &config.peer_id)]
@@ -306,9 +365,10 @@ async fn spawn_session(
         binding: SessionBinding {
             peer_id: config.peer_id.clone(),
             session_id,
-            driver: Arc::new(handle),
+            driver: Arc::new(handle.clone()),
         },
-        _http_task: None,
+        handle,
+        http_task: None,
     })
 }
 

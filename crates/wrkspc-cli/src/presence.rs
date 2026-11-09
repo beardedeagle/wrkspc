@@ -14,7 +14,7 @@ use serde::Deserialize;
 use wrkspc_core::{PresenceOutcome, Store};
 
 /// Shared state for the discovery routes.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PresenceState {
     store: Store,
     base_url: String,
@@ -211,8 +211,11 @@ mod tests {
             )
     }
 
+    /// The stamped identity IS the host id (the certificate's first DNS
+    /// SAN, stamped by the accept loop) — kept as a helper so fixtures
+    /// stay honest about the wire shape.
     fn identity(host: &str) -> String {
-        format!("CN=test,SAN={host}")
+        host.to_string()
     }
 
     async fn post_presence(
