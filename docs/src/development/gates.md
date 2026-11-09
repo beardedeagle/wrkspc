@@ -45,6 +45,11 @@ with `lefthook install`.
   changelog changes.
 - `release.yml` runs `just quality` as its gate, then packages and
   signs release tarballs.
+- Every compiling job carries a hand-rolled cargo cache in two
+  entries: the registry (plus the cargo-installed tools) keyed on the
+  lockfile, and a per-job target dir keyed on the manifests, Justfile,
+  toolchain pin, and workflow itself. `actions/cache` only — this repo
+  pins official actions, never third-party cache actions.
 
 ## Docs
 
