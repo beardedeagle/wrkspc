@@ -23,8 +23,7 @@ artifacts later.
   `ghcr.io/<owner>/wrkspc-hub` (`vX.Y.Z` + `latest`, multi-arch
   `linux/amd64`/`linux/arm64`, cosign keyless-signed). The image is
   assembled from the same release binaries as the tarballs — no
-  recompilation in CI — and the package follows the repository across
-  an org transfer. Verify an image signature with:
+  recompilation in CI. Verify an image signature with:
 
   ```console
   $ cosign verify       --certificate-identity https://github.com/<owner>/wrkspc/.github/workflows/release.yml@refs/tags/vX.Y.Z       --certificate-oidc-issuer https://token.actions.githubusercontent.com       ghcr.io/<owner>/wrkspc-hub@<digest>
@@ -42,11 +41,8 @@ first tagged version.
 
 ## macOS signing
 
-Tarballs ship unsigned until Apple Developer Program enrollment is
-complete. The practical impact is small and specific: binaries
-fetched with `curl` or built locally carry no quarantine attribute,
-so Gatekeeper leaves them alone. Browser downloads get quarantined;
-the documented, per-artifact removal is the supported workaround.
-Enrollment buys a Developer ID and notarization — one durable
-identity per app — which replaces ad-hoc signing and retires the
-per-binary prompt class for good.
+Tarballs ship unsigned for now. The practical impact is small and
+specific: binaries fetched with `curl` or built locally carry no
+quarantine attribute, so Gatekeeper leaves them alone. Browser
+downloads get quarantined; the documented, per-artifact removal is
+the supported workaround.
