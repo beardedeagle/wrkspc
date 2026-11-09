@@ -377,7 +377,20 @@
     font-family: ui-monospace, monospace; font-size: 0.66rem; }
   #events-feed .feed-line.failure { color: var(--red); }
   #events-feed .feed-line.attention { color: var(--amber); }
-  .empty-note { color: var(--faint); font-size: 0.85rem; padding: 1rem 0; text-align: center; }
+  .load-earlier {
+  display: block;
+  margin: 0.2rem 0 0.6rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: none;
+  color: var(--muted-foreground);
+  cursor: pointer;
+}
+
+.load-earlier:hover { color: var(--foreground); }
+
+.empty-note { color: var(--faint); font-size: 0.85rem; padding: 1rem 0; text-align: center; }
 
   /* ---- conversation-creation modal ---- */
   #modal-backdrop {
@@ -529,6 +542,17 @@ let editingPeer = null;
 let hideEjected = false;
 let moderationCache = [];
 let composeMode = "message";
+// Rooms whose FULL history the operator has asked to see (UI-19):
+// the transcript loads a bounded window by default and the whole
+// room only on demand.
+const FULL_HISTORY_ROOMS = new Set();
+const INITIAL_WINDOW = 200;
+// Loads the complete message history for the open room.
+async function loadFullHistory() {
+  if (!selected) return;
+  FULL_HISTORY_ROOMS.add(selected);
+  await renderAll();
+}
 // The default compose hint ("as operator · to …"), restored when the
 // box holds no @ mention.
 // The compose hint only ever carries something the operator has to act on: an
@@ -626,8 +650,15 @@ function installTooltips() {
 
 function renderIfChanged(key, h, fn) {
   if (seenHashes[key] === h) return;
-  seenHashes[key] = h;
-  fn();
+  try {
+    fn();
+    // Commit only after a successful render (UI-16): a renderer that
+    // throws must be retried on the next poll, never skipped against
+    // a cached hash recorded before the failure.
+    seenHashes[key] = h;
+  } catch (e) {
+    console.error("render failed for " + key, e);
+  }
 }
 
 // Forgets a render hash so the next render rebuilds that region even when its
@@ -809,9 +840,24 @@ async function loadConversations() {
           return;
         }
         clearTimeout(armTimer);
-        try { await api("/api/conversations/" + encodeURIComponent(c.id), { method: "DELETE" }); }
-        catch { del.title = "delete failed"; return; }
-        if (selected === c.id) selected = null;
+        try {
+          await api("/api/conversations/" + encodeURIComponent(c.id), { method: "DELETE" });
+        } catch (e) {
+          del.title = "delete failed: " + e.message;
+          return;
+        }
+        if (selected === c.id) {
+          // Deleting the OPEN room tears its whole surface down
+          // (UI-15): the stale transcript, gates, and composer must
+          // not stay visible for a room that no longer exists.
+          selected = null;
+          transcriptEvents = [];
+          viewGeneration += 1;
+          seenHashes = {};
+          el("transcript").textContent = "";
+          el("gates-list").textContent = "";
+          el("compose-text").value = "";
+        }
         invalidate("convos");
         await loadConversations();
       };
@@ -880,11 +926,21 @@ function wireRoomDelete(control, conversation) {
     clearTimeout(armTimer);
     try {
       await api("/api/conversations/" + encodeURIComponent(conversation.id), { method: "DELETE" });
-    } catch {
-      control.title = "delete failed";
+    } catch (e) {
+      control.title = "delete failed: " + e.message;
       return;
     }
-    if (selected === conversation.id) selected = null;
+    if (selected === conversation.id) {
+      // Deleting the OPEN room tears its whole surface down (UI-15):
+      // no stale transcript, gates, or composer for a dead room.
+      selected = null;
+      transcriptEvents = [];
+      viewGeneration += 1;
+      seenHashes = {};
+      el("transcript").textContent = "";
+      el("gates-list").textContent = "";
+      el("compose-text").value = "";
+    }
     invalidate("convos");
     await loadConversations();
   };
@@ -969,7 +1025,11 @@ function startRoomRename(block, conversation) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name: value }),
         });
-      } catch { /* a refused name leaves the old one in place */ }
+      } catch (e) {
+        // A refused name (bad value, or hub-owned on a connected node)
+        // is reported; the old name stays in place (UI-17).
+        alert("rename failed: " + e.message);
+      }
     }
     await loadConversations();
   };
@@ -1007,7 +1067,19 @@ async function loadPeers() {
   // construction, so it holds the top of the cohort permanently instead of
   // drifting with the rest of the roster. Everything below keeps its own order.
   visible.sort((a, b) => (b.peer_id === "operator") - (a.peer_id === "operator"));
-  renderIfChanged("peers", hash(JSON.stringify(peers) + JSON.stringify(moderationCache)), () => {
+  // The key carries the client state that shapes this list (UI-14):
+  // the ejected-peer filter and the picker selection. Omitting them
+  // left a stale hash skipping the rebuild after a filter or pick
+  // changed only client state.
+  renderIfChanged(
+    "peers",
+    hash(
+      JSON.stringify(peers) +
+        JSON.stringify(moderationCache) +
+        JSON.stringify(hideEjected) +
+        JSON.stringify([...pickedPeers]),
+    ),
+    () => {
     const list = el("peer-list");
     clear(list);
     if (!visible.length) {
@@ -1279,10 +1351,18 @@ function refreshComposeHint() {
   el("compose-hint").textContent = "";
 }
 
+// Sending is single-flight (UI-12): a second click while a send is in
+// flight is ignored, and the composer is cleared only for the exact
+// draft the send owned — a newer draft typed mid-flight survives.
+let sendInFlight = false;
+let sendDraft = null;
 async function sendComposed() {
   const box = el("compose-text");
   const text = box.value.trim();
   if (!text || !selected) return;
+  if (sendInFlight) return;
+  sendInFlight = true;
+  sendDraft = { text, conversation: selected };
   try {
     if (composeMode === "message") {
       const { targets, unknown } = composeTargets(text);
@@ -1301,10 +1381,20 @@ async function sendComposed() {
         body: JSON.stringify({ text }),
       });
     }
-    box.value = "";
+    // Clear only the SAME draft in the SAME room: an edit or a room
+    // switch while the request was in flight keeps its text (UI-12).
+    if (sendDraft && box.value.trim() === sendDraft.text && selected === sendDraft.conversation) {
+      box.value = "";
+    }
     refreshComposeHint();
     await renderAll();
-  } catch (e) { alert("send failed: " + e.message); }
+  } catch (e) {
+    alert("send failed: " + e.message);
+    // The draft stays in the composer for retry (UI-12).
+  } finally {
+    sendInFlight = false;
+    sendDraft = null;
+  }
 }
 
 /* ---- markdown (safe subset) ---- */
@@ -1322,6 +1412,20 @@ const MD_LINK_PROTOCOLS = ["http:", "https:", "mailto:"];
 // and italic — building DOM with createElement/textContent, never
 // innerHTML, so the text can't inject markup. An unclosed fence (a turn
 // still streaming) runs to the end of the text.
+//
+// Quote nesting is BOUNDED (UI-16): a hostile `>` run thousands deep
+// must not grow the recursion stack without limit — levels beyond the
+// bound render as inert text instead.
+const MAX_QUOTE_DEPTH = 50;
+function unnestQuote(line) {
+  let depth = 0;
+  let rest = line;
+  while (depth < MAX_QUOTE_DEPTH && MD_QUOTE.test(rest)) {
+    rest = rest.replace(/^\s*>\s?/, "");
+    depth++;
+  }
+  return { depth, rest };
+}
 function renderMarkdown(source) {
   const out = document.createDocumentFragment();
   const lines = String(source ?? "").replace(/\r\n?/g, "\n").split("\n");
@@ -1350,7 +1454,12 @@ function renderMarkdown(source) {
     if (MD_RULE.test(line)) { out.appendChild(document.createElement("hr")); i++; continue; }
     if (MD_QUOTE.test(line)) {
       const quoted = [];
-      for (; i < lines.length && MD_QUOTE.test(lines[i]); i++) quoted.push(lines[i].replace(/^\s*>\s?/, ""));
+      for (; i < lines.length && MD_QUOTE.test(lines[i]); i++) {
+        // Unnest iteratively within the bound; the `>` glyphs beyond
+        // it stay as inert text (UI-16).
+        const { depth, rest } = unnestQuote(lines[i]);
+        quoted.push(depth > 1 ? ">".repeat(depth - 1) + rest : rest);
+      }
       out.appendChild(document.createElement("blockquote")).appendChild(renderMarkdown(quoted.join("\n")));
       continue;
     }
@@ -1526,6 +1635,7 @@ async function select(id) {
   eventCursor = 0;
   transcriptEvents = [];
   viewGeneration += 1;
+  const generation = viewGeneration;
   seenHashes = {};
   el("transcript").textContent = "";
   resetFollow();
@@ -1535,7 +1645,12 @@ async function select(id) {
   try {
     await renderAll();
   } finally {
-    el("transcript-scroll").classList.remove("loading");
+    // Only the LATEST selection owns the loading cleanup (UI-11): an
+    // older selection completing must not clear a newer one's gate
+    // while it is still pending.
+    if (generation === viewGeneration) {
+      el("transcript-scroll").classList.remove("loading");
+    }
   }
   await loadConversations();
 }
@@ -1674,8 +1789,12 @@ async function renderAll() {
   refresh = current;
   let messages, events, fences, members;
   try {
+    // The transcript's initial load is BOUNDED (UI-19): the latest
+    // window only — the whole history is fetched on demand, never at
+    // startup or on a room switch.
+    const bounded = !FULL_HISTORY_ROOMS.has(selected);
     [messages, events, fences, members] = await Promise.all([
-      api("/api/conversations/" + selected + "/messages"),
+      api("/api/conversations/" + selected + "/messages" + (bounded ? "?window=" + INITIAL_WINDOW : "")),
       fetchEventsAfter(selected, eventCursor, generation),
       api("/api/conversations/" + selected + "/fences"),
       api("/api/conversations/" + selected).then((c) => c.members),
@@ -1686,6 +1805,9 @@ async function renderAll() {
   // A fetch begun for an earlier view (another conversation, or before a
   // re-select) must not render into the current one.
   if (generation !== viewGeneration) return;
+  // Same-view overlap: a NEWER refresh owns the view — a stale response
+  // finishing last must not roll back its newer state (UI-11).
+  if (refresh !== current) return;
   // The events endpoint is an incremental feed (seq-ordered, append-only):
   // keep only what is new, since overlapping polls can return the same
   // events, so the transcript shows the whole history, not the last batch.
@@ -1696,7 +1818,15 @@ async function renderAll() {
     }
   }
 
-  renderIfChanged("transcript", hash(JSON.stringify(messages) + "#" + eventCursor), () => {
+  // The transcript renders authored content only: messages, streamed
+  // turn output, and authored events. System narration (fence/claim/
+  // ack events) advances the cursor and the side feed WITHOUT
+  // rebuilding every authored row (UI-20).
+  const authoredSeq = transcriptEvents
+    .filter((e) => e.kind === "turn.chunk" || e.kind === "dispatch.started" || AUTHORED_EVENTS.has(e.kind))
+    .map((e) => e.seq + ":" + e.kind + ":" + (e.payload.attempt_id || ""))
+    .join(",");
+  renderIfChanged("transcript", hash(JSON.stringify(messages) + "#" + authoredSeq), () => {
     const scroll = el("transcript-scroll");
     const before = rememberScroll(scroll);
     const transcript = el("transcript");
@@ -1813,6 +1943,16 @@ async function renderAll() {
     }
     rows.sort((a, b) => (a.at - b.at) || (a.ord - b.ord));
     for (const row of rows) appendRow(transcript, row.node, row.when);
+    // The bounded window's disclosure control (UI-19): when older
+    // messages exist, the operator loads them explicitly — memory
+    // stays bounded for the common case.
+    if (!FULL_HISTORY_ROOMS.has(selected) && messages.length >= INITIAL_WINDOW) {
+      const more = document.createElement("button");
+      more.className = "load-earlier";
+      more.textContent = "older messages may exist — load the full history";
+      more.onclick = loadFullHistory;
+      transcript.insertBefore(more, transcript.firstChild);
+    }
     if (!rows.length) {
       const note = document.createElement("div");
       note.className = "empty-note";
@@ -1907,22 +2047,27 @@ async function toggleFence(peerId, kind, existing) {
 //
 // * `action` — `pause`, `block`, or `clear` for every gate in the room.
 async function applyBulkGate(action) {
+  // Capture the target room and its membership ONCE (UI-06): a room
+  // switch mid-action must not redirect later requests to the newly
+  // selected room, and the per-row loops must not read mutable globals.
+  const room = selected;
+  const members = roomMembers.slice();
+  const fences = roomFences.slice();
   if (action === "clear") {
-    for (const gate of roomFences) {
+    for (const gate of fences) {
       await api("/api/fences/" + gate.id, { method: "DELETE" });
     }
-    await renderAll();
-    return;
+  } else {
+    for (const peer of members) {
+      if (fences.some((gate) => gate.peer_id === peer && gate.kind === action)) continue;
+      await api("/api/conversations/" + room + "/fences", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ peer_id: peer, kind: action }),
+      });
+    }
   }
-  for (const peer of roomMembers) {
-    if (roomFences.some((gate) => gate.peer_id === peer && gate.kind === action)) continue;
-    await api("/api/conversations/" + selected + "/fences", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ peer_id: peer, kind: action }),
-    });
-  }
-  await renderAll();
+  if (selected === room) await renderAll();
 }
 
 // Kicks a member out of this room. The peer stays enrolled in the hub and in
@@ -1932,12 +2077,19 @@ async function applyBulkGate(action) {
 //
 // * `peerId` — the member to remove.
 async function kickMember(peerId) {
+  // Capture the target room once: a switch mid-request must not kick
+  // from the newly selected room (UI-06).
+  const room = selected;
   try {
-    await api("/api/conversations/" + selected + "/members/" + encodeURIComponent(peerId), {
+    await api("/api/conversations/" + room + "/members/" + encodeURIComponent(peerId), {
       method: "DELETE",
     });
-  } catch { /* the next render shows the membership as it stands */ }
-  await renderAll();
+  } catch (e) {
+    // A failed moderation action is PRESENTED as a failure (UI-17) —
+    // never suppressed on the theory that a later poll surfaces it.
+    alert("kick failed: " + e.message);
+  }
+  if (selected === room) await renderAll();
 }
 
 // Opens or closes the gates menu. It floats over the transcript, so opening it
@@ -1954,13 +2106,26 @@ function toggleGatesMenu(open) {
 }
 
 async function act(path, method) {
-  await api(path, { method });
+  try {
+    await api(path, { method });
+  } catch (e) {
+    // Moderation failures are presented, not hidden (UI-17).
+    alert("action failed: " + e.message);
+  }
   await renderAll();
 }
 
 async function renderUnknown() {
   let attempts = [];
-  try { attempts = await api("/api/attempts/unknown"); } catch { return; }
+  try {
+    attempts = await api("/api/attempts/unknown");
+  } catch (e) {
+    // A failed read must never leave the stale "none" claim visible
+    // (UI-17): the region says the read failed until it succeeds.
+    const list = el("unknown-list");
+    list.textContent = "could not load unknown attempts: " + e.message;
+    return;
+  }
   renderIfChanged("unknown", hash(JSON.stringify(attempts)), () => {
     const list = el("unknown-list");
     const banner = el("unknown-banner");
@@ -2069,47 +2234,61 @@ function dropGate() {
   if (gate) gate.remove();
 }
 
+// Login attempts are serialized and stale responses disregarded
+// (UI-13): overlapping submissions must not race the token state or
+// double-install the app.
+let connecting = false;
 async function connectWith(value) {
   const candidate = value.trim();
-  if (!candidate) return;
+  if (!candidate || connecting) return;
+  connecting = true;
   el("login-error").textContent = "";
   el("boot").classList.add("connecting");
   token = candidate;
   try {
     await api("/api/conversations");
     localStorage.setItem("wrkspc_token", token);
+    await startApp();
   } catch (e) {
     token = null;
     el("boot").classList.remove("connecting");
     el("login-error").textContent = "rejected — check the token";
-    return;
+  } finally {
+    connecting = false;
   }
-  await startApp();
 }
 
+// One-time DOM wiring runs exactly once (UI-13): a reconnect without a
+// page reload must not stack duplicate listeners, tooltips, or
+// counter timers (a second install made one toggle click open-then-
+// close and doubled bulk actions).
+let appWired = false;
 async function startApp() {
-  installTooltips();
-  el("boot").classList.add("connecting");
-  startCounterTicker();
-  document.addEventListener("click", (event) => {
-    if (!event.target.closest(".delivery")) closeDeliveryMenus();
-  });
-  el("gates-toggle").addEventListener("click", (event) => {
-    event.stopPropagation();
-    toggleGatesMenu();
-  });
-  for (const bulk of document.querySelectorAll("#gates-menu [data-bulk]")) {
-    bulk.addEventListener("click", (event) => {
+  if (!appWired) {
+    appWired = true;
+    installTooltips();
+    startCounterTicker();
+    document.addEventListener("click", (event) => {
+      if (!event.target.closest(".delivery")) closeDeliveryMenus();
+    });
+    el("gates-toggle").addEventListener("click", (event) => {
       event.stopPropagation();
-      applyBulkGate(bulk.dataset.bulk);
+      toggleGatesMenu();
+    });
+    for (const bulk of document.querySelectorAll("#gates-menu [data-bulk]")) {
+      bulk.addEventListener("click", (event) => {
+        event.stopPropagation();
+        applyBulkGate(bulk.dataset.bulk);
+      });
+    }
+    document.addEventListener("click", (event) => {
+      if (!event.target.closest("#convo-head")) toggleGatesMenu(false);
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") toggleGatesMenu(false);
     });
   }
-  document.addEventListener("click", (event) => {
-    if (!event.target.closest("#convo-head")) toggleGatesMenu(false);
-  });
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") toggleGatesMenu(false);
-  });
+  el("boot").classList.add("connecting");
   await loadConversations();
   await loadModeration();
   await loadPeers();

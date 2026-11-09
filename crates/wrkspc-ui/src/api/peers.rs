@@ -18,10 +18,25 @@ pub(crate) async fn list_peers(
 /// and/or hub lifecycle status.
 #[derive(serde::Deserialize)]
 pub(crate) struct PatchPeerBody {
-    /// The new display alias (`null` clears it).
+    /// The new display alias. Absent = untouched; explicit `null` =
+    /// CLEAR (UI-09 — Serde's default `Option<Option<_>>` collapses
+    /// null into "absent", which made clearing impossible); a value =
+    /// set.
+    #[serde(default, deserialize_with = "deserialize_alias_patch")]
     alias: Option<Option<String>>,
     /// The target status (`enrolled`, `booted`, `banned`).
     status: Option<String>,
+}
+
+/// Deserializes the alias patch distinguishing the three shapes:
+/// missing field → `None`, explicit `null` → `Some(None)` (clear), a
+/// string → `Some(Some(value))`.
+fn deserialize_alias_patch<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let inner = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(Some(inner))
 }
 
 /// `PATCH /api/peers/{id}` — the operator's cohort controls: rename
@@ -42,40 +57,75 @@ pub(crate) async fn patch_peer(
             Json(json!({ "error": "nothing to change" })),
         ));
     }
-    if let Some(alias) = body.alias.flatten().as_deref() {
-        let alias = alias.trim();
-        if alias.chars().count() > 64 {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "alias too long (max 64 characters)" })),
-            ));
-        }
-        state
-            .store
-            .set_peer_alias(&id, (!alias.is_empty()).then_some(alias), "operator")
-            .await
-            .map_err(store_error)?;
-    }
-    if let Some(status) = body.status.as_deref() {
-        let parsed = wrkspc_core::PeerStatus::parse(status).ok_or_else(|| {
+    // VALIDATE EVERYTHING BEFORE ANY WRITE (UI-10): a bad status must
+    // never leave a partial alias mutation committed, and a missing
+    // target is 404 — never a 200 with no effect.
+    let status = match body.status.as_deref() {
+        Some(status) => Some(wrkspc_core::PeerStatus::parse(status).ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "unknown status (enrolled, booted, banned)" })),
             )
-        })?;
-        if id == "operator" && parsed.is_ejected() {
+        })?),
+        None => None,
+    };
+    if id == "operator" && status.is_some_and(|s| s.is_ejected()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "the operator peer cannot be ejected" })),
+        ));
+    }
+    // The alias value is validated up front too (missing = untouched,
+    // explicit null = CLEAR, value = set — UI-09 distinguishes them).
+    let alias_value = match &body.alias {
+        None => None, // field absent: no alias change
+        Some(Some(alias)) => {
+            let alias = alias.trim();
+            if alias.chars().count() > 64 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "alias too long (max 64 characters)" })),
+                ));
+            }
+            Some((!alias.is_empty()).then_some(alias))
+        }
+        Some(None) => Some(None), // explicit null: clear the alias
+    };
+    if !state
+        .store
+        .peer_details(&id)
+        .await
+        .map_err(store_error)?
+        .is_some()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unknown peer" })),
+        ));
+    }
+    if let Some(alias) = alias_value {
+        // A hub-connected node mirrors hub-owned alias state: the next
+        // authoritative snapshot would silently overwrite this write
+        // (UI-08), so it is refused loudly instead of reporting
+        // success for state that cannot persist.
+        if !state.hub_role && state.hub_connected {
             return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "the operator peer cannot be ejected" })),
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "the alias is hub-owned on a connected node; change it at the hub"
+                })),
             ));
         }
-        // The serial the peer presented (if any) drives the live deny
-        // set on ban, and its removal on restore.
-        let serial = state
+        // The target's existence was checked above; the store's
+        // silent no-op for a vanished peer is unreachable here except
+        // through a forget race, which the audit trail still records.
+        state
             .store
-            .peer_cert_serial(&id)
+            .set_peer_alias(&id, alias, "operator")
             .await
             .map_err(store_error)?;
+    }
+    if let Some(parsed) = status {
         let updated = state
             .store
             .set_peer_status(&id, parsed, "operator")
@@ -87,16 +137,32 @@ pub(crate) async fn patch_peer(
                 Json(json!({ "error": "unknown peer" })),
             ));
         }
+        // The live deny set mirrors the durable state after EVERY
+        // status change: bans add the peer's serial, restores remove
+        // only that peer's revocation reason — a shared host
+        // certificate stays denied while any peer remains banned, and
+        // the set can never diverge from the store (H-11). The
+        // `--revoke-list` floor is preserved: store re-syncs add to
+        // it, never replace it.
         if let Some(deny) = &state.deny {
-            let mut deny = deny.write().expect("deny lock poisoned");
-            match (parsed, serial) {
-                (wrkspc_core::PeerStatus::Banned, Some(serial)) => {
-                    deny.insert(serial);
+            match state.store.cert_revocations().await {
+                Ok(serials) => {
+                    let mut set: std::collections::HashSet<String> =
+                        deny.floor.iter().cloned().collect();
+                    set.extend(serials);
+                    // The set is rebuilt in full below, so recovering a
+                    // poisoned guard is safe: any partially-mutated
+                    // content is replaced wholesale.
+                    let mut live = deny
+                        .live
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    live.clear();
+                    live.extend(set);
                 }
-                (wrkspc_core::PeerStatus::Enrolled, Some(serial)) => {
-                    deny.remove(&serial);
+                Err(error) => {
+                    tracing::warn!(%error, "deny-set re-sync failed; the live set may lag the store");
                 }
-                _ => {}
             }
         }
     }

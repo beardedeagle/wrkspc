@@ -76,6 +76,7 @@ pub async fn spawn_ui_with(queue_remote_deliveries: bool, hub_role: bool) -> Tes
             token: Some(TOKEN.to_string()),
             queue_remote_deliveries,
             hub_role,
+            hub_connected: false,
         },
         None,
     );

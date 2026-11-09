@@ -1,4 +1,5 @@
 //! Moderation gates: fences, holds, the cancel seam, and guidance.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 use common::*;

@@ -62,6 +62,19 @@ impl CancelRequester for DispatcherHandle {
     }
 }
 
+/// The hub's live certificate-serial revocation service, shared by
+/// every operator surface and the TLS per-request gate. `live` is the
+/// effective deny set (the `--revoke-list` floor ∪ the store's
+/// per-peer revocations); `floor` is the immutable file baseline that
+/// store re-syncs must never drop.
+#[derive(Clone, Debug, Default)]
+pub struct RevocationSet {
+    /// The effective deny set (floor ∪ store revocations).
+    pub live: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    /// The `--revoke-list` file serials (the re-sync floor).
+    pub floor: Arc<std::collections::HashSet<String>>,
+}
+
 /// Shared handler state.
 #[derive(Clone)]
 pub struct AppState {
@@ -69,7 +82,20 @@ pub struct AppState {
     cancel: Arc<dyn CancelRequester>,
     queue_remote_deliveries: bool,
     hub_role: bool,
-    deny: Option<Arc<std::sync::RwLock<std::collections::HashSet<String>>>>,
+    hub_connected: bool,
+    deny: Option<RevocationSet>,
+}
+
+// The cancel requester is a trait object without Debug; the summary
+// carries the observable configuration instead.
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("queue_remote_deliveries", &self.queue_remote_deliveries)
+            .field("hub_role", &self.hub_role)
+            .field("hub_connected", &self.hub_connected)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AppState {
@@ -85,20 +111,24 @@ impl AppState {
     ///   shared store (conversation creation); the node role returns
     ///   404 for it (a node-created conversation would never reach the
     ///   hub).
-    /// * `deny` — the hub's live certificate-serial deny set, when this
-    ///   surface is embedded on the mTLS listener.
+    /// * `hub_connected` — whether this surface mirrors hub-owned
+    ///   state (connected node): hub-owned mutations refuse loudly.
+    /// * `deny` — the hub's live certificate-serial revocation set,
+    ///   when this surface can moderate TLS identity.
     pub fn new(
         store: Store,
         cancel: Arc<dyn CancelRequester>,
         queue_remote_deliveries: bool,
         hub_role: bool,
-        deny: Option<Arc<std::sync::RwLock<std::collections::HashSet<String>>>>,
+        hub_connected: bool,
+        deny: Option<RevocationSet>,
     ) -> Self {
         Self {
             store,
             cancel,
             queue_remote_deliveries,
             hub_role,
+            hub_connected,
             deny,
         }
     }

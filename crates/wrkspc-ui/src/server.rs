@@ -27,12 +27,22 @@ pub struct UiConfig {
     /// (conversation creation). The node role leaves this `false` and
     /// its `POST /api/conversations` returns 404.
     pub hub_role: bool,
+    /// Whether this surface dials a hub and mirrors hub-owned state
+    /// (conversation names, peer aliases). Hub-owned mutations are
+    /// refused with 409 instead of reporting success for writes the
+    /// next authoritative snapshot erases (UI-08).
+    pub hub_connected: bool,
 }
 
+// The default bind address is a compile-time constant; the `expect`
+// is the reviewed static-value allowance (a regression is caught by
+// any test that boots a server).
+#[allow(clippy::expect_used)]
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:0".parse().expect("static address parses"),
+            hub_connected: false,
             token: None,
             queue_remote_deliveries: false,
             hub_role: false,
@@ -45,7 +55,18 @@ pub struct UiServer {
     config: UiConfig,
     store: Store,
     cancel: Arc<dyn crate::api::CancelRequester>,
-    deny: Option<Arc<std::sync::RwLock<std::collections::HashSet<String>>>>,
+    deny: Option<crate::api::RevocationSet>,
+}
+
+// The cancel requester is a trait object without Debug; the summary
+// carries the observable configuration instead.
+impl std::fmt::Debug for UiServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UiServer")
+            .field("config", &self.config)
+            .field("has_deny_set", &self.deny.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl UiServer {
@@ -64,7 +85,7 @@ impl UiServer {
         store: Store,
         cancel: Arc<dyn crate::api::CancelRequester>,
         config: UiConfig,
-        deny: Option<Arc<std::sync::RwLock<std::collections::HashSet<String>>>>,
+        deny: Option<crate::api::RevocationSet>,
     ) -> Self {
         Self {
             config,
@@ -124,6 +145,7 @@ impl UiServer {
             self.cancel,
             self.config.queue_remote_deliveries,
             self.config.hub_role,
+            self.config.hub_connected,
             self.deny,
         );
 
@@ -139,10 +161,17 @@ impl UiServer {
                         .map(|presented| presented == token)
                         .unwrap_or(false);
                     if !authorized {
-                        return axum::response::Response::builder()
+                        let response = axum::response::Response::builder()
                             .status(axum::http::StatusCode::UNAUTHORIZED)
-                            .body(axum::body::Body::from("unauthorized"))
-                            .expect("static response builds");
+                            .body(axum::body::Body::from("unauthorized"));
+                        return match response {
+                            Ok(response) => response,
+                            // A static status and static body cannot fail;
+                            // this arm guards against builder misuse.
+                            Err(error) => {
+                                unreachable!("static unauthorized response failed: {error}")
+                            }
+                        };
                     }
                     next.run(request).await
                 }
@@ -195,9 +224,14 @@ impl UiServer {
 /// would show a stale UI (and a stale token prompt), so the browser must
 /// re-fetch on every load.
 async fn static_index() -> axum::response::Response {
-    axum::response::Response::builder()
+    match axum::response::Response::builder()
         .header("content-type", "text/html; charset=utf-8")
         .header("cache-control", "no-store")
         .body(axum::body::Body::from(crate::static_ui::INDEX_HTML))
-        .expect("static response builds")
+    {
+        Ok(response) => response,
+        // Static headers and a static body cannot fail; this arm guards
+        // against builder misuse.
+        Err(error) => unreachable!("static index response failed: {error}"),
+    }
 }

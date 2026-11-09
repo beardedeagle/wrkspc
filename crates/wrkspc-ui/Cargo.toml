@@ -15,8 +15,11 @@ uuid.workspace = true
 tracing.workspace = true
 axum = "0.8"
 regex = "1"
-wrkspc-core = { path = "../wrkspc-core" }
-wrkspc-dispatcher = { path = "../wrkspc-dispatcher" }
+wrkspc-core = { version = "0.1.0", path = "../wrkspc-core" }
+wrkspc-dispatcher = { version = "0.1.0", path = "../wrkspc-dispatcher" }
+
+[lints]
+workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

@@ -1,4 +1,5 @@
 //! The bearer-token gate and the static page shell.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 use common::*;

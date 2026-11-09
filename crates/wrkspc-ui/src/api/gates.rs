@@ -141,6 +141,8 @@ pub(crate) async fn post_message(
                         local_host: wrkspc_core::PILOT_HOST_ID,
                         conversation_id: &id,
                         message_id: &message_id,
+                        // Operator posts have no node-side origin.
+                        origin_message_id: None,
                         sender_peer: "operator",
                         content: &body.content,
                         execution_requested: true,

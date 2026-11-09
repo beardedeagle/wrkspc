@@ -72,6 +72,18 @@ pub(crate) async fn rename_conversation(
 ) -> Result<Json<ConversationView>, (StatusCode, Json<Value>)> {
     /// Longest name accepted, matching the peer alias limit.
     const MAX_NAME_CHARS: usize = 64;
+    // A hub-connected node mirrors hub-owned names: the next
+    // authoritative snapshot erases a local rename, so it is refused
+    // loudly instead of reporting success for state that cannot
+    // persist (UI-08).
+    if !state.hub_role && state.hub_connected {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "the conversation name is hub-owned on a connected node; change it at the hub"
+            })),
+        ));
+    }
     if let Some(name) = body.name.as_deref()
         && name.trim().chars().count() > MAX_NAME_CHARS
     {
@@ -144,11 +156,25 @@ pub(crate) async fn conversation_events(
     Ok(Json(redacted))
 }
 
+/// `?window=N` bounds the response to the latest N messages (UI-19):
+/// the transcript's initial load stays bounded instead of pulling a
+/// whole room into memory; the unbounded form remains for explicit
+/// full-history reads.
+#[derive(serde::Deserialize)]
+pub(crate) struct MessageQuery {
+    window: Option<u32>,
+}
+
 pub(crate) async fn conversation_messages(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<MessageQuery>,
 ) -> Result<Json<Vec<MessageView>>, (StatusCode, Json<Value>)> {
-    let mut messages = state.store.list_messages(&id).await.map_err(store_error)?;
+    let mut messages = match query.window {
+        Some(window) => state.store.list_messages_window(&id, window).await,
+        None => state.store.list_messages(&id).await,
+    }
+    .map_err(store_error)?;
     for message in &mut messages {
         message.content = redact(&message.content);
     }
@@ -187,6 +213,17 @@ pub(crate) async fn create_conversation(
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "conversation creation is hub-only" })),
+        ));
+    }
+    // The operator must be a member by construction (UI-18): every UI
+    // post is authored as `operator`, and a room the operator cannot
+    // post to presents a working composer that can only fail.
+    if !body.members.iter().any(|member| member == "operator") {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "the operator must be a member of every conversation"
+            })),
         ));
     }
     for member in &body.members {

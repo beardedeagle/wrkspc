@@ -1,5 +1,6 @@
 //! Operator posts and unknown-attempt reconciliation, including the
 //! hub/node delivery-queueing split.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 use common::*;
@@ -302,6 +303,7 @@ async fn hub_mode_operator_post_queues_remote_deliveries() {
             token: Some(TOKEN.to_string()),
             queue_remote_deliveries: true,
             hub_role: true,
+            hub_connected: false,
         },
         None,
     );
@@ -369,6 +371,7 @@ async fn node_mode_operator_post_queues_nothing() {
             token: Some(TOKEN.to_string()),
             queue_remote_deliveries: false,
             hub_role: false,
+            hub_connected: false,
         },
         None,
     );

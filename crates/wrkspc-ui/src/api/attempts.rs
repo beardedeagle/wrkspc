@@ -134,7 +134,7 @@ mod tests {
             .await
             .unwrap();
 
-        let state = AppState::new(store, Arc::new(NoCancel), false, true, None);
+        let state = AppState::new(store, Arc::new(NoCancel), false, true, false, None);
         let Json(views) = unknown_attempts(State(state)).await.unwrap();
         assert_eq!(views.len(), 1);
         let reason = views[0].stop_reason.as_deref().unwrap();

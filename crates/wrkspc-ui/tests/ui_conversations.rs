@@ -2,6 +2,7 @@
 //!
 //! A name is display metadata the hub owns: nullable, non-unique, and mirrored
 //! to nodes. These tests pin the wire behaviour the UI's inline rename relies on.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 use common::*;

@@ -1,5 +1,6 @@
 //! The roster, the moderation surface, and hub/node conversation
 //! creation roles.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 use common::*;
@@ -28,6 +29,7 @@ async fn peers_route_returns_the_roster() {
             token: Some(TOKEN.to_string()),
             queue_remote_deliveries: false,
             hub_role: false,
+            hub_connected: false,
         },
         None,
     );
@@ -206,6 +208,7 @@ async fn hub_role_creates_conversations_and_validates_members() {
             token: Some(TOKEN.to_string()),
             queue_remote_deliveries: true,
             hub_role: true,
+            hub_connected: false,
         },
         None,
     );
@@ -278,6 +281,7 @@ async fn node_role_refuses_conversation_creation() {
             token: Some(TOKEN.to_string()),
             queue_remote_deliveries: false,
             hub_role: false,
+            hub_connected: false,
         },
         None,
     );
