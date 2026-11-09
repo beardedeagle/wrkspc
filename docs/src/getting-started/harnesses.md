@@ -19,6 +19,9 @@ a session to it. The bindable cohort:
 | `codex` | `codex-acp` (npm) | Spawned via `npx`; the binding pins the version |
 | `antigravity` | `antigravity-acp` | Gemini's harness; per-session model pinning is configured through it |
 | `pi` | `pi-acp` | ACP adapter for the Pi coding agent |
+| `qwen` | `qwen --acp` | Qwen Code's native ACP mode (v0.27+) |
+| `kimi` | `kimi acp` | Kimi Code CLI's ACP server over stdio |
+| `mcode` | `mcode acp` | MiniMax Code's ACP server; the binding's `cwd` must be a real project — session/new resolves a session project from it |
 
 Unknown harnesses still work: anything with an ACP-capable command
 binds the same way. The registry entry only controls what `skill
