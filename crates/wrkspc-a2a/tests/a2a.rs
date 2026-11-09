@@ -1,19 +1,21 @@
 //! Integration tests for the A2A surface: the TaskStore adapter over the
 //! durable store, and the full wire path (card discovery → six methods)
 //! against a real loopback socket with the pinned client.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use a2a::{
-    GetTaskRequest, ListTasksRequest, Message, Part, Role, SendMessageRequest, SendMessageResponse,
-    Task, TaskState,
+    Artifact, GetTaskRequest, ListTasksRequest, Message, Part, Role, SendMessageRequest,
+    SendMessageResponse, Task, TaskState,
 };
 use a2a_client::agent_card::AgentCardResolver;
 use a2a_client::{A2AClient, A2AClientFactory};
 use a2a_server::task_store::TaskStore;
+use a2a_server::{AgentExecutor, ExecutorContext};
 use futures::StreamExt;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use wrkspc_a2a::{A2aSurface, WrkspcTaskStore};
+use wrkspc_a2a::{A2aSurface, WrkspcExecutor, WrkspcTaskStore};
 use wrkspc_core::Store;
 
 fn user_message(text: &str) -> Message {
@@ -98,6 +100,75 @@ async fn adapter_terminal_immutability_and_idempotent_reemission() {
     assert_eq!(version, 2);
 }
 
+/// A2A cancel reaches the EXECUTION, not just the task row (H-cancel
+/// propagation): canceling a delivery task closes the queued execution
+/// intent the envelope describes.
+#[tokio::test]
+async fn cancel_propagates_to_the_deliverys_execution_intent() {
+    let store = wrkspc_core::Store::open_in_memory("a2a-cancel-propagates")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    let conversation_id = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+    let wrkspc_core::AcceptOutcome::Accepted { message_id } = store
+        .accept_message(
+            &conversation_id,
+            "operator",
+            "k1",
+            "do the thing",
+            true,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "codex".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("fresh accept");
+    };
+    let task_id = store
+        .task_create_delivery(wrkspc_core::DeliveryTaskRequest {
+            recipient_host: "node-work-mac",
+            recipient_peer: "codex",
+            recipient_name: "codex",
+            recipient_class: "harness",
+            message_id: &message_id,
+            origin_message_id: None,
+            conversation_id: &conversation_id,
+            sender_peer: "operator",
+            sender_name: "operator",
+            sender_class: "human",
+            sender_host: "hub",
+            content: "do the thing",
+            execution_requested: true,
+        })
+        .await
+        .unwrap();
+    let adapter = crate::WrkspcTaskStore::new(store.clone());
+    let canceled = adapter.begin_cancel(&task_id).await.expect("cancel");
+    assert_eq!(canceled.status.state, TaskState::Canceled);
+    // The intent the envelope describes is actually canceled — the
+    // cancellation reached the work, not just the row.
+    assert!(
+        store
+            .recipient_intent_canceled(&message_id, "codex")
+            .await
+            .unwrap(),
+        "the cancel must close the delivery's execution intent"
+    );
+}
+
 /// Begin-cancel transitions a non-terminal task atomically and refuses an already-terminal one.
 #[tokio::test]
 async fn adapter_begin_cancel_is_atomic_and_terminal_aware() {
@@ -122,6 +193,73 @@ async fn adapter_begin_cancel_is_atomic_and_terminal_aware() {
         .begin_cancel("missing")
         .await
         .expect_err("unknown task must fail");
+}
+
+/// Cancel preserves the task record (H-13): the context, history,
+/// artifacts, and delivery metadata survive; only the status
+/// transitions. A cancel that replaced the blob with `{id, contextId:
+/// "", canceled}` would erase the delivery envelope the node needs.
+#[tokio::test]
+async fn begin_cancel_preserves_the_task_record() {
+    let store = Store::open_in_memory("a2a-test").await.unwrap();
+    let adapter = WrkspcTaskStore::new(store.clone());
+
+    let mut task = task("t1", "ctx-a", TaskState::Working, None);
+    task.context_id = "ctx-a".to_string();
+    task.metadata = Some(std::collections::HashMap::from([(
+        "delivery".to_string(),
+        serde_json::json!({
+            "kind": "delivery",
+            "message_id": "m1",
+            "recipient_peer": "codex",
+            "content": "held turn",
+        }),
+    )]));
+    task.history = Some(vec![user_message("turn")]);
+    task.artifacts = Some(vec![Artifact {
+        artifact_id: "a1".to_string(),
+        name: Some("out".to_string()),
+        description: Some("turn output".to_string()),
+        parts: vec![Part::text("reply".to_string())],
+        metadata: None,
+        extensions: None,
+    }]);
+    adapter.create(task).await.unwrap();
+
+    let canceled = adapter.begin_cancel("t1").await.expect("cancel");
+    assert_eq!(canceled.status.state, TaskState::Canceled);
+    assert_eq!(canceled.context_id, "ctx-a", "context survives cancel");
+    let metadata = canceled
+        .metadata
+        .as_ref()
+        .expect("metadata survives cancel");
+    assert_eq!(
+        metadata["delivery"]["message_id"], "m1",
+        "the delivery envelope survives cancel: {metadata:#?}"
+    );
+    assert_eq!(
+        canceled.history.as_ref().map(Vec::len),
+        Some(1),
+        "history survives cancel"
+    );
+    assert_eq!(
+        canceled.artifacts.as_ref().map(Vec::len),
+        Some(1),
+        "artifacts survive cancel"
+    );
+
+    // The stored relational row agrees with the returned JSON.
+    let row = store.task_get("t1").await.unwrap().expect("row exists");
+    assert!(row.terminal, "the row is terminal after cancel");
+    let blob: serde_json::Value = serde_json::from_str(&row.task_json).unwrap();
+    assert_eq!(
+        blob["metadata"]["delivery"]["message_id"], "m1",
+        "the stored blob keeps the envelope"
+    );
+    assert_eq!(
+        blob["contextId"], "ctx-a",
+        "the stored blob keeps the context"
+    );
 }
 
 /// List applies the context/state filters and keyset pagination in newest-first order.
@@ -184,6 +322,67 @@ async fn adapter_list_filters_and_paginates() {
         .expect("page two");
     assert_eq!(page_two.tasks.len(), 2, "remaining rows on page two");
     assert!(page_two.next_page_token.is_empty(), "no third page");
+    // P11: `total_size` is the logical query total on EVERY page — the
+    // keyset cursor must never shrink it to the remaining suffix.
+    assert_eq!(all.total_size, 4, "page one reports the logical total");
+    assert_eq!(page_two.total_size, 4, "page two reports the same total");
+}
+
+/// P11 (artifact half): an explicit `include_artifacts: Some(false)`
+/// strips artifact payloads at the response boundary; other values
+/// return the stored task as-is.
+#[tokio::test]
+async fn list_honors_artifact_exclusion() {
+    let store = Store::open_in_memory("a2a-test").await.unwrap();
+    let adapter = WrkspcTaskStore::new(store);
+
+    let mut task = task("t1", "ctx-a", TaskState::Working, None);
+    task.artifacts = Some(vec![Artifact {
+        artifact_id: "a1".to_string(),
+        name: Some("out".to_string()),
+        description: None,
+        parts: vec![Part::text("payload".to_string())],
+        metadata: None,
+        extensions: None,
+    }]);
+    adapter.create(task).await.unwrap();
+
+    let with_artifacts = adapter
+        .list(&ListTasksRequest {
+            context_id: Some("ctx-a".to_string()),
+            status: None,
+            page_size: Some(10),
+            page_token: None,
+            history_length: None,
+            status_timestamp_after: None,
+            include_artifacts: Some(true),
+            tenant: None,
+        })
+        .await
+        .expect("list with artifacts");
+    assert_eq!(
+        with_artifacts.tasks[0].artifacts.as_ref().map(Vec::len),
+        Some(1)
+    );
+
+    let without = adapter
+        .list(&ListTasksRequest {
+            context_id: Some("ctx-a".to_string()),
+            status: None,
+            page_size: Some(10),
+            page_token: None,
+            history_length: None,
+            status_timestamp_after: None,
+            include_artifacts: Some(false),
+            tenant: None,
+        })
+        .await
+        .expect("list without artifacts");
+    assert!(
+        without.tasks[0].artifacts.is_none(),
+        "an explicit false must strip artifacts: {:?}",
+        without.tasks[0].artifacts
+    );
 }
 
 // ── Wire path ──────────────────────────────────────────────────────────────
@@ -369,4 +568,75 @@ fn part_text(part: a2a::Part) -> String {
         a2a::PartContent::Text(text) => text,
         other => panic!("expected text part, got {other:?}"),
     }
+}
+
+/// P05: a continuation preserves the stored task's metadata (the
+/// delivery envelope), artifacts, history, and a progressing state; the
+/// current input is appended exactly once.
+#[tokio::test]
+async fn executor_continuation_preserves_the_stored_record() {
+    let store = wrkspc_core::Store::open_in_memory("a2a-executor-continuation")
+        .await
+        .unwrap();
+    let mut stored = task("t1", "ctx-a", TaskState::Working, None);
+    stored.metadata = Some(std::collections::HashMap::from([(
+        "delivery".to_string(),
+        serde_json::json!({"message_id": "m1", "recipient_peer": "codex"}),
+    )]));
+    stored.artifacts = Some(vec![Artifact {
+        artifact_id: "a1".to_string(),
+        name: Some("out".to_string()),
+        description: None,
+        parts: vec![Part::text("turn output".to_string())],
+        metadata: None,
+        extensions: None,
+    }]);
+    stored.history = Some(vec![user_message("first turn")]);
+    let first = stored.history.as_ref().unwrap()[0].clone();
+
+    let ctx = ExecutorContext {
+        message: Some(user_message("second turn")),
+        task_id: "t1".into(),
+        stored_task: Some(stored),
+        context_id: "ctx-a".to_string(),
+        metadata: None,
+        user: None,
+        service_params: Default::default(),
+        tenant: None,
+    };
+    let stream = WrkspcExecutor::new(store.clone()).execute(ctx);
+    let events: Vec<_> = futures::StreamExt::collect(stream).await;
+    let event = events.into_iter().next().expect("one event").expect("ok");
+    let a2a::event::StreamResponse::Task(task) = event else {
+        panic!("the stream must begin with the Task object");
+    };
+
+    // The record survives (P05): metadata, artifacts, history, state.
+    assert_eq!(
+        task.metadata.as_ref().unwrap()["delivery"]["message_id"],
+        "m1"
+    );
+    assert_eq!(task.artifacts.as_ref().map(Vec::len), Some(1));
+    let history = task.history.expect("history preserved");
+    assert_eq!(
+        history.len(),
+        2,
+        "the current input is appended once: {history:#?}"
+    );
+    assert_eq!(
+        history[0].message_id, first.message_id,
+        "existing history kept"
+    );
+    assert!(
+        history[1]
+            .parts
+            .iter()
+            .any(|p| matches!(&p.content, a2a::PartContent::Text(t) if t == "second turn")),
+        "the new input rides the history: {history:#?}"
+    );
+    assert_eq!(
+        task.status.state,
+        TaskState::Working,
+        "a progressing task keeps its state instead of resetting to Submitted"
+    );
 }

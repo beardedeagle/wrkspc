@@ -9,6 +9,7 @@
 //! recorded as `submitted` with a status message, and execution state is
 //! driven by the dispatcher (unit 5). A completed *turn* is never claimed
 //! as task success (D-3 predicate).
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod executor;
 pub mod server;
@@ -16,7 +17,9 @@ pub mod state_mapping;
 pub mod store_adapter;
 
 pub use executor::WrkspcExecutor;
-pub use server::{A2aSurface, build_agent_card, build_peer_card, cert_serial_hex, peer_identity};
+pub use server::{
+    A2aSurface, build_agent_card, build_peer_card, cert_serial_hex, host_identity, peer_identity,
+};
 pub use state_mapping::LifecycleState;
 pub use store_adapter::WrkspcTaskStore;
 

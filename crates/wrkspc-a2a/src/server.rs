@@ -287,6 +287,9 @@ impl A2aSurface {
         let app = decorate(self.into_router(&base_url));
         let resolve_peer = std::sync::Arc::new(resolve_peer);
         let mut shutdown = std::pin::pin!(shutdown);
+        // Connection tasks are TRACKED and aborted at shutdown (P09):
+        // `serve_tls` returning must not leave connections serving.
+        let mut connections = tokio::task::JoinSet::new();
 
         tracing::info!(%addr, "wrkspc A2A surface bound (TLS)");
         loop {
@@ -297,11 +300,23 @@ impl A2aSurface {
                     let acceptor = acceptor.clone();
                     let app = app.clone();
                     let resolve_peer = resolve_peer.clone();
-                    tokio::spawn(async move {
-                        let tls = match acceptor.accept(tcp).await {
-                            Ok(tls) => tls,
-                            Err(error) => {
+                    connections.spawn(async move {
+                        // Bound the TLS handshake (P09): a client that
+                        // connects and never completes TLS must not pin
+                        // a task forever; incomplete handshakes time out.
+                        let tls = match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            acceptor.accept(tcp),
+                        )
+                        .await
+                        {
+                            Ok(Ok(tls)) => tls,
+                            Ok(Err(error)) => {
                                 tracing::warn!(%peer_addr, %error, "TLS handshake rejected");
+                                return;
+                            }
+                            Err(_) => {
+                                tracing::warn!(%peer_addr, "TLS handshake timed out");
                                 return;
                             }
                         };
@@ -328,19 +343,40 @@ impl A2aSurface {
                                 Some(identity)
                             }
                         };
-                        // Stamp the verified identity onto every request this
-                        // connection makes; handlers trust this header over
-                        // anything the client asserts in the payload. Unstamped
-                        // connections carry no header.
+                        // Stamp the verified identity and serial onto every
+                        // request this connection makes; handlers trust these
+                        // headers over anything the client asserts in the
+                        // payload. Unstamped connections carry neither — and
+                        // any client-supplied stamp is removed FIRST, so a
+                        // cert-less connection can never forge the peer
+                        // identity this surface enforces.
+                        let serial = certs.first().and_then(cert_serial_hex);
                         let stamped = tower::ServiceBuilder::new()
                             .map_request(
                                 move |mut request: hyper::Request<hyper::body::Incoming>| {
-                                    if let Some(identity) = &identity {
+                                    request.headers_mut().remove("x-wrkspc-peer");
+                                    request.headers_mut().remove("x-wrkspc-serial");
+                                    // The identities come from verified cert
+                                    // SANs; a header-parse failure here would
+                                    // be a bug, and dropping the header fails
+                                    // CLOSED — the request is then anonymous
+                                    // and the peer-stamp middleware denies it.
+                                    if let Some(identity) = &identity
+                                        && let Ok(value) = identity.parse::<hyper::header::HeaderValue>()
+                                    {
                                         request.headers_mut().insert(
                                             hyper::header::HeaderName::from_static("x-wrkspc-peer"),
-                                            identity
-                                                .parse()
-                                                .expect("identity string must be a valid header value"),
+                                            value,
+                                        );
+                                    }
+                                    if let Some(serial) = &serial
+                                        && let Ok(value) = serial.parse::<hyper::header::HeaderValue>()
+                                    {
+                                        request.headers_mut().insert(
+                                            hyper::header::HeaderName::from_static(
+                                                "x-wrkspc-serial",
+                                            ),
+                                            value,
                                         );
                                     }
                                     request
@@ -359,6 +395,10 @@ impl A2aSurface {
                 }
             }
         }
+        // Stop accepting, then stop serving: existing connections are
+        // aborted and joined before `serve_tls` returns (P09).
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
         Ok(addr)
     }
 
@@ -376,7 +416,7 @@ impl A2aSurface {
     /// The router (JSON-RPC + REST + agent card).
     pub fn into_router(self, base_url: &str) -> axum::Router {
         let handler = Arc::new(DefaultRequestHandler::new(
-            WrkspcExecutor,
+            WrkspcExecutor::new(self.store.clone()),
             WrkspcTaskStore::new(self.store),
         ));
         let card_producer = Arc::new(StaticAgentCard::new(build_agent_card(base_url, self.mtls)));
@@ -391,8 +431,11 @@ impl A2aSurface {
     }
 }
 
-/// Extracts `CN` + DNS SANs from a DER certificate for log/policy
-/// attribution.
+/// Extracts `CN` + DNS SANs from a DER certificate for LOG/display
+/// attribution only. This string must never participate in identity
+/// or authorization decisions — the CN is free text chosen by the CA
+/// issuer and can carry `SAN=` markers; the stamped identity is
+/// [`host_identity`], built from the parsed SAN extension alone.
 ///
 /// # Arguments
 ///
@@ -432,6 +475,41 @@ pub fn peer_identity(cert: &rustls_pki_types::CertificateDer<'_>) -> Option<Stri
     })
 }
 
+/// Extracts the authorization identity (the host id) from a client
+/// certificate: the FIRST DNS SAN of the parsed SAN extension, never
+/// anything parsed out of human-readable subject text.
+///
+/// The TLS accept loop stamps this value alone as `x-wrkspc-peer`;
+/// downstream handlers treat the header as the authenticated host.
+/// A certificate without a DNS SAN yields `None` — the connection is
+/// served unstamped and the stamp gate keeps it off the A2A routes
+/// (fail-closed: the CN alone is never an identity).
+///
+/// # Arguments
+///
+/// * `cert` — a leaf certificate in DER form.
+///
+/// # Returns
+///
+/// The first DNS SAN, or `None` when the certificate cannot be parsed
+/// or carries no DNS SAN.
+pub fn host_identity(cert: &rustls_pki_types::CertificateDer<'_>) -> Option<String> {
+    let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref()).ok()?;
+    parsed
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .and_then(|ext| {
+            ext.value.general_names.iter().find_map(|name| match name {
+                x509_parser::extensions::GeneralName::DNSName(d) => {
+                    let host = d.to_string();
+                    (!host.is_empty()).then_some(host)
+                }
+                _ => None,
+            })
+        })
+}
+
 /// Reads the leaf serial as lowercase hex, normalized to match revoke
 /// records: DER INTEGER serials with the high bit set carry a leading
 /// `0x00` that `step`/`openssl` omit, so leading zeros are stripped.
@@ -457,4 +535,73 @@ pub fn cert_serial_hex(cert: &rustls_pki_types::CertificateDer<'_>) -> Option<St
     } else {
         trimmed.to_string()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cert_serial_hex, host_identity, peer_identity};
+    use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+    use rustls_pki_types::CertificateDer;
+
+    /// Builds a client certificate whose CN carries a crafted
+    /// `SAN=` marker while its DNS SAN is the real host.
+    fn crafted_cn_cert() -> CertificateParams {
+        let mut params = CertificateParams::new(vec!["node-attacker".to_string()]).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "SAN=node-victim");
+        params
+    }
+
+    /// Signs `params` under a fresh CA and returns the leaf DER.
+    fn sign(params: CertificateParams) -> CertificateDer<'static> {
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "wrkspc-test-ca");
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+        CertificateDer::from(leaf.der().to_vec())
+    }
+
+    /// H-1: the authorization identity is the parsed DNS SAN alone —
+    /// CN text carrying a `SAN=` marker can never override it.
+    #[test]
+    fn host_identity_is_the_parsed_san_never_cn_text() {
+        let cert = sign(crafted_cn_cert());
+        assert_eq!(
+            host_identity(&cert).as_deref(),
+            Some("node-attacker"),
+            "the DNS SAN is the host, not text parsed out of the CN"
+        );
+        // The display string still carries the CN (for logs only), and
+        // must never be used for attribution.
+        let display = peer_identity(&cert).unwrap();
+        assert!(
+            display.contains("SAN=node-victim"),
+            "the display string keeps the raw CN text: {display}"
+        );
+        assert!(
+            cert_serial_hex(&cert).is_some(),
+            "serial extraction still works on the crafted leaf"
+        );
+    }
+
+    /// A certificate without a DNS SAN has no host identity: it is
+    /// served unstamped and the stamp gate keeps it off the A2A routes
+    /// (fail-closed — the CN alone is never an identity).
+    #[test]
+    fn cert_without_dns_san_has_no_host_identity() {
+        let mut params = CertificateParams::new(Vec::new()).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "cn-only");
+        let cert = sign(params);
+        assert_eq!(host_identity(&cert), None);
+    }
 }

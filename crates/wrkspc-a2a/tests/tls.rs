@@ -9,6 +9,7 @@
 //!    HTTP, while healthy peers pass;
 //! 4. `cert_serial_hex` normalizes DER serial padding to match revoke
 //!    records (the deny-list comparison contract).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 

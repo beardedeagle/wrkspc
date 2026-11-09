@@ -17,7 +17,7 @@ axum = "0.8"
 async-trait = "0.1"
 a2a-lf.workspace = true
 a2a-server-lf.workspace = true
-wrkspc-core = { path = "../wrkspc-core" }
+wrkspc-core = { version = "0.1.0", path = "../wrkspc-core" }
 tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-pki-types = "1"
@@ -25,6 +25,9 @@ hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 tower = "0.5"
 x509-parser = "0.16"
+
+[lints]
+workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

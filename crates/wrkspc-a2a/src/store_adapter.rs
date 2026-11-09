@@ -21,7 +21,12 @@ struct PageToken {
 
 impl PageToken {
     fn encode(&self) -> String {
-        serde_json::to_string(self).expect("page token serialization cannot fail")
+        match serde_json::to_string(self) {
+            Ok(encoded) => encoded,
+            // A PageToken is a flat struct of strings; serialization
+            // cannot fail, and a failure would be a bug in this module.
+            Err(error) => unreachable!("page token serialization failed: {error}"),
+        }
     }
 
     fn decode(token: &str) -> Option<Self> {
@@ -151,6 +156,20 @@ impl TaskStore for WrkspcTaskStore {
             .iter()
             .map(|r| task_from_json(&r.task_json))
             .collect::<Result<Vec<_>, _>>()?;
+        // include_artifacts is honored at the response boundary (P11):
+        // an explicit `false` strips artifact payloads; anything else
+        // (including `None`) returns the stored task as-is.
+        let tasks = if req.include_artifacts == Some(false) {
+            tasks
+                .into_iter()
+                .map(|mut task| {
+                    task.artifacts = None;
+                    task
+                })
+                .collect()
+        } else {
+            tasks
+        };
 
         let next_page_token = if has_more {
             page_rows
@@ -176,23 +195,50 @@ impl TaskStore for WrkspcTaskStore {
     }
 
     async fn begin_cancel(&self, task_id: &str) -> Result<Task, A2AError> {
-        let canceled_state = crate::state_mapping::task_state_literal(&a2a::TaskState::Canceled);
-        // The canceled blob is produced by the caller of this trait method's
-        // contract: core only needs a serialized replacement. The handler
-        // emits the actual TaskStatusUpdateEvent after this returns, so a
-        // minimal canceled snapshot suffices here.
-        let snapshot = serde_json::json!({
-            "id": task_id,
-            "contextId": "",
-            "status": { "state": "TASK_STATE_CANCELED" },
-        });
+        // Cancel the WORK first: the delivery's queued intent or
+        // in-flight attempt, not just this row (H-cancel propagation —
+        // a status flip alone would report cancellation that never
+        // reached the execution).
+        crate::executor::cancel_enveloped_work(&self.store, task_id).await?;
+        // Cancel preserves the task's record: the original context,
+        // history, artifacts, and metadata survive; only the status
+        // transitions. A cancel that discards the envelope would erase
+        // the delivery's audit data (H-13).
+        let current = self
+            .store
+            .task_get(task_id)
+            .await
+            .map_err(|e| A2AError::internal(e.to_string()))?
+            .ok_or_else(|| A2AError::task_not_found(task_id))?;
+        let mut snapshot: serde_json::Value = serde_json::from_str(&current.task_json)
+            .map_err(|e| A2AError::internal(e.to_string()))?;
+        let snapshot = snapshot
+            .as_object_mut()
+            .ok_or_else(|| A2AError::internal("task payload is not an object".to_string()))?;
+        snapshot.insert(
+            "status".to_string(),
+            serde_json::json!({
+                "state": "TASK_STATE_CANCELED",
+                "timestamp": chrono::Utc::now(),
+            }),
+        );
         let canceled_json =
-            serde_json::to_string(&snapshot).map_err(|e| A2AError::internal(e.to_string()))?;
+            serde_json::to_string(snapshot).map_err(|e| A2AError::internal(e.to_string()))?;
+        let canceled_state = crate::state_mapping::task_state_literal(&a2a::TaskState::Canceled);
         let row = self
             .store
             .task_begin_cancel(task_id, canceled_state, &canceled_json)
             .await
-            .map_err(store_error)?;
+            .map_err(|error| match error {
+                // A terminal task is not cancelable — that is a
+                // lifecycle verdict, not a malformed request.
+                wrkspc_core::StoreError::TaskTerminal { task_id, state, .. } => {
+                    A2AError::task_not_cancelable(&format!(
+                        "task {task_id} is terminal ({state}) and cannot be canceled"
+                    ))
+                }
+                other => store_error(other),
+            })?;
         task_from_json(&row.task_json)
     }
 }
