@@ -19,9 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mirrors, a second node presenting the same certificate loses the
   claim, and restart replays nothing.
 - Moderation engine: claim-time fences (pause, hold, block), a held
-  queue with operator release, reversible boot, and ban with live
-  certificate-serial revocation. Every action lands in an audit log
-  with actor, before, and after states.
+  queue with operator release, and reversible boot and ban. Every
+  action lands in an audit log with actor, before, and after states.
 - Presence-fed roster over the node↔hub link, with peer identities
   bound to the presenting certificate host.
 - Cursor-resumable committed event feed for the operator UI.
@@ -30,8 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ACP harness adapters spawned by the node from `bindings.toml`; MCP
   tools exposed to harness-resident agents; A2A agent cards served per
   peer.
-- Operator UI with credential redaction, visible delivery and execution
-  status, and conversation-level moderation controls.
+- Operator UI with visible delivery and execution status and
+  conversation-level moderation controls.
 - Distroless container image for the hub role, built from source.
 - Published container image on GHCR (`ghcr.io/<owner>/wrkspc-hub`):
   multi-arch `linux/amd64` + `linux/arm64`, cosign keyless-signed,
@@ -49,5 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   certificates or tokens are optional on coordination traffic.
 - Booted and banned peers are refused at message acceptance and at
   presence; a ban additionally revokes the peer's certificate serial
-  at the TLS layer. One operator action reverses any of it.
+  at the TLS layer, and the deny gate is per-request, so a ban also
+  denies the next request on an already-established connection. The
+  `--revoke-list` floor survives every store re-sync. One operator
+  action reverses any of it.
 - Credential redaction in the operator-facing event feed.
+- Core-dump guard: the process disables core dumps before anything
+  parses TLS private keys, so a panic cannot write key material into a
+  core file.
+- Operator-token files are written with `O_NOFOLLOW` exclusive create,
+  owner-only permissions, and a post-write readback; the installer
+  refuses writes and deletes that follow symlinks or escape the
+  selected harness directory.
