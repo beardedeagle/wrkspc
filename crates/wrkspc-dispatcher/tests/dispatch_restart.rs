@@ -1,5 +1,6 @@
 //! Restart reconciliation: open attempts are marked unknown, never
 //! re-dispatched.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 
@@ -65,6 +66,7 @@ async fn restart_reconciliation_marks_open_attempts_unknown() {
         provider,
         DispatcherConfig {
             tick: Duration::from_millis(10),
+            lookup_timeout: std::time::Duration::from_secs(10),
         },
     );
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);

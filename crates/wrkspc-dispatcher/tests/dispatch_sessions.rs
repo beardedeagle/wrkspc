@@ -1,5 +1,6 @@
 //! Session behavior: guidance prefixing, missing bindings, chunk
 //! attribution, per-session serialization, and parallel peers.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 
@@ -158,6 +159,7 @@ async fn one_session_serializes_turns_and_attributes_chunks_per_conversation() {
         provider,
         DispatcherConfig {
             tick: Duration::from_millis(10),
+            lookup_timeout: std::time::Duration::from_secs(10),
         },
     );
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -277,8 +279,12 @@ async fn two_peers_dispatch_in_parallel_without_wedging() {
         panic!("fresh accept");
     };
 
-    let codex = FakeDriver::new(Mode::Respond(StopReason::EndTurn));
-    let agy = FakeDriver::new(Mode::Respond(StopReason::EndTurn));
+    // Blocking drivers: each turn holds until release_all(). Both
+    // prompts must be OUTSTANDING at once before either completes —
+    // immediately-completing fakes would only prove distinct session
+    // ids, not overlap.
+    let codex = FakeDriver::new(Mode::BlockUntilReleased);
+    let agy = FakeDriver::new(Mode::BlockUntilReleased);
     let mut bindings = HashMap::new();
     bindings.insert(
         "codex".to_string(),
@@ -302,6 +308,7 @@ async fn two_peers_dispatch_in_parallel_without_wedging() {
         provider,
         DispatcherConfig {
             tick: Duration::from_millis(10),
+            lookup_timeout: std::time::Duration::from_secs(10),
         },
     );
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -313,6 +320,28 @@ async fn two_peers_dispatch_in_parallel_without_wedging() {
             .await
             .expect("run");
     });
+
+    // BOTH prompts must be in flight BEFORE any release: a serialized
+    // dispatcher would never reach the second peer while the first
+    // turn blocks.
+    for _ in 0..300 {
+        if codex.prompt_texts().len() == 1 && agy.prompt_texts().len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        codex.prompt_texts().len(),
+        1,
+        "codex must have its turn in flight before release"
+    );
+    assert_eq!(
+        agy.prompt_texts().len(),
+        1,
+        "agy must have its turn in flight BEFORE codex completes:          both turns overlap, dispatch is concurrent"
+    );
+    codex.release_all();
+    agy.release_all();
 
     // BOTH turns must complete.
     for _ in 0..300 {
@@ -340,4 +369,169 @@ async fn two_peers_dispatch_in_parallel_without_wedging() {
     assert_eq!(chunk_peers.len(), 2, "chunks from both sessions");
 
     let _ = shutdown_tx.send(()).await;
+}
+
+/// Guidance is claimed atomically: two concurrent turns in the SAME
+/// conversation partition the pending guidance, so the guidance rides
+/// exactly ONE prompt — never both (C3).
+#[tokio::test]
+async fn concurrent_turns_in_one_conversation_do_not_duplicate_guidance() {
+    let store = Store::open_in_memory("dispatcher-guidance-race")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    for peer in ["codex", "agy"] {
+        store.ensure_peer(peer, peer, "harness").await.unwrap();
+    }
+    let conversation_id = store
+        .create_conversation(&["operator", "codex", "agy"])
+        .await
+        .unwrap();
+    store
+        .add_guidance(&conversation_id, "operator", "only once")
+        .await
+        .unwrap();
+    let AcceptOutcome::Accepted { .. } = store
+        .accept_message(
+            &conversation_id,
+            "operator",
+            "k1",
+            "hello both",
+            false,
+            &[
+                RecipientRequest {
+                    peer_id: "codex".to_string(),
+                    execution_requested: true,
+                },
+                RecipientRequest {
+                    peer_id: "agy".to_string(),
+                    execution_requested: true,
+                },
+            ],
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("fresh accept");
+    };
+
+    let codex = FakeDriver::new(Mode::BlockUntilReleased);
+    let agy = FakeDriver::new(Mode::BlockUntilReleased);
+    let mut bindings = HashMap::new();
+    bindings.insert(
+        "codex".to_string(),
+        SessionBinding {
+            peer_id: "codex".to_string(),
+            session_id: "sess-codex".to_string(),
+            driver: Arc::new(codex.clone()),
+        },
+    );
+    bindings.insert(
+        "agy".to_string(),
+        SessionBinding {
+            peer_id: "agy".to_string(),
+            session_id: "sess-agy".to_string(),
+            driver: Arc::new(agy.clone()),
+        },
+    );
+    let provider = Arc::new(FakeProvider { bindings });
+    let (dispatcher, _handle) = Dispatcher::new(
+        store.clone(),
+        provider,
+        DispatcherConfig {
+            tick: Duration::from_millis(10),
+            lookup_timeout: std::time::Duration::from_secs(10),
+        },
+    );
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    tokio::spawn(async move {
+        dispatcher
+            .run(async move {
+                let _ = shutdown_rx.recv().await;
+            })
+            .await
+            .expect("run");
+    });
+
+    // Both turns in flight (both claims attempted), then release.
+    for _ in 0..300 {
+        if codex.prompt_texts().len() == 1 && agy.prompt_texts().len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(codex.prompt_texts().len(), 1, "codex turn in flight");
+    assert_eq!(agy.prompt_texts().len(), 1, "agy turn in flight");
+    let needle = "[operator guidance from operator]: only once";
+    let codex_has = codex.prompt_texts()[0].contains(needle);
+    let agy_has = agy.prompt_texts()[0].contains(needle);
+    assert_ne!(
+        codex_has,
+        agy_has,
+        "guidance must ride exactly ONE of the concurrent prompts; codex: {:?}, agy: {:?}",
+        codex.prompt_texts(),
+        agy.prompt_texts()
+    );
+    codex.release_all();
+    agy.release_all();
+
+    // Both complete; the guidance is delivered exactly once (the
+    // winning turn marked it, the other never saw it).
+    for _ in 0..300 {
+        let events = store.events_since(&conversation_id, 0, 100).await.unwrap();
+        let stopped = events
+            .iter()
+            .filter(|e| e.kind == "dispatch.stopped")
+            .count();
+        if stopped == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let undelivered = store.undelivered_guidance(&conversation_id).await.unwrap();
+    assert!(
+        undelivered.is_empty(),
+        "guidance must be delivered exactly once; pending: {undelivered:?}"
+    );
+
+    let _ = shutdown_tx.send(()).await;
+}
+
+/// Real stdio adapters send the terminal response BEFORE their trailing
+/// update. A chunk emitted just after the stop reason must still land
+/// in the feed — never silently dropped (H-16 completion; the fixture
+/// models the real ordering, which the in-memory fake previously
+/// reversed).
+#[tokio::test]
+async fn trailing_chunk_after_the_terminal_response_is_not_dropped() {
+    let harness = spawn_harness(Mode::RespondThenChunk(StopReason::EndTurn), true).await;
+    harness.wait_for_kind("dispatch.stopped").await;
+
+    // The trailing chunk arrives ~150 ms AFTER the stop reason; the
+    // drive task's grace window must still commit it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let events = harness
+            .store
+            .events_since(&harness.conversation_id, 0, 100)
+            .await
+            .unwrap();
+        let trailing = events.iter().any(|e| {
+            e.kind == "turn.chunk"
+                && e.payload["content"]
+                    .as_str()
+                    .is_some_and(|content| content.starts_with("trailing:"))
+        });
+        if trailing {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the trailing chunk was dropped; events: {events:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

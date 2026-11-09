@@ -77,6 +77,17 @@ pub struct SessionBinding {
     pub driver: Arc<dyn SessionDriver>,
 }
 
+// The driver is a trait object without Debug; the summary carries the
+// observable identity instead.
+impl std::fmt::Debug for SessionBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionBinding")
+            .field("peer_id", &self.peer_id)
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Resolves a peer to its bound session (the CLI builds this from the
 /// bindings table, spawning sessions on demand; tests use static fakes).
 pub trait SessionProvider: Send + Sync + 'static {

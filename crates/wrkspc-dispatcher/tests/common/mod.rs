@@ -32,6 +32,7 @@ struct FakeInner {
     mode: Mutex<Mode>,
     prompt_log: Mutex<Vec<String>>,
     release: Mutex<Option<oneshot::Sender<()>>>,
+    release_waiters: tokio::sync::Notify,
     events_tx: tokio::sync::broadcast::Sender<SessionEvent>,
 }
 
@@ -39,6 +40,14 @@ struct FakeInner {
 pub enum Mode {
     Respond(StopReason),
     BlockUntilCancel,
+    /// Blocks until `FakeDriver::release_all()` — lets a test hold two
+    /// turns in flight at once and prove CONCURRENT dispatch (not
+    /// merely distinct session ids).
+    BlockUntilReleased,
+    /// Returns the stop reason first and emits the turn's chunk AFTER
+    /// a short delay — the real-stdio ordering (response before the
+    /// trailing update), which the dispatcher must not silently drop.
+    RespondThenChunk(StopReason),
 }
 
 impl FakeDriver {
@@ -49,6 +58,7 @@ impl FakeDriver {
                 mode: Mutex::new(mode),
                 prompt_log: Mutex::new(Vec::new()),
                 release: Mutex::new(None),
+                release_waiters: tokio::sync::Notify::new(),
                 events_tx,
             }),
         }
@@ -56,6 +66,11 @@ impl FakeDriver {
 
     pub fn prompt_texts(&self) -> Vec<String> {
         self.inner.prompt_log.lock().unwrap().clone()
+    }
+
+    /// Releases every `BlockUntilReleased` turn.
+    pub fn release_all(&self) {
+        self.inner.release_waiters.notify_waiters();
     }
 
     pub async fn wait_for_prompt(&self) {
@@ -90,7 +105,7 @@ impl SessionDriver for FakeDriver {
             // One agent chunk per turn, content-derived so attribution is
             // observable per conversation.
             let _ = inner.events_tx.send(SessionEvent {
-                session_id,
+                session_id: session_id.clone(),
                 update: SessionUpdate::AgentMessageChunk(
                     ContentChunk::new(ContentBlock::Text(TextContent::new(format!(
                         "reply: {joined}"
@@ -106,6 +121,31 @@ impl SessionDriver for FakeDriver {
                     *inner.release.lock().unwrap() = Some(tx);
                     let _ = rx.await;
                     Ok(StopReason::Cancelled)
+                }
+                Mode::BlockUntilReleased => {
+                    inner.release_waiters.notified().await;
+                    Ok(StopReason::EndTurn)
+                }
+                Mode::RespondThenChunk(reason) => {
+                    // The terminal response goes first; the trailing
+                    // chunk follows on its own task — the real-stdio
+                    // ordering.
+                    let events_tx = inner.events_tx.clone();
+                    let sid = session_id.clone();
+                    let trailing = joined.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        let _ = events_tx.send(SessionEvent {
+                            session_id: sid,
+                            update: SessionUpdate::AgentMessageChunk(
+                                ContentChunk::new(ContentBlock::Text(TextContent::new(format!(
+                                    "trailing: {trailing}"
+                                ))))
+                                .message_id(MessageId::new("trailing-message")),
+                            ),
+                        });
+                    });
+                    Ok(reason)
                 }
             }
         })
@@ -198,6 +238,7 @@ pub async fn spawn_harness(mode: Mode, with_binding: bool) -> Harness {
     let provider = Arc::new(FakeProvider { bindings });
     let config = DispatcherConfig {
         tick: Duration::from_millis(10),
+        lookup_timeout: std::time::Duration::from_secs(10),
     };
     let (dispatcher, handle) = Dispatcher::new(store.clone(), provider, config);
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
