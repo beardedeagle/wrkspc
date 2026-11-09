@@ -114,18 +114,40 @@ pub(crate) async fn post_message(
             execution_requested: true,
         });
     }
-    let outcome = state
-        .store
-        .accept_message(
-            &id,
-            "operator",
-            &uuid::Uuid::new_v4().to_string(),
-            &body.content,
-            true,
-            &recipients,
-        )
-        .await
-        .map_err(store_error)?;
+    let outcome = if state.hub_connected && !state.hub_role {
+        // Team mode: the operator post mirrors locally WITHOUT local
+        // execution intents — execution waits for hub acceptance (the
+        // fences) and this node's claim of the echoed delivery. The
+        // outbound sync feeds the hub, which fans out authoritatively.
+        state
+            .store
+            .accept_message_mirror_only(
+                &id,
+                "operator",
+                &uuid::Uuid::new_v4().to_string(),
+                &body.content,
+                true,
+                &recipients,
+            )
+            .await
+            .map_err(store_error)?
+    } else {
+        // Standalone node, or the hub itself: direct acceptance with
+        // local execution intents (the hub never executes — its
+        // fan-out below queues remote deliveries instead).
+        state
+            .store
+            .accept_message(
+                &id,
+                "operator",
+                &uuid::Uuid::new_v4().to_string(),
+                &body.content,
+                true,
+                &recipients,
+            )
+            .await
+            .map_err(store_error)?
+    };
     let message_id = match outcome {
         wrkspc_core::AcceptOutcome::Accepted { message_id } => {
             // Hub mode: fan the operator's post out to recipients on
@@ -264,4 +286,96 @@ pub(crate) async fn add_guidance(
         .await
         .map_err(store_error)?;
     Ok(Json(json!({ "guidance_id": guidance_id })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use wrkspc_core::Store;
+
+    struct NoCancel;
+
+    impl crate::api::CancelRequester for NoCancel {
+        fn request_cancel(
+            &self,
+            _message_id: &str,
+            _recipient_id: &str,
+            _set_by: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<wrkspc_core::CancelOutcome, String>> + Send + '_>>
+        {
+            Box::pin(async { Ok(wrkspc_core::CancelOutcome::IntentCanceled) })
+        }
+    }
+
+    async fn seeded() -> (Store, String) {
+        let store = Store::open_in_memory("gates-defer").await.unwrap();
+        store
+            .ensure_peer("operator", "operator", "human")
+            .await
+            .unwrap();
+        store
+            .ensure_peer("codex", "codex", "harness")
+            .await
+            .unwrap();
+        let conversation = store
+            .create_conversation(&["operator", "codex"])
+            .await
+            .unwrap();
+        (store, conversation)
+    }
+
+    /// A hub-connected node's operator post mirrors the message WITHOUT
+    /// a local execution intent: execution waits for hub acceptance and
+    /// this node's claim of the echoed delivery (where fences gate).
+    #[tokio::test]
+    async fn hub_connected_operator_post_defers_execution() {
+        let (store, conversation) = seeded().await;
+        let state = AppState::new(store.clone(), Arc::new(NoCancel), false, false, true, None);
+        let Json(response) = post_message(
+            State(state),
+            Path(conversation.clone()),
+            Json(PostMessageBody {
+                content: "go".to_string(),
+                recipients: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let message_id = response["message_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            store.message_recipients(&message_id).await.unwrap(),
+            vec!["codex".to_string()],
+            "the message still commits with its recipients"
+        );
+        assert!(
+            store.claim_intent(&message_id, "codex").await.is_err(),
+            "no local intent: the dispatcher has nothing to claim before hub acceptance"
+        );
+    }
+
+    /// Standalone nodes keep direct acceptance: the operator post still
+    /// creates the claimable local intent.
+    #[tokio::test]
+    async fn standalone_operator_post_still_executes_directly() {
+        let (store, conversation) = seeded().await;
+        let state = AppState::new(store.clone(), Arc::new(NoCancel), false, false, false, None);
+        let Json(response) = post_message(
+            State(state),
+            Path(conversation.clone()),
+            Json(PostMessageBody {
+                content: "go".to_string(),
+                recipients: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let message_id = response["message_id"].as_str().unwrap().to_string();
+        assert!(
+            store.claim_intent(&message_id, "codex").await.is_ok(),
+            "standalone posts keep their local intent"
+        );
+    }
 }
