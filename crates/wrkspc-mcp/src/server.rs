@@ -7,9 +7,9 @@
 //!
 //! # rmcp 1.8 contract (read before touching this file)
 //!
-//! This crate is the adapter-isolation layer for rmcp (pinned `=1.8.0`,
+//! This crate is the adapter-isolation layer for rmcp (pinned `=2.1.0`,
 //! ported from `=0.7.0` for RUSTSEC-2026-0189). The tool surface below is
-//! macro-generated; behaviors verified from the rmcp/rmcp-macros 1.8.0
+//! macro-generated; behaviors verified from the rmcp/rmcp-macros 2.1.0
 //! sources:
 //!
 //! - [`tool_router`](tool_router) with the `server_handler` flag collects
@@ -34,7 +34,6 @@
 //! Full verified API surface: `references/rmcp-18.md` in the wrkspc skill.
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::ErrorData;
 use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -54,7 +53,10 @@ pub struct PostMessageParams {
     /// Whether execution is explicitly requested. Defaults to false.
     #[serde(default)]
     pub execution_requested: bool,
-    /// Recipient peer ids. Defaults to all other conversation members.
+    /// Recipient peer ids — deliveries are opt-in: name recipients
+    /// explicitly here or write `@peer` mentions in the text. A post
+    /// that names nobody wakes nobody (never a broadcast to the other
+    /// members).
     #[serde(default)]
     pub recipients: Option<Vec<String>>,
 }
@@ -131,32 +133,36 @@ impl McpServer {
     /// # Errors
     ///
     /// Returns the rejection message when the peer is not a member.
-    async fn require_member(&self, conversation_id: &str) -> Result<(), ErrorData> {
+    async fn require_member(&self, conversation_id: &str) -> Result<(), String> {
         let members = self
             .store
             .conversation_members(conversation_id)
             .await
             .map_err(store_error)?;
         if !members.iter().any(|m| m == &self.peer_id) {
-            return Err(ErrorData::invalid_request(
-                format!("peer is not a member of conversation {conversation_id}"),
-                None,
+            return Err(format!(
+                "peer is not a member of conversation {conversation_id}"
             ));
         }
         Ok(())
     }
 }
 
-/// Maps a store error to an rmcp error result, preserving the store's
-/// message verbatim so the harness agent can surface it. `Err(ErrorData)`
-/// is marked `is_error` by the framework — the harness sees a failed tool
-/// call, never a transport failure or a silent success.
+/// Maps a store error to a tool-level failure.
+///
+/// rmcp 2.1 contract (P06): `Err(String)` from a tool becomes a
+/// successful tools/call envelope with `is_error: true` and this text
+/// as content — the harness reads a failed tool call with the reason
+/// intact. `Err(ErrorData)` would be a JSON-RPC protocol error
+/// (`-32600`), which misclassifies an ordinary business denial as an
+/// invalid MCP request. Store errors are operational failures, so they
+/// ride the `is_error` envelope, never the protocol channel.
 ///
 /// # Arguments
 ///
 /// * `error` — the store error.
-fn store_error(error: StoreError) -> ErrorData {
-    ErrorData::invalid_request(error.to_string(), None)
+fn store_error(error: StoreError) -> String {
+    error.to_string()
 }
 
 /// Describes who an accepted post actually reached.
@@ -180,12 +186,12 @@ async fn routing_summary(
     message_id: &str,
     delivered: &[String],
     execution_requested: bool,
-) -> Result<String, ErrorData> {
+) -> String {
     if delivered.is_empty() {
-        return Ok(format!(
+        return format!(
             "{verb} {message_id}; no deliveries raised — nobody was addressed. \
              Pass the recipients parameter or write @peer in the text."
-        ));
+        );
     }
     let mut summary = format!("{verb} {message_id}; delivered to {}", delivered.join(", "));
     if execution_requested {
@@ -208,7 +214,7 @@ async fn routing_summary(
             ));
         }
     }
-    Ok(summary)
+    summary
 }
 
 #[tool_router(server_handler)]
@@ -222,10 +228,7 @@ impl McpServer {
         name = "post-message",
         description = "Post a message into a wrkspc conversation under the caller's peer identity. The same idempotency key with the same content returns the original message id (safe to retry); the same key with different content is rejected."
     )]
-    async fn post_message(
-        &self,
-        params: Parameters<PostMessageParams>,
-    ) -> Result<String, ErrorData> {
+    async fn post_message(&self, params: Parameters<PostMessageParams>) -> Result<String, String> {
         let Parameters(params) = params;
         // Deliveries are opt-in. A harness post names its recipients
         // explicitly; a post that names nobody is visible in the room and
@@ -261,14 +264,14 @@ impl McpServer {
             .message_recipients(&message_id)
             .await
             .map_err(store_error)?;
-        routing_summary(
+        Ok(routing_summary(
             &self.store,
             verb,
             &message_id,
             &delivered,
             params.execution_requested,
         )
-        .await
+        .await)
     }
 
     /// Reads committed events from a conversation after a cursor.
@@ -279,15 +282,24 @@ impl McpServer {
     async fn read_conversation(
         &self,
         params: Parameters<ReadConversationParams>,
-    ) -> Result<String, ErrorData> {
+    ) -> Result<String, String> {
         let Parameters(params) = params;
+        // Bounded reads (P07): the store clamps defensively, but the
+        // tool rejects out-of-range values loudly so a harness learns
+        // the contract instead of silently getting a clamped page.
+        if !(1..=500).contains(&params.limit) {
+            return Err(format!(
+                "limit must be between 1 and 500 (got {})",
+                params.limit
+            ));
+        }
         self.require_member(&params.conversation_id).await?;
         let events = self
             .store
             .events_since(&params.conversation_id, params.after_seq, params.limit)
             .await
             .map_err(store_error)?;
-        serde_json::to_string(&events).map_err(|e| ErrorData::invalid_request(e.to_string(), None))
+        serde_json::to_string(&events).map_err(|e| e.to_string())
     }
 
     /// Lists the connected cohort (HLD rev0.9): the hub's roster
@@ -297,9 +309,9 @@ impl McpServer {
         name = "list-peers",
         description = "List the connected wrkspc cohort: peer id, display name, class, host, and last reported live state. Global roster, no membership required."
     )]
-    async fn list_peers(&self) -> Result<String, ErrorData> {
+    async fn list_peers(&self) -> Result<String, String> {
         let roster = self.store.roster().await.map_err(store_error)?;
-        serde_json::to_string(&roster).map_err(|e| ErrorData::invalid_request(e.to_string(), None))
+        serde_json::to_string(&roster).map_err(|e| e.to_string())
     }
 
     /// Appends a work-status report to the conversation's committed feed.
@@ -307,7 +319,7 @@ impl McpServer {
         name = "report-work",
         description = "Append a free-form work status report to a conversation's committed event feed. Membership required."
     )]
-    async fn report_work(&self, params: Parameters<ReportWorkParams>) -> Result<String, ErrorData> {
+    async fn report_work(&self, params: Parameters<ReportWorkParams>) -> Result<String, String> {
         let Parameters(params) = params;
         self.require_member(&params.conversation_id).await?;
         let payload = serde_json::json!({
@@ -435,10 +447,17 @@ impl HttpListener {
                         .map(|token| tokens.contains(token))
                         .unwrap_or(false);
                     if !authorized {
-                        return axum::response::Response::builder()
+                        let response = axum::response::Response::builder()
                             .status(axum::http::StatusCode::UNAUTHORIZED)
-                            .body(axum::body::Body::from("unauthorized"))
-                            .expect("static response");
+                            .body(axum::body::Body::from("unauthorized"));
+                        return match response {
+                            Ok(response) => response,
+                            // A static status and static body cannot fail;
+                            // this arm guards against builder misuse.
+                            Err(error) => {
+                                unreachable!("static unauthorized response failed: {error}")
+                            }
+                        };
                     }
                     next.run(request).await
                 }

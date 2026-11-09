@@ -1,6 +1,7 @@
 //! Integration tests for the harness-facing MCP server: tool behavior over
 //! an in-process duplex transport (the same protocol path as stdio), store
 //! integration, and the HTTP token gate.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo};
@@ -85,8 +86,10 @@ async fn call(
         .expect("tool call must complete")
 }
 
-/// Calls a tool and surfaces the tool-level error: rmcp 1.8 clients
-/// return `Err` for `is_error` results instead of a plain result.
+/// Calls a tool and returns the raw result envelope. Tool-level
+/// failures arrive as `Ok(CallToolResult { is_error: Some(true), .. })`
+/// (rmcp 2.1 contract — P06); a JSON-RPC protocol error is the only
+/// `Err` this helper surfaces.
 async fn call_result(
     client: &TestClientService,
     name: &str,
@@ -99,6 +102,17 @@ async fn call_result(
         )
         .await
         .map_err(|error| error.to_string())
+}
+
+/// Asserts a call returned the tool-level failure envelope and reads
+/// its content text.
+fn error_text(result: &CallToolResult, context: &str) -> String {
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "operational failure must be an is_error envelope, not a protocol error: {context}"
+    );
+    text_of(result)
 }
 
 /// MCP post-message accepts a message and replays the same key idempotently (same message id, no duplicate commit).
@@ -124,14 +138,16 @@ async fn post_message_accepts_and_replays_idempotently() {
     let second = call(&client, "post-message", args()).await;
     assert_eq!(text_of(&second), format!("replay {message_id}"));
 
-    // Same key + different content: rejected with an error result.
+    // Same key + different content: rejected via the is_error envelope.
     let mut conflicting = args();
     conflicting["content"] = serde_json::json!("different content");
-    let conflict = call_result(&client, "post-message", conflicting).await;
-    let conflict = conflict.expect_err("conflict must be an error");
+    let conflict = call_result(&client, "post-message", conflicting)
+        .await
+        .expect("the conflict must arrive as an is_error envelope");
+    let conflict_text = error_text(&conflict, "idempotency conflict");
     assert!(
-        conflict.contains("idempotency"),
-        "the store's conflict message must surface: {conflict}"
+        conflict_text.contains("idempotency"),
+        "the store's conflict message must surface: {conflict_text}"
     );
 }
 
@@ -225,8 +241,9 @@ async fn non_member_is_rejected() {
             "content": "into the void",
         }),
     )
-    .await;
-    let error = result.expect_err("non-member post must be an error");
+    .await
+    .expect("the rejection must arrive as an is_error envelope");
+    let error = error_text(&result, "non-member post");
     assert!(
         error.contains("not found") || error.contains("not a member"),
         "the rejection reason must surface: {error}"
@@ -403,4 +420,32 @@ async fn list_peers_returns_the_mirrored_roster() {
     assert_eq!(roster.len(), 1);
     assert_eq!(roster[0]["peer_id"], "codex");
     assert_eq!(roster[0]["state"], "connected");
+}
+
+/// P07: out-of-range read limits are rejected loudly instead of
+/// becoming unbounded fetches (the store clamps defensively; the tool
+/// teaches the harness the contract).
+#[tokio::test]
+async fn read_conversation_rejects_out_of_range_limits() {
+    let (_store, _operator, _agent, conversation, server) = seeded().await;
+    let client = connect(server).await;
+
+    for bad in [-1i64, 0, 501] {
+        let result = call_result(
+            &client,
+            "read-conversation",
+            serde_json::json!({
+                "conversation_id": conversation,
+                "after_seq": 0,
+                "limit": bad,
+            }),
+        )
+        .await
+        .expect("the rejection must arrive as an is_error envelope");
+        let text = error_text(&result, &format!("limit {bad}"));
+        assert!(
+            text.contains("limit must be between"),
+            "the limit contract must surface: {text}"
+        );
+    }
 }

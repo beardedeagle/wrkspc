@@ -5,6 +5,7 @@
 //! from the listener's allowlist and binds loopback by default. The tools
 //! (post/read/report) translate harness tool calls onto the transactional
 //! store; the hub role never serves this surface.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod server;
 

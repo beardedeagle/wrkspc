@@ -14,7 +14,10 @@ tracing.workspace = true
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 schemars = "1.0"
 axum = "0.8"
-wrkspc-core = { path = "../wrkspc-core" }
+wrkspc-core = { version = "0.1.0", path = "../wrkspc-core" }
+
+[lints]
+workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
