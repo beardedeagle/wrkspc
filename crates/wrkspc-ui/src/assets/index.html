@@ -1799,8 +1799,12 @@ async function renderAll() {
       api("/api/conversations/" + selected + "/fences"),
       api("/api/conversations/" + selected).then((c) => c.members),
     ]);
-  } catch { return; } finally {
+  } catch {
+    // A failed fetch must not wedge the view-ownership token: this
+    // refresh is dead either way, so release it if it still owns the
+    // view before bailing (UI-11).
     if (refresh === current) refresh = null;
+    return;
   }
   // A fetch begun for an earlier view (another conversation, or before a
   // re-select) must not render into the current one.
@@ -1808,6 +1812,11 @@ async function renderAll() {
   // Same-view overlap: a NEWER refresh owns the view — a stale response
   // finishing last must not roll back its newer state (UI-11).
   if (refresh !== current) return;
+  // This refresh is the latest owner: it renders now, so the token no
+  // longer needs to block anyone. (Clearing it in a `finally` above the
+  // ownership check made `refresh !== current` always true — a successful
+  // fetch could never render.)
+  refresh = null;
   // The events endpoint is an incremental feed (seq-ordered, append-only):
   // keep only what is new, since overlapping polls can return the same
   // events, so the transcript shows the whole history, not the last batch.
