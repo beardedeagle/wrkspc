@@ -24,6 +24,28 @@ fn registry_entries_are_well_formed() {
     }
 }
 
+/// The ACP-native harness cohort's registry entries point at their
+/// canonical install locations (vercel-labs/skills table), with the
+/// adapter drill proving each harness speaks ACP over stdio.
+#[test]
+fn acp_harness_cohort_has_verified_entries() {
+    for (id, skills_dir, first_marker) in [
+        ("qwen-code", ".qwen/skills", ".qwen"),
+        ("kimi-code-cli", ".agents/skills", ".kimi-code"),
+        ("minimax-code", ".minimax/skills", ".minimax"),
+    ] {
+        let entry = HARNESSES
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap_or_else(|| panic!("{id} is registered"));
+        assert_eq!(entry.skills_dir, skills_dir, "{id} skills dir");
+        assert_eq!(
+            entry.detect[0], first_marker,
+            "{id} primary detection marker"
+        );
+    }
+}
+
 #[test]
 fn binding_cohort_has_pointer_files() {
     for entry in HARNESSES {
