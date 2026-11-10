@@ -44,7 +44,8 @@ impl Store {
         // bare `INSERT OR IGNORE` would silently swallow the FK
         // violation instead of recording the peer.
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        // IMMEDIATE: enrolment writes several tables before its commit.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("INSERT OR IGNORE INTO hosts (host_id, name, created_at) VALUES (?, ?, ?)")
             .bind(host_id)
             .bind(host_id)
@@ -103,7 +104,8 @@ impl Store {
     /// [`StoreError::Db`](StoreError::Db) on failure.
     pub async fn assign_peer_host(&self, peer_id: &str, host_id: &str) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        // IMMEDIATE: read-modify-write (host binding must not race a ban).
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let current: Option<String> = sqlx::query("SELECT host_id FROM peers WHERE id = ?")
             .bind(peer_id)
             .fetch_optional(&mut *tx)

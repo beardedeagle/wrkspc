@@ -54,7 +54,11 @@ impl Store {
         alias: Option<&str>,
         actor: &str,
     ) -> Result<()> {
-        let mut tx = self.pool().begin().await?;
+        // IMMEDIATE takes the write lock up front: alias, ban, boot, and
+        // forget are read-modify-write paths, and a deferred begin can
+        // deadlock another writer mid-upgrade (SQLITE_BUSY surfaces
+        // immediately, ignoring busy_timeout).
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let old: Option<(Option<String>,)> = sqlx::query_as("SELECT alias FROM peers WHERE id = ?")
             .bind(peer_id)
             .fetch_optional(&mut *tx)
@@ -106,7 +110,8 @@ impl Store {
         status: PeerStatus,
         actor: &str,
     ) -> Result<bool> {
-        let mut tx = self.pool().begin().await?;
+        // IMMEDIATE: read-modify-write (see set_peer_alias).
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let exists: Option<(String,)> = sqlx::query_as("SELECT status FROM peers WHERE id = ?")
             .bind(peer_id)
             .fetch_optional(&mut *tx)
@@ -242,7 +247,8 @@ impl Store {
     ///
     /// Returns [`StoreError::Db`](StoreError::Db) on failure.
     pub async fn forget_peer(&self, peer_id: &str, actor: &str) -> Result<bool> {
-        let mut tx = self.pool().begin().await?;
+        // IMMEDIATE: read-modify-write (see set_peer_alias).
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row: Option<(String,)> = sqlx::query_as("SELECT status FROM peers WHERE id = ?")
             .bind(peer_id)
             .fetch_optional(&mut *tx)
@@ -319,7 +325,9 @@ impl Store {
         // upserted (a first-ever connection creates it), and the latest
         // presented serial wins across short-TTL renewals.
         let now = chrono::Utc::now().to_rfc3339();
-        let mut tx = self.pool().begin().await?;
+        // IMMEDIATE: the upsert is the first write of enrolment and must
+        // not race another connection's write upgrade.
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO hosts (host_id, name, cert_serial, created_at)
              VALUES (?, ?, ?, ?)

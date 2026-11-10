@@ -15,7 +15,9 @@ impl Store {
         state: &str,
     ) -> Result<PresenceOutcome> {
         let now = chrono::Utc::now().to_rfc3339();
-        let mut tx = self.pool().begin().await?;
+        // IMMEDIATE: presence upsert is a read-modify-write that races
+        // operator moderation writes (ban/boot) on the same tables.
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("INSERT OR IGNORE INTO hosts (host_id, name, created_at) VALUES (?, ?, ?)")
             .bind(host_id)
             .bind(host_id)
@@ -194,7 +196,9 @@ impl Store {
     ///
     /// Returns [`StoreError::Db`](StoreError::Db) on failure.
     pub async fn replace_roster(&self, entries: &[RosterEntry]) -> Result<()> {
-        let mut tx = self.pool().begin().await?;
+        // IMMEDIATE: a delete-and-rebuild must not interleave with other
+        // writers mid-stream.
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM roster").execute(&mut *tx).await?;
         for entry in entries {
             sqlx::query(

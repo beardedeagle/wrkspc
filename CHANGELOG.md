@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Roster moderation and presence writes (alias, status, forget, host
+  serial, presence upsert, roster replace, enrolment, host binding) open
+  `BEGIN IMMEDIATE` transactions instead of deferred ones, eliminating
+  the SQLITE_BUSY deadlock that could fail an operator ban racing a
+  concurrent presence write.
+
 ## [0.1.0] - 2026-11-10
 
 ### Added
