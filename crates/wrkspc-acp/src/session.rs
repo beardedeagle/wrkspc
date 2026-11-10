@@ -12,9 +12,9 @@
 use crate::error::{AcpError, Result};
 use crate::transport::AcpTransport;
 use agent_client_protocol::Agent;
-use agent_client_protocol::ConnectionTo;
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema::{
     CancelNotification, ContentBlock, InitializeRequest, McpServer, NewSessionRequest,
     PromptRequest, SessionConfigId, SessionConfigOptionValue, SessionUpdate,
     SetSessionConfigOptionRequest, StopReason,

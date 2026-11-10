@@ -2,7 +2,7 @@
 //! agent binary over real stdio — the same wire path the adapter uses.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ContentBlock, McpServer, McpServerStdio, SessionUpdate, StopReason, TextContent,
 };
 use std::path::PathBuf;

@@ -8,7 +8,7 @@
 //! task success — the D-3 success predicate is a separate check the
 //! dispatcher applies.
 
-use agent_client_protocol::schema::v1::StopReason;
+use agent_client_protocol::v1::schema::StopReason;
 use wrkspc_core::AttemptState;
 
 /// Maps an ACP stop reason to the wrkspc attempt state it implies.

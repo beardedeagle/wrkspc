@@ -4,7 +4,7 @@
 
 mod common;
 
-use agent_client_protocol::schema::v1::StopReason;
+use agent_client_protocol::v1::schema::StopReason;
 use common::{FakeDriver, FakeProvider, Mode};
 use std::collections::HashMap;
 use std::sync::Arc;

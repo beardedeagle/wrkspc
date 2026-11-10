@@ -3,7 +3,7 @@
 //! session driver (immediate respond or block-until-cancel), a static
 //! provider, and the spawn harness over an in-memory store.
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ContentBlock, ContentChunk, MessageId, SessionUpdate, StopReason, TextContent,
 };
 use std::collections::HashMap;

@@ -62,6 +62,9 @@ fn failed_native_mcp_registration_surfaces_unknown_and_keeps_the_node_up() {
             &format!("127.0.0.1:{port}"),
         ])
         .env("WRKSPC_UI_TOKEN", DRILL_TOKEN)
+        // The per-peer MCP token is pinned like the UI token so the
+        // mcp_http path never writes real Keychain entries.
+        .env("WRKSPC_MCP_TOKEN", "wrkspc-test-mcp-token")
         // The fake agy wins over any real one on PATH.
         .env(
             "PATH",

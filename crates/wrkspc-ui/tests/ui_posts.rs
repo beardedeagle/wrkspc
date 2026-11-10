@@ -300,6 +300,7 @@ async fn hub_mode_operator_post_queues_remote_deliveries() {
         cancel,
         UiConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
+            cookie_secure: false,
             token: Some(TOKEN.to_string()),
             queue_remote_deliveries: true,
             hub_role: true,
@@ -368,6 +369,7 @@ async fn node_mode_operator_post_queues_nothing() {
         cancel,
         UiConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
+            cookie_secure: false,
             token: Some(TOKEN.to_string()),
             queue_remote_deliveries: false,
             hub_role: false,

@@ -42,7 +42,7 @@ impl TestPki {
         ca_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "wrkspc-test-ca");
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_cert = rcgen::CertifiedIssuer::self_signed(ca_params, &ca_key).unwrap();
 
         let server_key = KeyPair::generate().unwrap();
         let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
@@ -53,9 +53,7 @@ impl TestPki {
         server_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "hub");
-        let server_cert = server_params
-            .signed_by(&server_key, &ca_cert, &ca_key)
-            .unwrap();
+        let server_cert = server_params.signed_by(&server_key, &ca_cert).unwrap();
 
         let client_key = KeyPair::generate().unwrap();
         let mut client_params = CertificateParams::new(vec!["node-test-1".to_string()]).unwrap();
@@ -63,9 +61,7 @@ impl TestPki {
         client_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "node-test-1");
-        let client_cert = client_params
-            .signed_by(&client_key, &ca_cert, &ca_key)
-            .unwrap();
+        let client_cert = client_params.signed_by(&client_key, &ca_cert).unwrap();
 
         Self {
             ca_pem: ca_cert.pem().into_bytes(),

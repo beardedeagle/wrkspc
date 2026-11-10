@@ -5,33 +5,17 @@
 //! store does not have. Errors from the store surface as MCP error results
 //! with the store's message intact, never as silent success.
 //!
-//! # rmcp 1.8 contract (read before touching this file)
+//! # rmcp adapter contract
 //!
-//! This crate is the adapter-isolation layer for rmcp (pinned `=2.1.0`,
-//! ported from `=0.7.0` for RUSTSEC-2026-0189). The tool surface below is
-//! macro-generated; behaviors verified from the rmcp/rmcp-macros 2.1.0
-//! sources:
+//! The pinned SDK is rmcp 3.9. `tool_router(server_handler)` generates the
+//! tools-only handler. Tool methods return `Result<T, String>`: `Err(String)`
+//! becomes a successful JSON-RPC response with `is_error: true`, preserving
+//! operational failures as failed tool calls. `ErrorData` instead produces a
+//! JSON-RPC protocol error and is reserved for malformed requests.
 //!
-//! - [`tool_router`](tool_router) with the `server_handler` flag collects
-//!   every `#[tool]` fn in the impl block into a `ToolRouter<Self>` AND
-//!   emits `#[tool_handler]` for tools-only servers (no separate
-//!   `impl ServerHandler` block, no `tool_router` field on the struct —
-//!   both 0.7 patterns are gone).
-//! - `Parameters<T>` lives at `rmcp::handler::server::wrapper::Parameters`
-//!   (unchanged path); the 0.7 `Result<T, String>` error contract is
-//!   REPLACED: `Err(String)` now serializes as plain text SUCCESS content.
-//!   Tool-level failures must be `Result<T, rmcp::ErrorData>` — the
-//!   framework marks `Err(ErrorData)` as an error result (`is_error`),
-//!   which is what harness clients read as a failed tool call.
-//! - The HTTP transport is Streamable HTTP (the SSE server no longer
-//!   exists in rmcp): `StreamableHttpService::new(factory,
-//!   LocalSessionManager::default(), config)` is a tower service mounted
-//!   with `axum::Router::new().nest_service("/mcp", service)`. The
-//!   default `StreamableHttpServerConfig.allowed_hosts` accepts loopback
-//!   only — the RUSTSEC-2026-0189 DNS-rebinding fix is baked into the
-//!   transport, on top of this crate's bearer-token gate.
-//!
-//! Full verified API surface: `references/rmcp-18.md` in the wrkspc skill.
+//! MCP uses stdio or Streamable HTTP at `/mcp`. The HTTP transport's default
+//! host allowlist accepts loopback only, in addition to this listener's
+//! bearer-token gate.
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
@@ -158,7 +142,7 @@ impl McpServer {
 
 /// Maps a store error to a tool-level failure.
 ///
-/// rmcp 2.1 contract (P06): `Err(String)` from a tool becomes a
+/// The SDK contract (P06): `Err(String)` from a tool becomes a
 /// successful tools/call envelope with `is_error: true` and this text
 /// as content — the harness reads a failed tool call with the reason
 /// intact. `Err(ErrorData)` would be a JSON-RPC protocol error
@@ -443,10 +427,10 @@ impl HttpListener {
         let addr = listener.local_addr()?;
         tracing::info!(%addr, peer = %self.server.peer_id, "wrkspc MCP http listener bound");
 
-        // Streamable HTTP (rmcp 1.8): a tower service mounted at /mcp,
-        // one fresh server clone per MCP session, sessions tracked by the
-        // local in-memory manager. The default config accepts loopback
-        // hosts only.
+        // Streamable HTTP: a tower service mounted at /mcp. Older clients
+        // keep managed sessions; newer protocol versions are stateless. Each
+        // handler clone retains this listener's fixed peer identity. The
+        // default config accepts loopback hosts only.
         let server = self.server.clone();
         let http_config =
             rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();

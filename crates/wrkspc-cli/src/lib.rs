@@ -65,6 +65,11 @@ pub enum Command {
         /// The database path for the file-backed store (non-macOS).
         #[arg(long)]
         db: Option<std::path::PathBuf>,
+        /// Reads an explicit token file (the deploy wrapper's tmpfs
+        /// handoff) instead of the platform secret store. Wins over the
+        /// environment override and the stored token.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
     },
 }
 

@@ -26,6 +26,7 @@ async fn peers_route_returns_the_roster() {
         cancel,
         UiConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
+            cookie_secure: false,
             token: Some(TOKEN.to_string()),
             queue_remote_deliveries: false,
             hub_role: false,
@@ -205,6 +206,7 @@ async fn hub_role_creates_conversations_and_validates_members() {
         cancel,
         UiConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
+            cookie_secure: false,
             token: Some(TOKEN.to_string()),
             queue_remote_deliveries: true,
             hub_role: true,
@@ -278,6 +280,7 @@ async fn node_role_refuses_conversation_creation() {
         cancel,
         UiConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
+            cookie_secure: false,
             token: Some(TOKEN.to_string()),
             queue_remote_deliveries: false,
             hub_role: false,

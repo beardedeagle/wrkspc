@@ -16,12 +16,13 @@
 //! - `session/cancel` → responds to the held prompt with `Cancelled`
 //!   (the HLD's confirmed cancellation carrier)
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     AgentCapabilities, ClientNotification, ContentBlock, InitializeRequest, InitializeResponse,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
     PromptResponse, SessionNotification, SessionUpdate, StopReason, TextContent,
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
+use agent_client_protocol::v1::{ConnectionTo, Responder};
+use agent_client_protocol::{Agent, Client, Stdio};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -62,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(Mutex::new(FakeState::default()));
 
     Agent
-        .builder()
+        .v1()
         .name("wrkspc-fake-acp-agent")
         .on_receive_request(
             async move |init: InitializeRequest, responder: Responder<InitializeResponse>, _cx| {
@@ -181,7 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             connection.send_notification(SessionNotification::new(
                                 sid.clone(),
                                 SessionUpdate::AgentMessageChunk(
-                                    agent_client_protocol::schema::v1::ContentChunk::new(
+                                    agent_client_protocol::v1::schema::ContentChunk::new(
                                         ContentBlock::Text(TextContent::new(
                                             "echo: never".to_string(),
                                         )),
@@ -196,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             connection.send_notification(SessionNotification::new(
                                 sid,
                                 SessionUpdate::AgentMessageChunk(
-                                    agent_client_protocol::schema::v1::ContentChunk::new(
+                                    agent_client_protocol::v1::schema::ContentChunk::new(
                                         ContentBlock::Text(TextContent::new(
                                             "echo: slow".to_string(),
                                         )),
@@ -209,7 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             connection.send_notification(SessionNotification::new(
                                 sid,
                                 SessionUpdate::AgentMessageChunk(
-                                    agent_client_protocol::schema::v1::ContentChunk::new(
+                                    agent_client_protocol::v1::schema::ContentChunk::new(
                                         ContentBlock::Text(TextContent::new(format!(
                                             "echo: {text}"
                                         ))),

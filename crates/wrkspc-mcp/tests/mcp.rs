@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use rmcp::handler::client::ClientHandler;
-use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig};
 use rmcp::{ServiceExt, service::RoleClient, service::RunningService};
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -19,8 +19,8 @@ use wrkspc_mcp::{HttpListener, HttpListenerConfig, McpServer};
 struct TestClient;
 
 impl ClientHandler for TestClient {
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::default()
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::default()
     }
 }
 
@@ -88,7 +88,7 @@ async fn call(
 
 /// Calls a tool and returns the raw result envelope. Tool-level
 /// failures arrive as `Ok(CallToolResult { is_error: Some(true), .. })`
-/// (rmcp 2.1 contract — P06); a JSON-RPC protocol error is the only
+/// (the SDK's tool-failure contract — P06); a JSON-RPC protocol error is the only
 /// `Err` this helper surfaces.
 async fn call_result(
     client: &TestClientService,
@@ -326,10 +326,21 @@ async fn report_work_appends_a_committed_event() {
     assert_eq!(events[0]["payload"]["summary"], "fixed the thing");
 }
 
-/// The HTTP listener refuses requests without a valid bearer token.
+/// Reads a JSON-RPC packet from either supported HTTP response encoding.
+fn http_packet(body: &str) -> serde_json::Value {
+    if let Ok(packet) = serde_json::from_str(body) {
+        return packet;
+    }
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .find_map(|data| serde_json::from_str(data.trim()).ok())
+        .expect("HTTP response contains a JSON-RPC packet")
+}
+
+/// The HTTP listener gates access and serves an authenticated MCP session.
 #[tokio::test]
 async fn http_listener_enforces_token_gate() {
-    let (store, _operator, _agent, _conversation, server) = seeded().await;
+    let (store, _operator, _agent, conversation, server) = seeded().await;
     let tokens = HashSet::from(["good-token".to_string()]);
     let listener = HttpListener::new(
         server,
@@ -352,7 +363,10 @@ async fn http_listener_enforces_token_gate() {
     // Give the listener a moment to start accepting.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
     let base = format!("http://{addr}");
 
     // No token → 401 on the MCP route (GET and POST).
@@ -379,6 +393,64 @@ async fn http_listener_enforces_token_gate() {
         .await
         .unwrap();
     assert_ne!(good_token.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Exercise the transport, not only the gate: negotiate, acknowledge
+    // initialization, then call a membership-scoped tool in the same session.
+    let initialize = client
+        .post(format!("{base}/mcp"))
+        .bearer_auth("good-token")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26", "capabilities": {},
+                "clientInfo": { "name": "wrkspc-http-test", "version": "0.0.0" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(initialize.status().is_success());
+    let session_id = initialize.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let initialized = http_packet(&initialize.text().await.unwrap());
+    let version = initialized["result"]["protocolVersion"].as_str().unwrap();
+    let acknowledgement = client
+        .post(format!("{base}/mcp"))
+        .bearer_auth("good-token")
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .header("mcp-protocol-version", version)
+        .json(&serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(acknowledgement.status().is_success());
+    let response = client
+        .post(format!("{base}/mcp"))
+        .bearer_auth("good-token")
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .header("mcp-protocol-version", version)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "read-conversation", "arguments": { "conversation_id": conversation } }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let packet = http_packet(&response.text().await.unwrap());
+    assert!(
+        packet.get("error").is_none(),
+        "tool call is not a protocol error"
+    );
+    assert_ne!(packet["result"]["isError"], true);
+    let events: serde_json::Value =
+        serde_json::from_str(packet["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(events, serde_json::json!([]));
 
     let _ = shutdown_tx.send(());
     serve_task

@@ -6,7 +6,7 @@
 //! harness directly — it only sees this seam (the hub role never links the
 //! ACP layer; the node role binds real sessions behind it).
 
-use agent_client_protocol::schema::v1::{ContentBlock, StopReason};
+use agent_client_protocol::v1::schema::{ContentBlock, StopReason};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

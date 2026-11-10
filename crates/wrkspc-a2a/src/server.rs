@@ -562,9 +562,9 @@ mod tests {
         ca_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "wrkspc-test-ca");
-        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let ca = rcgen::CertifiedIssuer::self_signed(ca_params, &ca_key).unwrap();
         let leaf_key = KeyPair::generate().unwrap();
-        let leaf = params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+        let leaf = params.signed_by(&leaf_key, &ca).unwrap();
         CertificateDer::from(leaf.der().to_vec())
     }
 

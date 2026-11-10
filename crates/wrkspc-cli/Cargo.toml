@@ -20,7 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 tower = "0.5"
 uuid.workspace = true
-toml = "0.8"
+toml = "1.2"
 agent-client-protocol.workspace = true
 wrkspc-core = { version = "0.1.0", path = "../wrkspc-core" }
 wrkspc-acp = { version = "0.1.0", path = "../wrkspc-acp" }
@@ -79,6 +79,6 @@ assert_cmd = "2"
 # The core-dump guard test reads RLIMIT_CORE back to prove the guard took hold;
 # `libc` is already a normal dependency of this crate.
 libc = "0.2"
-rcgen = "0.13"
+rcgen = "0.14"
 rustls-pki-types = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "blocking"] }

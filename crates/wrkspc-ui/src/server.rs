@@ -6,9 +6,20 @@
 //! injected into served pages.
 
 use crate::api::{AppState, router};
+use axum::response::IntoResponse;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use wrkspc_core::Store;
+
+/// The operator login cookie name.
+const COOKIE_NAME: &str = "wrkspc_token";
+
+/// The `/api/login` request body: the bearer token pasted from the
+/// login card.
+#[derive(serde::Deserialize)]
+struct LoginBody {
+    token: String,
+}
 
 /// UI server configuration.
 #[derive(Debug, Clone)]
@@ -32,6 +43,11 @@ pub struct UiConfig {
     /// refused with 409 instead of reporting success for writes the
     /// next authoritative snapshot erases (UI-08).
     pub hub_connected: bool,
+    /// Marks the login cookie `Secure`. True on TLS listeners (the
+    /// browser stores it); false on the plaintext loopback listener
+    /// (browsers refuse Secure cookies over http, so the cookie is
+    /// simply not stored there).
+    pub cookie_secure: bool,
 }
 
 // The default bind address is a compile-time constant; the `expect`
@@ -42,12 +58,51 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:0".parse().expect("static address parses"),
+            cookie_secure: false,
             hub_connected: false,
             token: None,
             queue_remote_deliveries: false,
             hub_role: false,
         }
     }
+}
+
+/// Constant-time equality for operator credentials: the comparison
+/// time does not depend on how many leading bytes match.
+fn ct_equals(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (left, right) in a.iter().zip(b) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
+/// The cookie a successful login sets: HttpOnly so page scripts never
+/// read it, SameSite=Strict so cross-site requests never carry it, and
+/// Secure on TLS listeners.
+fn set_cookie_value(token: &str, secure: bool) -> String {
+    format!(
+        "{COOKIE_NAME}={token}; HttpOnly; SameSite=Strict; Path=/{}",
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+/// The presented login cookie value, if any.
+fn presented_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
+    let header = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    for part in header.split("; ") {
+        if let Some(value) = part.strip_prefix(COOKIE_NAME)
+            && let Some(value) = value.strip_prefix('=')
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 /// The UI server.
@@ -149,20 +204,34 @@ impl UiServer {
             self.deny,
         );
 
+        let cookie_secure = self.config.cookie_secure;
+        let middleware_token = token.clone();
         let api = router(state).layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
-                let token = token.clone();
+                let token = middleware_token.clone();
                 async move {
-                    let authorized = request
+                    let presented = presented_cookie(request.headers());
+                    let header_ok = request
                         .headers()
                         .get(axum::http::header::AUTHORIZATION)
                         .and_then(|value| value.to_str().ok())
                         .and_then(|value| value.strip_prefix("Bearer "))
-                        .map(|presented| presented == token)
+                        .map(|value| ct_equals(value, &token))
                         .unwrap_or(false);
-                    if !authorized {
+                    let cookie_ok = presented
+                        .as_deref()
+                        .map(|value| ct_equals(value, &token))
+                        .unwrap_or(false);
+                    if !header_ok && !cookie_ok {
+                        // A 401 never clears a cookie: a stale request's
+                        // rejection must not clear a newer login, and a
+                        // cookie that holds the current token is by
+                        // definition authorized. A stale cookie is
+                        // superseded by the next successful login's
+                        // Set-Cookie.
                         let response = axum::response::Response::builder()
                             .status(axum::http::StatusCode::UNAUTHORIZED)
+                            .header("content-type", "text/plain; charset=utf-8")
                             .body(axum::body::Body::from("unauthorized"));
                         return match response {
                             Ok(response) => response,
@@ -178,9 +247,41 @@ impl UiServer {
             },
         ));
 
+        let login_token = token;
+        let login_secure = cookie_secure;
+        // The login route sits OUTSIDE the auth layer: it is the only
+        // unauthenticated /api route and the only place the cookie is
+        // set.
+        let login = axum::routing::post(move |axum::Json(body): axum::Json<LoginBody>| {
+            let login_token = login_token.clone();
+            async move {
+                if !ct_equals(&body.token, &login_token) {
+                    return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+                }
+                let cookie = set_cookie_value(&login_token, login_secure);
+                let header = match axum::http::HeaderValue::from_str(&cookie) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::error!(%error, "login cookie header construction failed");
+                        return (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "login failed",
+                        )
+                            .into_response();
+                    }
+                };
+                let mut response = axum::http::StatusCode::NO_CONTENT.into_response();
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::SET_COOKIE, header);
+                response
+            }
+        });
+
         axum::Router::new()
             .merge(api)
             .route("/", axum::routing::get(static_index))
+            .route("/api/login", login)
     }
 
     /// Serves on an already-bound `listener` until `shutdown` resolves.

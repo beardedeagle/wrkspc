@@ -24,7 +24,7 @@ rustls-pki-types = "1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 tower = "0.5"
-x509-parser = "0.16"
+x509-parser = "0.18"
 
 [lints]
 workspace = true
@@ -32,7 +32,7 @@ workspace = true
 [dev-dependencies]
 tokio.workspace = true
 a2a-client-lf.workspace = true
-rcgen = "0.13"
+rcgen = "0.14"
 rustls-pemfile = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

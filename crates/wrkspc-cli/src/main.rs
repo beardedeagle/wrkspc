@@ -33,6 +33,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => wrkspc_cli::hub::run_hub(args).await,
         Command::McpBridge(args) => wrkspc_cli::bridge::run_bridge(args).await,
         Command::Skill { skill } => wrkspc_cli::skill::run_skill(skill).await,
-        Command::UiToken { node, db } => wrkspc_cli::secrets::run_ui_token(node, db).await,
+        Command::UiToken { node, db, file } => {
+            wrkspc_cli::secrets::run_ui_token(node, db, file).await
+        }
     }
 }

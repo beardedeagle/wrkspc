@@ -56,6 +56,12 @@ pub struct NodeRunArgs {
     /// or they share one operator token.
     #[arg(long)]
     pub node_name: Option<String>,
+    /// Explicit operator-token file (the deploy wrapper's tmpfs
+    /// handoff). Read-only and fail-closed: a missing or empty file is
+    /// an error, never a silently generated credential. Wins over the
+    /// environment override and the platform secret store.
+    #[arg(long)]
+    pub ui_token_file: Option<PathBuf>,
 }
 
 /// The node's keychain identity: `--node-name` when given, otherwise the
@@ -165,14 +171,16 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
     let (dispatcher, dispatcher_handle) =
         Dispatcher::new(store.clone(), provider.clone(), DispatcherConfig::default());
 
-    // Operator token: WRKSPC_UI_TOKEN env wins; otherwise the platform
-    // secret store (macOS Keychain, keyed by the node's host identity;
-    // 0600 file elsewhere). The browser session survives node restarts;
-    // the token never sits in plaintext on disk on macOS. Retrieval:
-    // `wrkspc ui-token` (copies to the clipboard and clears it after
-    // 30s — only when it still holds the token).
+    // Operator token: an explicit `--ui-token-file` wins (the deploy
+    // wrapper's tmpfs handoff), then WRKSPC_UI_TOKEN, then the
+    // platform secret store (macOS Keychain, keyed by the node's host
+    // identity; 0600 file elsewhere). The browser session survives node
+    // restarts; the token never sits in plaintext on disk on macOS.
+    // Retrieval: `wrkspc ui-token` (copies to the clipboard and clears
+    // it after 30s — only when it still holds the token).
     let identity = node_identity(args.node_name.as_deref(), args.host_id.as_deref());
-    let token = crate::secrets::resolve_ui_token(&identity, &db).await?;
+    let token =
+        crate::secrets::resolve_ui_token(&identity, &db, args.ui_token_file.as_deref()).await?;
     tracing::info!(
         "operator token ready (platform secret store; set WRKSPC_UI_TOKEN to override; copy it with `wrkspc ui-token`)",
     );
@@ -213,6 +221,7 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
         Arc::new(dispatcher_handle),
         wrkspc_ui::UiConfig {
             bind: args.ui.parse()?,
+            cookie_secure: false,
             token: Some(token),
             queue_remote_deliveries: false,
             hub_role: false,

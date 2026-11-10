@@ -20,7 +20,6 @@ use wrkspc_core::Store;
 use wrkspc_dispatcher::{SessionBinding, SessionProvider};
 
 use crate::bindings::bridge_injection;
-use crate::util::stable_token;
 
 /// Spawn material for one binding: everything the registry needs to
 /// bring the peer's session up on demand.
@@ -277,7 +276,7 @@ async fn spawn_session(
 ) -> Result<PeerSession, String> {
     tracing::debug!(peer_id = %config.peer_id, "spawning session transport");
     let (handle, _events) = SessionHandle::spawn(StdioTransport::new(config.command.clone()));
-    let mcp: Vec<agent_client_protocol::schema::v1::McpServer> = if config.mcp_http {
+    let mcp: Vec<agent_client_protocol::v1::schema::McpServer> = if config.mcp_http {
         // The ACP injection is a dead path for adapters without
         // mcpServers handling; the harness-native HTTP config is the
         // route. A fresh loopback listener + bearer token per peer,
@@ -286,7 +285,7 @@ async fn spawn_session(
             .await
             .map_err(|e| e.to_string())?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
-        let token = stable_token(db, &format!("{}.mcp-token", config.peer_id)).await?;
+        let token = crate::secrets::mcp_token_for_peer(db, &config.peer_id).await?;
         let server = wrkspc_mcp::McpServer::new(store.clone(), &config.peer_id, hub_connected);
         let http = wrkspc_mcp::HttpListener::new(
             server,

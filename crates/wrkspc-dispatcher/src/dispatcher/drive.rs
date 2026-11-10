@@ -3,7 +3,7 @@
 
 use super::{DispatchState, InFlight};
 use crate::driver::{SessionBinding, SessionProvider};
-use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
+use agent_client_protocol::v1::schema::{ContentBlock, TextContent};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,9 +35,9 @@ async fn record_chunk(
     conversation_id: &str,
     attempt_id: &str,
     session_id: &str,
-    update: agent_client_protocol::schema::v1::SessionUpdate,
+    update: agent_client_protocol::v1::schema::SessionUpdate,
 ) -> Result<(), wrkspc_core::StoreError> {
-    if let agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(chunk) = update
+    if let agent_client_protocol::v1::schema::SessionUpdate::AgentMessageChunk(chunk) = update
         && let ContentBlock::Text(text) = chunk.content
     {
         store

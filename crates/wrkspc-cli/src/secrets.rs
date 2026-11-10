@@ -152,10 +152,132 @@ async fn cleanup_legacy_token_file(path: &std::path::Path, stored: &str) {
     }
 }
 
-/// The operator UI token: the environment override wins, otherwise the
-/// platform store keyed by the node's `identity` (macOS: a Keychain
-/// entry named for the node, e.g. `wrkspc.<host>`; elsewhere: a 0600
-/// file next to `db`), migrating any legacy plaintext file or
+/// Reads the operator token from an explicit file (the deploy wrapper's
+/// tmpfs handoff). Read-only and fail-closed: a missing file, an empty
+/// file, a symlink, or a non-regular file is an error — never a silent
+/// token generation, so a restart cannot invent a credential the
+/// wrapper did not supply.
+///
+/// # Arguments
+///
+/// * `path` — the explicit token file.
+///
+/// # Errors
+///
+/// Returns the stat/read failure or the refusal message.
+pub async fn resolve_ui_token_from_file(path: &Path) -> Result<String, String> {
+    let meta = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|e| format!("cannot stat token file {}: {e}", path.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(format!(
+            "token file {} is not a regular file — refusing to read it",
+            path.display()
+        ));
+    }
+    let token = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| format!("cannot read token file {}: {e}", path.display()))?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err(format!(
+            "token file {} is empty — refusing to generate a replacement",
+            path.display()
+        ));
+    }
+    Ok(token)
+}
+
+/// The per-peer MCP bearer token for the node's loopback HTTP listener.
+/// macOS: the Keychain (service `wrkspc.mcp`, account = peer id); the
+/// legacy `<db>.<peer>.mcp-token` sidecar is migrated into the Keychain
+/// and removed only after a readback proves the stored value matches.
+/// Other platforms: the audited 0600 sidecar. `WRKSPC_MCP_TOKEN` (a
+/// test/emergency pin, same role as the UI-token override) wins on
+/// every platform.
+///
+/// # Arguments
+///
+/// * `db` — the node database (legacy sidecar location).
+/// * `peer` — the binding's peer id.
+///
+/// # Errors
+///
+/// Returns the store or filesystem failure.
+pub async fn mcp_token_for_peer(db: &Path, peer: &str) -> Result<String, String> {
+    if let Some(token) = std::env::var("WRKSPC_MCP_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+    {
+        return Ok(token);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let account = format!("wrkspc.mcp.{peer}");
+        let legacy = std::path::PathBuf::from(format!("{}.{peer}.mcp-token", db.display()));
+        let read_account = account.clone();
+        if let Some(token) = bounded_store_op("keychain read", move || {
+            mcp_platform_store().load(&read_account)
+        })
+        .await?
+        {
+            cleanup_legacy_token_file(&legacy, &token).await;
+            return Ok(token);
+        }
+        if let Some(token) = load_legacy_token_file(&legacy).await? {
+            let stored = token.clone();
+            let store_account = account.clone();
+            bounded_store_op("keychain write", move || {
+                mcp_platform_store().store(&store_account, &stored)
+            })
+            .await?;
+            // Readback proves the migration before the sidecar dies.
+            let readback_account = account.clone();
+            let readback = bounded_store_op("keychain read", move || {
+                mcp_platform_store().load(&readback_account)
+            })
+            .await?;
+            return match readback {
+                Some(value) if value == token => {
+                    cleanup_legacy_token_file(&legacy, &token).await;
+                    Ok(token)
+                }
+                _ => Err(
+                    "mcp token migration failed readback — leaving the sidecar in place"
+                        .to_string(),
+                ),
+            };
+        }
+        let token = uuid::Uuid::new_v4().to_string();
+        let stored = token.clone();
+        let store_account = account.clone();
+        bounded_store_op("keychain write", move || {
+            mcp_platform_store().store(&store_account, &stored)
+        })
+        .await?;
+        Ok(token)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::util::stable_token(db, &format!("{peer}.mcp-token")).await
+    }
+}
+
+/// The macOS Keychain store for per-peer MCP bearer tokens: a separate
+/// service so `wrkspc ui-token` enumeration (service `wrkspc`) never
+/// surfaces MCP tokens.
+#[cfg(target_os = "macos")]
+pub fn mcp_platform_store() -> Box<dyn TokenStore> {
+    Box::new(KeychainStore {
+        service: "wrkspc.mcp",
+    })
+}
+
+/// The operator UI token: an explicit token file wins (the deploy
+/// wrapper's tmpfs handoff), otherwise the environment override,
+/// otherwise the platform store keyed by the node's `identity` (macOS:
+/// a Keychain entry named for the node, e.g. `wrkspc.<host>`; elsewhere:
+/// a 0600 file next to `db`), migrating any legacy plaintext file or
 /// database-path-keyed Keychain entry into it, otherwise a freshly
 /// generated token.
 ///
@@ -163,11 +285,19 @@ async fn cleanup_legacy_token_file(path: &std::path::Path, stored: &str) {
 ///
 /// * `identity` — the node's stable name (its host id, or `default`).
 /// * `db` — the canonical database path (legacy-file migration key).
+/// * `file` — the optional explicit token file (`--ui-token-file`).
 ///
 /// # Errors
 ///
 /// Returns the store or filesystem failure.
-pub async fn resolve_ui_token(identity: &str, db: &Path) -> Result<String, String> {
+pub async fn resolve_ui_token(
+    identity: &str,
+    db: &Path,
+    file: Option<&Path>,
+) -> Result<String, String> {
+    if let Some(path) = file {
+        return resolve_ui_token_from_file(path).await;
+    }
     if let Some(token) = std::env::var("WRKSPC_UI_TOKEN")
         .ok()
         .filter(|token| !token.is_empty())
@@ -184,6 +314,12 @@ pub async fn resolve_ui_token(identity: &str, db: &Path) -> Result<String, Strin
         // directory) must not leave the live credential on disk
         // forever — the Keychain-hit return used to precede all
         // cleanup, so the failure was never revisited.
+        // macOS only: on file-store platforms the legacy path IS the
+        // platform store's own file, and "cleaning" it deletes the
+        // live credential — the next resolve_ui_token call generates
+        // a fresh token, and the hub's two listeners (UI and A2A)
+        // diverge, each accepting a different token.
+        #[cfg(target_os = "macos")]
         cleanup_legacy_token_file(&legacy, &token).await;
         return Ok(token);
     }
@@ -294,13 +430,18 @@ pub fn ui_token_account(identity: &str) -> String {
 /// the clipboard after 30 seconds — and only when it still holds the
 /// token. Runs with NO arguments normally (the stored token is found in
 /// the keychain); `--node <name>` picks one explicitly when several
-/// nodes have tokens. Other platforms: prints the 0600 token file path
-/// (selectable with `--db`).
+/// nodes have tokens. `--file <path>` reads an explicit token file (the
+/// deploy wrapper's tmpfs handoff) and delivers it the same way; on
+/// non-macOS the explicit token is printed (an explicit operator ask,
+/// never a default). Other platforms without `--file`: reports the 0600
+/// token file path (selectable with `--db`), and names the deploy
+/// wrapper's retrieval path when no store file exists.
 ///
 /// # Arguments
 ///
 /// * `node` — the optional node name (macOS Keychain selector).
 /// * `db` — the optional database path (non-macOS file selector).
+/// * `file` — the optional explicit token file.
 ///
 /// # Errors
 ///
@@ -308,7 +449,29 @@ pub fn ui_token_account(identity: &str) -> String {
 pub async fn run_ui_token(
     node: Option<String>,
     db: Option<std::path::PathBuf>,
+    file: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // The explicit token file mirrors the runtime precedence: it wins
+    // over the environment override and the platform store.
+    if let Some(path) = &file {
+        let token = resolve_ui_token_from_file(path).await?;
+        #[cfg(target_os = "macos")]
+        {
+            let scheduled = copy_to_clipboard(&token)?;
+            println!(
+                "token from {} copied to the clipboard — {}; paste it into the wrkspc login screen",
+                path.display(),
+                clear_promise(scheduled)
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // An explicit --file request is an explicit ask for the
+            // value; the operator pastes it into the login card.
+            println!("{token}");
+        }
+        return Ok(());
+    }
     // The environment override has the SAME precedence here as at
     // runtime (CU-06): with WRKSPC_UI_TOKEN set, that token is the
     // active credential and is copied/reported AS SUCH — the stored
@@ -363,9 +526,10 @@ pub async fn run_ui_token(
         .await?
         .is_none()
         {
-            return Err(
-                format!("no UI token stored for {} — start the node first", account).into(),
-            );
+            return Err(format!(
+                "no UI token stored at {account} — a wrapper-managed deployment seals the credential on the host (tpm2 unseal to a tmpfs mount); otherwise start the node first, or read an explicit token file with `wrkspc ui-token --file <path>`"
+            )
+            .into());
         }
         println!("token is stored at {} (mode 0600)", account);
     }
@@ -658,5 +822,198 @@ impl TokenStore for FileStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!("cannot remove {path:?}: {error}")),
         }
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod tests {
+    use super::resolve_ui_token;
+    use std::path::PathBuf;
+
+    /// Two resolves against the same database must return the SAME
+    /// token and leave the 0600 store file in place (CU-02): the hub
+    /// calls resolve_ui_token once per listener, and a token that
+    /// rotates between the calls splits the UI and A2A surfaces.
+    #[tokio::test]
+    async fn repeated_resolve_keeps_one_token() {
+        let dir = std::env::temp_dir().join(format!(
+            "wrkspc-ui-token-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let db = dir.join("hub.db");
+        let first = resolve_ui_token("hub", &db, None)
+            .await
+            .expect("first resolve");
+        let second = resolve_ui_token("hub", &db, None)
+            .await
+            .expect("second resolve");
+        assert_eq!(first, second, "the store never rotates a settled token");
+        let account = super::ui_token_account(&db.display().to_string());
+        let path = PathBuf::from(account);
+        assert!(
+            path.exists(),
+            "the live credential file must survive the second resolve"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("token readable")
+                .trim(),
+            first,
+            "the file keeps holding the accepted token"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An explicit token file outranks the platform store — the
+    /// wrapper's tmpfs handoff is the deployment's chosen credential,
+    /// never a fallback behind a stored one.
+    #[tokio::test]
+    async fn explicit_file_outranks_the_platform_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "wrkspc-ui-token-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let db = dir.join("hub.db");
+        let file = dir.join("token.file");
+        std::fs::write(&file, "file-token\n").expect("write token file");
+        // A stored token exists (generated on the store path) and must
+        // lose to the explicit file.
+        let store_token = resolve_ui_token("hub", &db, None)
+            .await
+            .expect("store resolve");
+        assert_ne!(store_token, "file-token", "test setup: distinct values");
+        let resolved = resolve_ui_token("hub", &db, Some(&file))
+            .await
+            .expect("file resolve");
+        assert_eq!(resolved, "file-token", "the explicit file must win");
+        let sidecar = PathBuf::from(format!("{}.ui-token", db.display()));
+        assert_eq!(
+            std::fs::read_to_string(&sidecar)
+                .expect("sidecar readable")
+                .trim(),
+            store_token,
+            "the store token is left untouched by the file resolve"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing token file is a loud failure, never a silent
+    /// generation: a restart must not invent a credential the wrapper
+    /// did not supply.
+    #[tokio::test]
+    async fn missing_file_fails_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "wrkspc-ui-token-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let db = dir.join("hub.db");
+        let file = dir.join("absent.token");
+        let error = resolve_ui_token("hub", &db, Some(&file))
+            .await
+            .expect_err("a missing token file must fail");
+        assert!(
+            error.contains("cannot stat token file"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !PathBuf::from(format!("{}.ui-token", db.display())).exists(),
+            "a failed file resolve must not create a store sidecar"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty token file is a loud failure, never a silent
+    /// generation (the audited file-store rule applied to the explicit
+    /// source).
+    #[tokio::test]
+    async fn empty_file_fails_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "wrkspc-ui-token-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let db = dir.join("hub.db");
+        let file = dir.join("empty.token");
+        std::fs::write(&file, "   \n").expect("write empty file");
+        let error = resolve_ui_token("hub", &db, Some(&file))
+            .await
+            .expect_err("an empty token file must fail");
+        assert!(error.contains("empty"), "unexpected error: {error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlinked token file is refused, never followed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "wrkspc-ui-token-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let db = dir.join("hub.db");
+        let target = dir.join("real.token");
+        std::fs::write(&target, "real-token\n").expect("write target");
+        let link = dir.join("link.token");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let error = resolve_ui_token("hub", &db, Some(&link))
+            .await
+            .expect_err("a symlinked token file must be refused");
+        assert!(
+            error.contains("not a regular file"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Resolving from an explicit file never writes the platform
+    /// store: the wrapper owns this credential end to end.
+    #[tokio::test]
+    async fn file_resolve_never_writes_the_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "wrkspc-ui-token-nowrite-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let db = dir.join("hub.db");
+        let file = dir.join("token.file");
+        std::fs::write(&file, "file-token\n").expect("write token file");
+        let resolved = resolve_ui_token("hub", &db, Some(&file))
+            .await
+            .expect("file resolve");
+        assert_eq!(resolved, "file-token");
+        let sidecar = PathBuf::from(format!("{}.ui-token", db.display()));
+        assert!(
+            !sidecar.exists(),
+            "an explicit token file must never spawn a store sidecar"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

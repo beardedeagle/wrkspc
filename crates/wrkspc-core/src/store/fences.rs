@@ -1,4 +1,7 @@
 //! Moderation fences: set, ack, clear, list.
+//!
+//! Read-modify-write operations reserve the WAL writer before reading, so a
+//! competing commit cannot invalidate the snapshot they need to update.
 
 use super::Fence;
 use super::Store;
@@ -21,7 +24,7 @@ impl Store {
         kind: FenceKind,
         set_by: &str,
     ) -> Result<String> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(row) = sqlx::query(
             "SELECT id FROM fences
              WHERE conversation_id = ? AND peer_id = ? AND kind = ? AND active = 1",
@@ -109,7 +112,7 @@ impl Store {
     /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the fence
     /// does not exist.
     pub async fn clear_fence(&self, fence_id: &str, cleared_by: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row: Option<(String, String, String)> =
             sqlx::query_as("SELECT conversation_id, peer_id, kind FROM fences WHERE id = ?")
                 .bind(fence_id)

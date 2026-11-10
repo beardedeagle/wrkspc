@@ -53,6 +53,12 @@ pub struct HubRunArgs {
     /// Serial deny-list file: one hex serial per line. TLS mode only.
     #[arg(long)]
     pub revoke_list: Option<PathBuf>,
+    /// Explicit operator-token file (the deploy wrapper's tmpfs
+    /// handoff). Read-only and fail-closed: a missing or empty file is
+    /// an error, never a silently generated credential. Wins over the
+    /// environment override and the platform secret store.
+    #[arg(long)]
+    pub ui_token_file: Option<PathBuf>,
 }
 
 /// Runs the hub until ctrl-c.
@@ -137,7 +143,7 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
     // It shares the TLS surface's revocation set, so bans/restores
     // through EITHER listener update the same live deny set.
     if let Some(bind) = args.ui {
-        let token = resolve_ui_token(&db).await?;
+        let token = resolve_ui_token(&db, args.ui_token_file.as_deref()).await?;
         let ui = UiServer::new(
             store.clone(),
             Arc::new(HubCancel {
@@ -145,6 +151,7 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
             }),
             UiConfig {
                 bind: bind.parse()?,
+                cookie_secure: false,
                 token: Some(token),
                 queue_remote_deliveries: true,
                 hub_role: true,
@@ -199,7 +206,7 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
             // The UI router joins the TLS surface: the browser (no client
             // certificate) reaches `/` and `/api/*` behind the bearer
             // gate, while the A2A routes stay behind the stamp gate.
-            let ui_token = resolve_ui_token(&db).await?;
+            let ui_token = resolve_ui_token(&db, args.ui_token_file.as_deref()).await?;
             let ui_app = UiServer::new(
                 store.clone(),
                 Arc::new(HubCancel {
@@ -207,6 +214,9 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                 }),
                 UiConfig {
                     bind: "127.0.0.1:0".parse().expect("static address parses"),
+                    // The embedded UI serves on the TLS surface: the
+                    // browser stores the Secure login cookie here.
+                    cookie_secure: true,
                     token: Some(ui_token.clone()),
                     queue_remote_deliveries: true,
                     hub_role: true,
@@ -440,12 +450,14 @@ fn build_acceptor(
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
-/// Resolves the operator bearer token: `WRKSPC_UI_TOKEN` when set,
-/// otherwise the stable token derived from the hub database.
+/// Resolves the operator bearer token: an explicit token file (the
+/// deploy wrapper's tmpfs handoff), then `WRKSPC_UI_TOKEN`, then the
+/// stable token derived from the hub database.
 ///
 /// # Arguments
 ///
 /// * `db` — the hub database path.
+/// * `file` — the optional explicit token file.
 ///
 /// # Returns
 ///
@@ -453,10 +465,13 @@ fn build_acceptor(
 ///
 /// # Errors
 ///
-/// Returns a boxed error when the stable token cannot be derived.
-async fn resolve_ui_token(db: &Path) -> Result<String, Box<dyn std::error::Error>> {
+/// Returns a boxed error when the token cannot be resolved.
+async fn resolve_ui_token(
+    db: &Path,
+    file: Option<&Path>,
+) -> Result<String, Box<dyn std::error::Error>> {
     // The hub's identity doubles as its file-store key on non-macOS.
-    crate::secrets::resolve_ui_token(&db.display().to_string(), db)
+    crate::secrets::resolve_ui_token(&db.display().to_string(), db, file)
         .await
         .map_err(Into::into)
 }

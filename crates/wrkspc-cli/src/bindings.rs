@@ -5,7 +5,7 @@
 //! stdio `McpServer` pointing at this same binary's `mcp-bridge`
 //! subcommand, so the harness sees the wrkspc tools from its first turn.
 
-use agent_client_protocol::schema::v1::{McpServer, McpServerStdio};
+use agent_client_protocol::v1::schema::{McpServer, McpServerStdio};
 use std::path::PathBuf;
 
 /// The bindings file: one entry per enrolled harness peer.

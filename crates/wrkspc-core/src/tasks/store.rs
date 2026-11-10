@@ -219,7 +219,8 @@ impl Store {
         };
 
         let count_sql = format!("SELECT COUNT(*) FROM a2a_tasks {where_clause}");
-        let mut count_query = sqlx::query_scalar(&count_sql);
+        // SQL comes only from the literal filter fragments above; values stay bound.
+        let mut count_query = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql));
         for bind in &binds {
             count_query = count_query.bind(bind);
         }
@@ -244,7 +245,8 @@ impl Store {
             "SELECT * FROM a2a_tasks {page_where}
              ORDER BY updated_at DESC, task_id DESC LIMIT ?"
         );
-        let mut rows_query = sqlx::query(&rows_sql);
+        // Pagination also adds only literal SQL, never interpolated request values.
+        let mut rows_query = sqlx::query(sqlx::AssertSqlSafe(rows_sql));
         for bind in &binds {
             rows_query = rows_query.bind(bind);
         }

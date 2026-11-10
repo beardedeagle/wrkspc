@@ -15,7 +15,9 @@ impl Store {
         set_by: &str,
     ) -> Result<CancelOutcome> {
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool().begin().await?;
+        // Wait for the WAL writer before reading; a deferred read snapshot
+        // cannot be promoted safely if another connection commits first.
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT i.id AS intent_id, i.state, m.conversation_id
              FROM execution_intents i

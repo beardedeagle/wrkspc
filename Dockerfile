@@ -40,7 +40,7 @@ COPY . .
 # --locked (the container build must respect Cargo.lock like every
 # other gate) and the same path-remapping policy as the justfile-level
 # RUSTFLAGS, adjusted for the image's cargo home (T09).
-ENV RUSTFLAGS="--remap-path-prefix=/usr/local/cargo/registry=/registry/src --remap-path-prefix=/src=/wrkspc"
+ENV RUSTFLAGS="--remap-path-prefix=/usr/local/cargo/registry=/registry/src --remap-path-prefix=/usr/local/cargo/git=/git --remap-path-prefix=/src=/wrkspc"
 RUN cargo build --release --locked -p wrkspc-cli --bin wrkspc \
     && mkdir -p /data \
     && touch /data/.keep \

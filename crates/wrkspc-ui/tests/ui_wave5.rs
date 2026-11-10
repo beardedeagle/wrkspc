@@ -26,6 +26,7 @@ async fn boot(
         cancel,
         UiConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
+            cookie_secure: false,
             token: Some(TOKEN.to_string()),
             queue_remote_deliveries: hub_role,
             hub_role,

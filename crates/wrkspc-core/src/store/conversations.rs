@@ -426,7 +426,8 @@ impl Store {
                     "DELETE FROM conversation_members
                      WHERE conversation_id = ? AND peer_id NOT IN ({placeholders})"
                 );
-                let mut query = sqlx::query(&sql).bind(&conversation.id);
+                // Only placeholder count is dynamic; every id is bound separately.
+                let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(&conversation.id);
                 for member in &conversation.members {
                     query = query.bind(member);
                 }

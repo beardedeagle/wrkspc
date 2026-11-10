@@ -120,7 +120,7 @@ fn write_pki(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, Stri
     ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "wrkspc-hub-test-ca");
-    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let ca = rcgen::CertifiedIssuer::self_signed(ca_params, &ca_key).unwrap();
 
     let server_key = KeyPair::generate().unwrap();
     let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
@@ -131,7 +131,7 @@ fn write_pki(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, Stri
     server_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "hub");
-    let server = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
+    let server = server_params.signed_by(&server_key, &ca).unwrap();
 
     let client_key = KeyPair::generate().unwrap();
     let mut client_params = CertificateParams::new(vec!["node-hubtest".to_string()]).unwrap();
@@ -139,7 +139,7 @@ fn write_pki(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, Stri
     client_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "node-hubtest");
-    let client = client_params.signed_by(&client_key, &ca, &ca_key).unwrap();
+    let client = client_params.signed_by(&client_key, &ca).unwrap();
 
     let ca_path = dir.join("ca.pem");
     let cert_path = dir.join("hub.crt");

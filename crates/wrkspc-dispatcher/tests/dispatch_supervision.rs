@@ -5,7 +5,7 @@
 
 mod common;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ContentBlock, ContentChunk, MessageId, SessionUpdate, StopReason, TextContent,
 };
 use std::collections::HashMap;

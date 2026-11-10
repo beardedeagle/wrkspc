@@ -21,7 +21,7 @@ osv_scanner_dir := justfile_directory() / "output" / "tools" / ("osv-scanner-" +
 # so the expansion happens here (machine-agnostic via just's builtins)
 # and the flags ride the RUSTFLAGS env var every just-invoked build
 # carries. Enforced by the `no-user-paths` gate recipe.
-export RUSTFLAGS := "--remap-path-prefix=" + home_directory() + "/.cargo/registry/src=/registry/src --remap-path-prefix=" + home_directory() + "/.rustup=/rustup --remap-path-prefix=" + justfile_directory() + "=/wrkspc"
+export RUSTFLAGS := "--remap-path-prefix=" + home_directory() + "/.cargo/registry/src=/registry/src --remap-path-prefix=" + home_directory() + "/.cargo/git=/git --remap-path-prefix=" + home_directory() + "/.rustup=/rustup --remap-path-prefix=" + justfile_directory() + "=/wrkspc"
 
 default:
     @just --list

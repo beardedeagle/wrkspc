@@ -11,11 +11,12 @@
 
 use crate::error::AcpError;
 use crate::session::SessionEvent;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema::{
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SessionNotification,
 };
-use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo};
+use agent_client_protocol::{AcpAgent, Agent, Client};
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -92,7 +93,7 @@ impl AcpTransport for StdioTransport {
             let agent =
                 AcpAgent::from_str(&self.command).map_err(|e| AcpError::Spawn(e.to_string()))?;
             Client
-                .builder()
+                .v1()
                 .on_receive_notification(
                     async move |notification: SessionNotification, _cx| {
                         let event = SessionEvent {

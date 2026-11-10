@@ -37,3 +37,18 @@ are loopback-scoped bearer-token HTTP, and ACP plus the injected MCP
 bridge are stdio between the node and the adapters it spawned. Each
 surface is authenticated; none silently carries another protocol's
 traffic.
+
+## SDK and storage dependencies
+
+| Surface | Rust SDK | Protocol or transport |
+|---------|----------|-----------------------|
+| ACP | `agent-client-protocol 5.1.0` | Stable ACP v1 over stdio |
+| MCP | `rmcp 3.9.0` | Stdio and Streamable HTTP |
+| A2A | `a2a-lf 0.4.2`, server `0.5.3`, client `0.2.9` | A2A v1.0 over HTTP/TLS |
+
+Storage uses SQLx 0.9.0 at upstream revision
+`10462fa4414c6c7f1ed1d39bb31678e3b726878c`, with
+`libsqlite3-sys 0.39.1` bundling SQLite 3.54.1. The revision permits the
+patched SQLite library; the published SQLx 0.9.0 driver excludes it.
+`Cargo.lock` fixes the complete dependency graph. Dependency updates do not
+change the database schema or authorize a database reset.
