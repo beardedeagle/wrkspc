@@ -1,0 +1,120 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "CHANGELOG.md"
+      # deploy/README.md is copied into the book by `just docs`, and
+      # the Justfile recipe + its inputs change the build itself.
+      - "deploy/README.md"
+      - "Justfile"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "CHANGELOG.md"
+      - "deploy/README.md"
+      - "Justfile"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: docs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build book
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      # The caches restore BEFORE setup-rust: its version probes must
+      # run against the restored pinned tools. Hand-rolled cargo cache
+      # (the two-step split); official SHA-pinned actions only.
+      - name: Cache Cargo registry and tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache Cargo target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: target
+          key: ${{ runner.os }}-book-target-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'Justfile', 'rust-toolchain.toml', '.github/workflows/docs.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-book-target-
+
+      - name: Setup Rust and just
+        uses: ./.github/actions/setup-rust
+
+
+
+      - name: Install mdbook (pinned)
+        # Probe-guarded like the setup-rust tool installs: the Cargo
+        # tools cache restores a previously installed binary, and a
+        # bare `cargo install` fails on "binary already exists". Skip
+        # the install when the pinned version already runs.
+        run: |
+          set -euo pipefail
+          if found="$(mdbook --version 2>/dev/null)"; then
+            if [[ "$found" == "mdbook v0.5.4" ]]; then
+              echo "mdbook already available at pinned version: $(command -v mdbook) -> $found"
+              exit 0
+            fi
+            echo "mdbook version mismatch: found '$found', pinned is 0.5.4; installing"
+          fi
+          cargo install mdbook --version 0.5.4 --locked --target-dir target/cargo-install
+
+      - name: just docs
+        run: just docs
+
+      # The book is a static site, so pushes to main (and manual runs)
+      # publish it to GitHub Pages; pull requests only verify the build.
+      # configure-pages' enablement also repairs the Pages site config if
+      # it is ever reset, so publication self-heals on the next run.
+      - name: Configure Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+        with:
+          enablement: true
+
+      - name: Upload pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: docs/book
+
+  # The deployment is atomic: it only ever publishes a completed build's
+  # artifact, and the workflow-level concurrency means a superseded build
+  # never deploys a half-written book.
+  deploy:
+    name: Deploy book
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wrkspc-core",
+    "crates/wrkspc-acp",
+    "crates/wrkspc-mcp",
+    "crates/wrkspc-a2a",
+    "crates/wrkspc-dispatcher",
+    "crates/wrkspc-ui",
+    "crates/wrkspc-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/beardedeagle/wrkspc"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database: the released 0.9.0 driver excludes patched libsqlite3-sys 0.39.
+# Pin upstream's merged fix until a release includes it (RUSTSEC-2026-0459).
+sqlx = { version = "0.9.0", git = "https://github.com/transact-rs/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c", features = ["runtime-tokio", "sqlite", "chrono", "uuid", "migrate"] }
+
+# Error handling
+thiserror = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUIDs
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# ACP client: keep the native process and stdio transports explicit.
+agent-client-protocol = { version = "=5.1.0", features = ["process", "stdio"] }
+
+# MCP server: 3.9.0 includes the OAuth SSRF and HTTP response-body fixes
+# (RUSTSEC-2026-0457 and RUSTSEC-2026-0462), plus the earlier transport fixes.
+rmcp = "=3.9.0"
+
+# A2A SDK (D-4b pin set: keep the three crates pinned together)
+a2a-lf = "=0.4.2"
+a2a-server-lf = "=0.5.3"
+a2a-client-lf = "=0.2.9"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+future_incompatible = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused = { level = "warn", priority = -1 }
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+unimplemented = "warn"
+wildcard_dependencies = "deny"
+
+# Shipping artifacts must not leak builder paths (no /Users/... or
+# /home/... in panic locations, error chains, or debug sections).
+# The remapping lives in the Justfile's exported RUSTFLAGS (and the
+# Dockerfile's ENV for container builds) — cargo's `trim-paths`
+# profile option is still unstable on the pinned
+# toolchain); strip drops the debug sections entirely. Enforced by
+# the `no-user-paths` gate recipe.
+[profile.release]
+strip = true

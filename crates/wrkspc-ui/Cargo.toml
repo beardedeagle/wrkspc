@@ -1,0 +1,26 @@
+[package]
+name = "wrkspc-ui"
+description = "Embedded operator console served by wrkspc nodes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+axum = "0.8"
+regex = "1"
+wrkspc-core = { version = "0.1.0", path = "../wrkspc-core" }
+wrkspc-dispatcher = { version = "0.1.0", path = "../wrkspc-dispatcher" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json"] }

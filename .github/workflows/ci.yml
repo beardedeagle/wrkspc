@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci-rust:
+    name: ci-rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      # The caches restore BEFORE setup-rust: its version probes must
+      # run against the restored pinned tools (restoring afterwards
+      # could overwrite freshly validated tools with older cached
+      # copies, and installing before the restore wastes the compile
+      # work). Hand-rolled cargo cache (the two-step split): the
+      # registry/tools entry and the per-job target entry are separate
+      # so target churn never evicts the registry. Official SHA-pinned
+      # actions only.
+      - name: Cache Cargo registry and tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache Cargo target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: target
+          key: ${{ runner.os }}-ci-rust-target-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'Justfile', 'rust-toolchain.toml', '.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-ci-rust-target-
+
+      - name: Setup Rust and just
+        uses: ./.github/actions/setup-rust
+
+      - name: just ci-rust
+        run: just ci-rust

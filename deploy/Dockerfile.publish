@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1
+
+# wrkspc hub — registry-publish image (GHCR).
+#
+# Unlike the root Dockerfile, which compiles the workspace inside the
+# image and is the reproducibility definition, this file wraps a
+# PREBUILT release binary. The binary comes from the same
+# `just release-tarball` leg that ships the signed release tarballs,
+# so a published image never recompiles in CI and is byte-identical
+# to the artifact humans download.
+#
+# Build context contract (one context per target arch, as produced by
+# .github/workflows/release.yml):
+#   wrkspc          the release binary for the platform being built
+#   data/.keep      an empty owned placeholder that seeds /data as
+#                   uid-65532-writable in the layer (distroless has no
+#                   shell, so ownership is fixed at COPY time)
+#
+# Runtime posture mirrors the root Dockerfile exactly: distroless
+# cc-debian12 (digest-pinned), non-root uid 65532, no shell, no
+# package manager, no utilities. Nothing here is image-specific
+# behavior — only the build stage differs.
+
+# ---- runtime stage: distroless, non-root, no shell ----
+FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa
+COPY --chown=65532:65532 wrkspc /usr/local/bin/wrkspc
+COPY --chown=65532:65532 data/.keep /data/.keep
+# License notice retention (the project license requires the notice to
+# accompany every distribution format); LICENSE comes from the repo
+# root in the build context.
+COPY --chown=65532:65532 LICENSE /NOTICES/LICENSE
+USER 65532:65532
+WORKDIR /data
+EXPOSE 8443 8082 8083
+# No in-image HEALTHCHECK: the distroless image carries no shell or
+# curl, so the liveness probe is an external monitor against the UI's
+# /api/health (a bare 401 still proves the process is serving). See
+# deploy/README.md.
+ENTRYPOINT ["/usr/local/bin/wrkspc"]
+CMD ["hub", "run", "--help"]

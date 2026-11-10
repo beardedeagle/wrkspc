@@ -1,0 +1,23 @@
+[package]
+name = "wrkspc-dispatcher"
+description = "Delivery and execution scheduler for wrkspc messages."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+futures = "0.3"
+thiserror = "2"
+agent-client-protocol.workspace = true
+wrkspc-core = { version = "0.1.0", path = "../wrkspc-core" }
+wrkspc-acp = { version = "0.1.0", path = "../wrkspc-acp" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -1,0 +1,8 @@
+# cargo-audit configuration (separate from cargo-deny's deny.toml).
+[advisories]
+
+# RUSTSEC-2025-0134 (rustls-pemfile 2.2.0, unmaintained): called
+# directly in the hub/node TLS setup for PEM loading. Stable, tiny,
+# widely used; the flag is a project-lifecycle note, not a
+# vulnerability. Accepted until a maintained loader replaces it.
+ignore = ["RUSTSEC-2025-0134"]

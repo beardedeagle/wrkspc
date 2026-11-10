@@ -1,0 +1,57 @@
+name: Security
+
+on:
+  schedule:
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: dependency security scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      # The caches restore BEFORE setup-rust: its version probes must
+      # run against the restored pinned tools. Hand-rolled cargo cache
+      # (the two-step split); official SHA-pinned actions only.
+      - name: Cache Cargo registry and tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache Cargo target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: target
+          key: ${{ runner.os }}-scan-target-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'Justfile', 'rust-toolchain.toml', '.github/workflows/security.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-scan-target-
+
+      - name: Setup Rust and just
+        uses: ./.github/actions/setup-rust
+        with:
+          install-cargo-deny: "true"
+          install-cargo-audit: "true"
+
+      - name: just deny-check
+        run: just deny-check
+
+      - name: just audit
+        run: just audit
+
+      - name: just osv
+        run: just osv

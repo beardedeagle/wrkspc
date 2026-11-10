@@ -1,0 +1,2714 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wrkspc</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #0d1117;
+    --surface: #161b22;
+    --surface-2: #1c2129;
+    --border: #21262d;
+    --border-strong: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --faint: #6e7681;
+    --accent: #4493f8;
+    --green: #3fb950;
+    --amber: #d29922;
+    --red: #f85149;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; display: flex; overflow: hidden; }
+
+  /* Quiet scrollbars: the browser's native thumb reads near-white against
+     the dark panels and brightens further on hover — pin it to the border
+     tone in every state. */
+  * { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+  *::-webkit-scrollbar { width: 10px; height: 10px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px;
+    border: 2px solid transparent; background-clip: padding-box; }
+  *::-webkit-scrollbar-thumb:hover,
+  *::-webkit-scrollbar-thumb:active { background: var(--muted);
+    border: 2px solid transparent; background-clip: padding-box; }
+  *::-webkit-scrollbar-corner { background: transparent; }
+
+  /* first-frame gate: an opaque, var-free cover that exists in the very
+     first paint (before JS or theme) and is removed only when the first
+     full render (login card or transcript) is on screen. */
+  #boot-gate {
+    position: fixed; inset: 0; z-index: 100;
+    display: flex; align-items: center; justify-content: center;
+    background: #0d1117; color: #6e7681;
+    font-size: 0.85rem; letter-spacing: 0.12em; text-transform: uppercase;
+  }
+
+  /* per-conversation loading state: the response area shows a loading
+     line while a conversation's content is fetched and rendered. */
+  #transcript-loading { display: none; }
+  #transcript-scroll.loading #transcript-loading {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; color: var(--faint);
+    font-size: 0.85rem; letter-spacing: 0.12em; text-transform: uppercase;
+  }
+  #transcript-scroll.loading #transcript { visibility: hidden; }
+
+  /* boot/login overlay: nothing but the login card (or the loading
+     line) paints until the first full render */
+  #boot {
+    position: fixed; inset: 0; z-index: 60;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--bg); color: var(--faint);
+    font-size: 0.85rem; letter-spacing: 0.12em; text-transform: uppercase;
+  }
+  #boot[hidden] { display: none; }
+  #boot-status { display: none; }
+  #boot.connecting #boot-status { display: block; }
+  #boot.connecting #login-card { display: none; }
+  #login-card {
+    width: min(24rem, 90vw);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    padding: 1.4rem 1.4rem 1.1rem;
+    text-align: left;
+    letter-spacing: normal;
+    text-transform: none;
+    color: var(--text);
+  }
+  #login-card h1 {
+    margin: 0 0 0.5rem;
+    font-size: 1.1rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+  }
+  #login-card .explain { margin-bottom: 0.8rem; }
+  #login-card code { font-size: 0.72rem; color: var(--muted); background: var(--surface-2); padding: 0.05rem 0.3rem; border-radius: 4px; }
+  #login-card input {
+    margin-bottom: 0.6rem;
+    font-family: ui-monospace, monospace;
+    letter-spacing: 0.05em;
+  }
+  #login-card button { width: 100%; }
+  #login-error { color: var(--red); font-size: 0.78rem; min-height: 1.1em; margin-top: 0.5rem; }
+
+  aside, #workspace { display: flex; flex-direction: column; }
+
+  /* ---- left rail ---- */
+  #conversations { width: 22rem; flex: none; border-right: 1px solid var(--border); background: var(--panel); }
+  /* Two fixed halves: each section owns its vertical space and scrolls on its
+     own, so a long list can never push its neighbour off the column. Both
+     side columns use this. */
+  .split-slot { flex: 1 1 50%; min-height: 0; display: flex; flex-direction: column; padding: 0 0.75rem 0.5rem; }
+  .split-slot + .split-slot { border-top: 1px solid var(--border); }
+  .split-slot > h2:first-child, .split-slot > .rail-row:first-child h2 { margin-top: 0.75rem; }
+  .split-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+
+  /* One tooltip layer for the whole page. The browser's native tooltip is slow
+     and its delay is not configurable, so a hovered element's title is lifted
+     into this element instead. */
+  #tooltip { position: fixed; z-index: 90; pointer-events: none; max-width: 22rem;
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--border-strong);
+    border-radius: 6px; padding: 0.25rem 0.45rem; font-size: 0.72rem; line-height: 1.4;
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.45); white-space: pre-line; }
+  #tooltip[hidden] { display: none; }
+  /* A hairline under each rail heading, so a section's list is bounded at the
+     top the same way its rows are separated below. */
+  .split-slot > .rail-row:first-child { border-bottom: 1px solid var(--border);
+    padding-bottom: 0.35rem; }
+  .rail-row { display: flex; align-items: center; gap: 0.5rem; }
+  .rail-row h2 { margin: 0.9rem 0 0.4rem; }
+  .rail-action { margin-left: auto; padding: 0.15rem 0.5rem; font-size: 0.66rem; }
+
+  h2 {
+    margin: 0.9rem 0 0.4rem;
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--faint);
+  }
+  h2:first-child { margin-top: 0; }
+  .explain { color: var(--faint); font-size: 0.72rem; margin: 0.2rem 0 0.5rem; line-height: 1.4; }
+
+
+  /* ---- conversation strip: room, members, gates ---- */
+  #convo-head { border-bottom: 1px solid var(--border); background: var(--panel);
+    padding: 0.5rem 0.9rem 0.45rem; position: relative; }
+  /* The gates trigger sits inline with the room name, pinned to the right of
+     the centre column, and its menu drops from there over the transcript. */
+  .room-line { display: flex; align-items: center; gap: 0.5rem; padding-right: 3.6rem; }
+  .room-name { font-size: 0.95rem; font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+  .room-id { font-family: ui-monospace, monospace; font-size: 0.72rem; color: var(--faint); }
+  .room-line #unknown-banner { margin-left: auto; }
+  .room-members { margin-top: 0.2rem; font-size: 0.72rem; color: var(--faint); overflow-wrap: anywhere; }
+  /* The banner and the gates trigger share the right end of the room line, so
+     the trigger is pinned where the menu opens and nothing drifts left. */
+  .room-actions { margin-left: auto; display: flex; align-items: center; gap: 0.5rem; }
+  #gates-toggle { border: 1px solid var(--border-strong); background: var(--surface);
+    color: var(--muted); border-radius: 8px; height: 2.3rem; min-width: 2.5rem;
+    padding: 0 0.55rem; font-size: 1.15rem; line-height: 1; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+    /* Dead-centre of the header strip, out of the text flow: the room name
+       and the members line keep their original layout untouched. */
+    position: absolute; right: 0.9rem; top: 50%; transform: translateY(-50%);
+    margin: 0; }
+  #gates-toggle:hover { color: var(--text); border-color: var(--accent); }
+  /* The menu floats over the transcript: opening it never reflows the pane. */
+  .gates-menu { position: absolute; top: 100%; right: 0.9rem; z-index: 40; margin-top: 0.25rem;
+    width: min(24rem, 90vw); background: var(--surface); border: 1px solid var(--border-strong);
+    border-radius: 8px; box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45); }
+  .gates-menu[hidden] { display: none; }
+  .gates-head { display: flex; align-items: center; gap: 0.25rem;
+    padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--border); }
+  .gates-head .gates-hint { margin-right: auto; font-size: 0.66rem; text-transform: uppercase;
+    letter-spacing: 0.05em; color: var(--faint); }
+  .gates-list { max-height: 14rem; overflow-y: auto; padding: 0.2rem; }
+  .gate-row { display: flex; align-items: center; gap: 0.25rem; padding: 0.15rem 0.3rem; border-radius: 5px; }
+  .gate-row:hover { background: var(--surface-2); }
+  .gate-id { display: flex; flex-direction: column; margin-right: auto; min-width: 0; }
+  .gate-row .gate-name { font-size: 0.76rem; color: var(--text); overflow-wrap: anywhere; }
+  .gate-row .gate-host { color: var(--faint); font-size: 0.68rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .gate-row .peer-btn.on { color: var(--amber); }
+  .gate-row .peer-btn.on.block { color: var(--red); }
+
+  .convo {
+    display: flex; flex-direction: column; gap: 0.1rem;
+    width: 100%; text-align: left; margin: 0.2rem 0;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 0.45rem 0.6rem;
+    color: var(--text);
+    cursor: pointer;
+  }
+  .convo:hover { border-color: var(--border-strong); background: var(--surface-2); }
+  .convo.selected { border-color: var(--accent); background: rgba(68, 147, 248, 0.09); }
+  .convo .cid { font-family: ui-monospace, monospace; font-size: 0.72rem; color: var(--faint); }
+  .convo-top { display: flex; align-items: baseline; gap: 0.4rem; }
+  .convo .cname { flex: 0 1 auto; font-size: 0.8rem; color: var(--text); overflow-wrap: anywhere; }
+  /* Both controls pin to the block's right edge, so they stay put and behave
+     the same; the name keeps the left to itself. */
+  .convo-actions { margin-left: auto; display: flex; align-items: baseline; gap: 0.1rem; flex: none; }
+  .convo .convo-edit, .convo .convo-del { padding: 0 3px; color: var(--faint); cursor: pointer; }
+  .convo .convo-edit:hover, .convo .convo-del:hover { color: var(--text); }
+  /* Renaming takes the block: a full-width field, then the id on the left and
+     the controls on the right beneath it, the way the cohort rename reads. */
+  .convo-rename { display: flex; flex-direction: column; gap: 0.2rem; }
+  .convo-rename-input { width: 100%; box-sizing: border-box; font-size: 0.78rem; background: var(--surface-2);
+    color: var(--text); border: 1px solid var(--border-strong); border-radius: 4px; padding: 0.05rem 0.3rem; }
+  .convo-rename-foot { display: flex; align-items: baseline; gap: 0.4rem; }
+  .convo .members { font-size: 0.82rem; }
+  .convo .when { font-size: 0.72rem; color: var(--muted); }
+  /* The delete control used to be pinned to the block's corner, which put it on
+     the name row while the edit control stayed inline: the two never travelled
+     together and the field couldn't reach the block's right edge. Both now live
+     in the block's action cluster. */
+  .convo .members { white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
+  .convo .convo-del:hover { color: var(--red, #f85149); }
+
+  .peer-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem 0.45rem;
+    margin: 0.25rem 0; padding-bottom: 0.2rem; font-size: 0.82rem;
+    border-bottom: 1px solid var(--border); }
+  .peer-row .peer-name { flex: 1 1 auto; min-width: 6ch; overflow-wrap: anywhere; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .dot.connected { background: var(--green); box-shadow: 0 0 5px rgba(63, 185, 80, 0.6); }
+  .dot.disconnected { background: var(--faint); }
+  .dot.unknown { background: var(--amber); }
+  .peer-actions { margin-left: auto; display: flex; align-items: center; gap: 0.1rem; flex: none; }
+  .peer-meta { flex: 1 1 100%; display: flex; align-items: center; gap: 0.45rem; min-width: 0; }
+  .peer-row .host { min-width: 0; color: var(--faint);
+    font-size: 0.7rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .peer-counter { color: var(--faint); font-size: 0.68rem; white-space: nowrap; flex: none; margin-left: auto; }
+  .peer-status { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; padding: 0.02rem 0.32rem; border-radius: 8px; flex: none; }
+  .peer-status.booted { color: var(--amber); border: 1px solid var(--amber); }
+  .peer-status.banned { color: var(--red); border: 1px solid var(--red); }
+  .peer-btn { border: none; background: none; color: var(--faint); font-size: 0.72rem; cursor: pointer; padding: 0.02rem 0.18rem; border-radius: 4px; flex: none; }
+  .peer-btn:hover { color: var(--text); background: var(--surface-2); }
+  .peer-rename-input { width: 7rem; font-size: 0.78rem; background: var(--surface-2); color: var(--text); border: 1px solid var(--border-strong); border-radius: 4px; padding: 0.05rem 0.3rem; }
+
+  input[type="text"], input[type="password"], textarea {
+    width: 100%;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 0.45rem 0.6rem;
+    font-family: inherit;
+    font-size: 0.85rem;
+    resize: vertical;
+  }
+  input[type="text"]:focus, textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(68, 147, 248, 0.18);
+  }
+
+  button {
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    padding: 0.28rem 0.6rem;
+    cursor: pointer;
+    font-size: 0.78rem;
+    font-family: inherit;
+  }
+  button:hover { border-color: var(--accent); color: #fff; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: #5aa4f9; }
+  button.danger { color: var(--red); }
+  button.danger:hover { border-color: var(--red); background: rgba(248, 81, 73, 0.1); }
+
+  /* ---- center ---- */
+  #workspace { flex: 1; min-width: 0; background: var(--bg); }
+  #workspace { flex: 1; min-width: 0; background: var(--bg); }
+
+
+  #transcript-scroll { flex: 1; overflow-y: auto; padding: 1rem; }
+  #transcript { max-width: 52rem; margin: 0 auto; }
+
+  .msg {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 0.65rem 0.8rem;
+    margin: 0.6rem 0;
+  }
+  .msg .meta { display: flex; align-items: baseline; gap: 0.5rem; margin-bottom: 0.3rem; }
+  .msg .sender { font-weight: 600; font-size: 0.85rem; color: var(--accent); }
+  .msg .sender.operator { color: #d2a8ff; }
+  /* Absolute time joins the sender in the meta line; the relative age is
+     pinned to the block's right edge. */
+  .msg .dt { font-size: 0.72rem; color: var(--faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .msg .when { font-size: 0.72rem; color: var(--faint); margin-left: auto; white-space: nowrap; }
+  /* Copy control: rides the right edge of a block's meta/feed header line. */
+  .copy-btn { background: none; border: none; padding: 0 0.05rem; cursor: pointer;
+    color: var(--faint); font-size: 0.72rem; line-height: 1; }
+  .copy-btn:hover { color: var(--text); }
+  .copy-btn.copied { color: var(--green); }
+  .msg .content { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.9rem; }
+  .msg .deliveries { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.5rem; align-items: center; }
+  .msg .deliveries .label { color: var(--faint); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .msg .deliveries { gap: 0.25rem 0.7rem; }
+  .msg .deliveries .label { display: none; }
+  .msg .deliveries .delivery { position: relative; display: inline-flex; align-items: center; }
+  .msg .deliveries .delivery-btn {
+    display: inline-flex; align-items: center; gap: 0.3rem;
+    background: none; border: 1px solid transparent; border-radius: 6px;
+    padding: 0.05rem 0.3rem; cursor: pointer; color: var(--muted);
+  }
+  .msg .deliveries .delivery-btn:hover { border-color: var(--border-strong); background: var(--surface-2); color: var(--text); }
+  .msg .deliveries .delivery-menu {
+    position: absolute; top: 100%; left: 0; z-index: 5;
+    display: flex; gap: 0.1rem; margin-top: 0.15rem;
+    background: var(--surface-2); border: 1px solid var(--border-strong);
+    border-radius: 6px; padding: 0.1rem 0.15rem;
+  }
+  .msg .deliveries .delivery-menu[hidden] { display: none; }
+  .msg .deliveries .dname { color: inherit; font-size: 0.72rem; }
+  .msg .deliveries .dstate { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .msg .deliveries .dstate.stored,
+  .msg .deliveries .dstate.eligible,
+  .msg .deliveries .dstate.expired { background: var(--faint); }
+  .msg .deliveries .dstate.delivered { background: var(--green); box-shadow: 0 0 5px rgba(63, 185, 80, 0.6); }
+  .msg .deliveries .dstate.held { background: var(--amber); }
+  .msg .deliveries .dstate.blocked { background: var(--red); }
+  .msg .deliveries button { padding: 0.02rem 0.16rem; font-size: 0.7rem; }
+  .msg .deliveries button.danger:hover { color: var(--red); }
+
+  .event {
+    font-size: 0.75rem; color: var(--muted);
+    margin: 0.3rem 0; padding-left: 0.7rem;
+    border-left: 2px solid var(--border-strong);
+  }
+  .event .ekind { color: var(--faint); font-weight: 600; margin-right: 0.4rem; }
+  .event.turn .ekind { display: block; }
+  .event.turn .turn-body { color: var(--text); font-size: 0.85rem; margin-top: 0.15rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* A work report block: kind + commit time on the header line with the
+     copy control pinned right, the report data beneath it. The right
+     padding matches the chat blocks' so the copy controls share one
+     vertical column down the transcript's right edge. */
+  .event.report { padding-right: 0.8rem; }
+  .report-head { display: flex; align-items: baseline; gap: 0.5rem; }
+  .report-head .ekind { margin-right: 0; }
+  .report-head .report-who { font-weight: 600; }
+  .report-head .feed-ts { color: var(--faint); font-size: 0.72rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .report-head .report-age { margin-left: auto; color: var(--faint); font-size: 0.72rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .report-body { color: var(--text); font-size: 0.85rem; margin-top: 0.15rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+  /* rendered markdown: message bodies and turn output */
+  .md p { margin: 0 0 0.5em; }
+  .md > :last-child { margin-bottom: 0; }
+  .md .md-heading { font-weight: 700; }
+  .md code { font-family: ui-monospace, monospace; font-size: 0.88em; background: var(--surface-2); padding: 0.05rem 0.3rem; border-radius: 4px; }
+  .md pre { margin: 0.4em 0 0.5em; padding: 0.5rem 0.65rem; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; overflow-x: auto; white-space: pre; }
+  .md pre code { background: none; padding: 0; }
+  .md blockquote { margin: 0.3em 0 0.5em; padding-left: 0.7rem; border-left: 2px solid var(--border-strong); color: var(--muted); }
+  .md ul, .md ol { margin: 0.3em 0 0.5em; padding-left: 1.4rem; }
+  .md a { color: var(--accent); }
+  .md hr { border: none; border-top: 1px solid var(--border); margin: 0.6em 0; }
+
+  /* Transcript rows span the full column, flush with the composer: the entry's
+     real time lives inside the entry itself — in the message meta line for
+     chat blocks, at the head of authored event lines. */
+  .event .ts { font-size: 0.68rem; color: var(--faint); font-variant-numeric: tabular-nums; white-space: nowrap; margin-right: 0.4rem; }
+  .event.turn .ts { display: block; margin-right: 0; }
+  .event.attention { border-left-color: var(--amber); color: #e3b341; }
+  .event.failure { border-left-color: var(--red); color: #f08880; }
+
+  #compose-panel {
+    flex: none; padding: 0.75rem 1rem 1rem;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  /* Draggable dividers between the side columns and the centre. Each rail
+     keeps its own width, bounded and persisted (see initRailResize). */
+  .rail-handle { width: 6px; flex: none; cursor: col-resize; touch-action: none;
+    position: relative; z-index: 10; }
+  .rail-handle::after { content: ""; position: absolute; inset: 0 -4px; }
+  .rail-handle:hover, .rail-handle.dragging { background: var(--border-strong); }
+  body.rail-resizing { user-select: none; cursor: col-resize; }
+  #compose-panel .inner { max-width: 52rem; margin: 0 auto; }
+  #compose-panel .hint { color: var(--faint); font-size: 0.72rem; }
+  /* The composer is one box: the mode tabs sit inside its top edge and the send
+     control inside its bottom edge, so the controls take no room away from the
+     writing surface. */
+  .composer { display: flex; flex-direction: column; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(68, 147, 248, 0.18); }
+  .composer-foot .seg { border: none; background: transparent; padding: 0; }
+  #compose-text { border: none; border-radius: 0; background: transparent;
+    min-height: 8.5rem; padding: 0.55rem 0.7rem; }
+  #compose-text:focus { border: none; box-shadow: none; }
+  .composer-foot { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; row-gap: 0.35rem;
+    padding: 0.4rem 0.5rem; border-top: 1px solid var(--border); background: var(--panel); }
+  /* The send control takes the right edge; everything else keeps the left. */
+  #compose-send { margin-left: auto; }
+  .composer-foot .hint { color: var(--amber, #d29922); }
+  .seg { display: inline-flex; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 2px; gap: 2px; align-self: flex-start; }
+  .seg button { border: none; background: transparent; padding: 0.3rem 0.85rem; border-radius: 6px; color: var(--muted); }
+  .seg button.active { background: var(--accent); color: #fff; }
+
+  /* ---- right rail ---- */
+  #unknown { width: 22rem; flex: none; border-left: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; overflow: hidden; }
+  #unknown .empty { color: var(--faint); font-style: italic; font-size: 0.8rem; }
+  #unknown-banner {
+    background: rgba(248, 81, 73, 0.12);
+    border: 1px solid rgba(248, 81, 73, 0.5);
+    color: #f08880;
+    border-radius: 8px;
+    padding: 0.5rem 0.7rem;
+    margin-bottom: 0.6rem;
+    font-size: 0.8rem;
+  }
+
+  #unknown .attempt { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 0.55rem 0.65rem; margin: 0.4rem 0; }
+  #unknown .attempt .meta { font-size: 0.74rem; color: var(--muted); margin-bottom: 0.35rem; }
+  #unknown .attempt .row { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+
+  #events-feed .feed-line .feed-ts { color: var(--faint);
+    font-variant-numeric: tabular-nums; white-space: nowrap; }
+  /* Each feed line opens with a header row — absolute time left, relative
+     age pinned right — and the event's content sits beneath it, so the left
+     clock column scans cleanly. */
+  #events-feed .feed-line .feed-head { display: flex; align-items: baseline; gap: 0.45rem; }
+  #events-feed .feed-line .feed-age { margin-left: auto; color: var(--faint);
+    font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #events-feed .feed-line { font-size: 0.72rem; color: var(--muted); padding: 0.12rem 0;
+    border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+  #events-feed .feed-line .ekind { color: var(--faint); font-weight: 600; margin-right: 0.4rem;
+    font-family: ui-monospace, monospace; font-size: 0.66rem; }
+  #events-feed .feed-line.failure { color: var(--red); }
+  #events-feed .feed-line.attention { color: var(--amber); }
+  .load-earlier {
+  display: block;
+  margin: 0.2rem 0 0.6rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: none;
+  color: var(--muted-foreground);
+  cursor: pointer;
+}
+
+.load-earlier:hover { color: var(--foreground); }
+
+.empty-note { color: var(--faint); font-size: 0.85rem; padding: 1rem 0; text-align: center; }
+
+  /* ---- conversation-creation modal ---- */
+  #modal-backdrop {
+    position: fixed; inset: 0; z-index: 70;
+    background: rgba(1, 4, 9, 0.72);
+    display: flex; align-items: center; justify-content: center;
+  }
+  #modal-backdrop[hidden] { display: none; }
+  #modal {
+    width: min(30rem, 92vw);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    padding: 1rem;
+  }
+  #modal h2 { margin-top: 0; }
+  #modal-pick { display: flex; flex-wrap: wrap; gap: 0.45rem; margin: 0.6rem 0; }
+  .pick-chip {
+    border-radius: 999px; padding: 0.3rem 0.75rem;
+    background: var(--surface-2); border: 1px solid var(--border-strong);
+    color: var(--muted); cursor: pointer; font-size: 0.8rem;
+  }
+  .pick-chip:hover { border-color: var(--accent); color: var(--text); }
+  .pick-chip.on { background: rgba(68, 147, 248, 0.14); border-color: var(--accent); color: #fff; }
+  #modal-error { color: var(--red); font-size: 0.78rem; min-height: 1.1em; margin-top: 0.5rem; }
+  #modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 0.6rem; }
+</style>
+</head>
+<body>
+<div id="boot-gate">loading wrkspc…</div>
+<div id="boot" class="connecting">
+  <div id="login-card">
+    <h1>wrkspc</h1>
+    <p class="explain">operator console. run <code>wrkspc ui-token</code> in a terminal and paste the copied token — the clipboard clears itself after 30 seconds.</p>
+    <input id="login-token" type="password" autocomplete="off" spellcheck="false" placeholder="bearer token">
+    <button id="login-submit" class="primary">connect</button>
+    <div id="login-error"></div>
+  </div>
+  <span id="boot-status">connecting…</span>
+</div>
+<div id="modal-backdrop" hidden>
+  <div id="modal">
+    <h2>new room</h2>
+    <p class="explain">pick participants (operator is you — included by default). add ids not in the roster with the box below.</p>
+    <div id="modal-pick"></div>
+    <input id="modal-extra" type="text" placeholder="extra peer ids (comma-separated, optional)">
+    <div id="modal-error"></div>
+    <div id="modal-actions">
+      <button id="modal-cancel">cancel</button>
+      <button id="modal-create" class="primary">create</button>
+    </div>
+  </div>
+</div>
+<aside id="conversations">
+  <section class="split-slot">
+    <div class="rail-row">
+      <h2>cohort</h2>
+      <button id="hide-ejected" class="primary rail-action">hide ejected</button>
+    </div>
+    <p class="explain">every enrolled agent, its host, and how long it has been in the cohort. ejected peers drop out unless shown.</p>
+    <div id="peer-list" class="split-scroll"></div>
+  </section>
+  <section class="split-slot">
+    <div class="rail-row">
+      <h2>conversations</h2>
+      <button id="new-convo-open" class="primary rail-action">New Room</button>
+    </div>
+    <p class="explain">the rooms you're in — pick one to open its transcript.</p>
+    <div id="convo-list" class="split-scroll"></div>
+  </section>
+</aside>
+<section id="workspace">
+  <div id="convo-head">
+    <div class="room-line">
+      <span class="room-name" id="room-name">wrkspc</span>
+      <span class="room-id" id="room-id"></span>
+      <div class="room-actions">
+        <div id="unknown-banner" hidden></div>
+        <button id="gates-toggle" title="conversation gates" aria-haspopup="true" aria-expanded="false">☰</button>
+        <div id="gates-menu" class="gates-menu" hidden>
+        <div class="gates-head">
+          <span class="gates-hint">all members</span>
+          <button class="peer-btn" data-bulk="pause" title="pause every member — no new deliveries">⏸</button>
+          <button class="peer-btn" data-bulk="block" title="block every member — no delivery at all">⛔</button>
+          <button class="peer-btn" data-bulk="clear" title="clear every gate in this room">⌫</button>
+        </div>
+          <div class="gates-list" id="gates-list"></div>
+        </div>
+      </div>
+    </div>
+    <div class="room-members" id="room-members"></div>
+  </div>
+  <div id="transcript-scroll"><div id="transcript-loading">loading…</div><div id="transcript"></div></div>
+  <div id="compose-panel">
+    <div class="inner">
+      <div class="composer">
+        <textarea id="compose-text" rows="3" placeholder="post a message to the conversation"></textarea>
+        <div class="composer-foot">
+          <div class="seg">
+            <button id="compose-mode-msg" class="active">message</button>
+            <button id="compose-mode-guidance">guidance</button>
+          </div>
+          <span class="hint" id="compose-hint"></span>
+          <button id="compose-send" class="primary">send</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+<aside id="unknown">
+  <section class="split-slot">
+    <h2>unknown attempts</h2>
+    <p class="explain">turns whose outcome the node can't determine (e.g. it restarted mid-turn). you decide: retry, or close as failed/completed.</p>
+    <div id="unknown-list" class="split-scroll"></div>
+  </section>
+  <section class="split-slot">
+    <h2>system events</h2>
+    <p class="explain">what the hub did — delivery, dispatch, attempt, membership, and gate events in feed order. a delivery's claim and ack collapse into one line.</p>
+    <div id="events-feed" class="split-scroll"></div>
+  </section>
+</aside>
+<script>
+"use strict";
+// The operator credential is a server-managed HttpOnly cookie: the
+// page never stores or reads it. The generation counter tracks LOGIN
+// ATTEMPTS instead — every request captures the generation at send
+// time, and only a 401 that still belongs to the current generation
+// may reset the UI to the login card. An older request's late 401
+// must never wipe a newer valid login.
+let authGeneration = 0;
+let selected = null;
+// The conversation whose name is being edited inline. While set, renders are
+// skipped so a poll cannot replace the input mid-edit.
+let editingConversation = null;
+// The selected room's members and fences, kept for the gates menu's bulk
+// actions so a button does not have to re-read them from the DOM.
+let roomMembers = [];
+let roomFences = [];
+let eventCursor = 0;
+// The selected conversation's events, accumulated across incremental
+// fetches (eventCursor is the highest seq held). viewGeneration bumps on
+// every select() so a fetch begun for an earlier view never renders.
+let transcriptEvents = [];
+let viewGeneration = 0;
+// The newest in-flight renderAll() fetch ({ startedAt }), or null. The 1 s
+// poll skips its refresh while one runs (a large backlog takes several
+// pages) unless it has outlived REFRESH_STALE_MS, so a hung request can
+// never freeze the transcript.
+let refresh = null;
+const REFRESH_STALE_MS = 15000;
+let seenHashes = {};
+// The peer_id whose inline rename editor is open. While set, loadPeers()
+// skips its re-render so the 1 s poll (whose payload changes every tick —
+// presence `updated_at`) cannot rebuild the rows and destroy the input.
+let editingPeer = null;
+// Cohort filters and the moderation audit feed (see loadModeration).
+let hideEjected = false;
+let moderationCache = [];
+let composeMode = "message";
+// Rooms whose FULL history the operator has asked to see (UI-19):
+// the transcript loads a bounded window by default and the whole
+// room only on demand.
+const FULL_HISTORY_ROOMS = new Set();
+const INITIAL_WINDOW = 200;
+// Loads the complete message history for the open room.
+async function loadFullHistory() {
+  if (!selected) return;
+  FULL_HISTORY_ROOMS.add(selected);
+  await renderAll();
+}
+// The default compose hint ("as operator · to …"), restored when the
+// box holds no @ mention.
+// The compose hint only ever carries something the operator has to act on: an
+// unknown mention, or a directed send. Who is in the room is already in the
+// strip above, so a standing "as operator · to …" line said nothing new.
+
+function hash(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return h; }
+// How long the pointer must rest on an element before its tooltip shows. The
+// native tooltip is closer to a second; this is fast enough to feel immediate
+// and slow enough that sweeping across a toolbar does not flash.
+const TOOLTIP_DELAY_MS = 120;
+
+// Turns every `title` in the page into a fast, styled tooltip.
+//
+// The browser's own tooltip cannot be sped up, so the title is lifted off the
+// element as the pointer arrives (which is what stops the native one from ever
+// appearing) and put back when the pointer leaves.
+function installTooltips() {
+  const tip = document.createElement("div");
+  tip.id = "tooltip";
+  tip.hidden = true;
+  document.body.appendChild(tip);
+  let current = null;
+  let timer = null;
+
+  const hide = () => {
+    clearTimeout(timer);
+    timer = null;
+    tip.hidden = true;
+    if (current) {
+      // `dataset.tip` holds the text while it is off the element.
+      if (current.dataset.tip) {
+        current.title = current.dataset.tip;
+        delete current.dataset.tip;
+      }
+      current = null;
+    }
+  };
+
+  // Anchored to the element, not the pointer: the transcript scrolls under a
+  // resting pointer several times a second, and a cursor-anchored tooltip
+  // would drift away from what it describes.
+  const place = (target) => {
+    const box = target.getBoundingClientRect();
+    tip.hidden = false;
+    const size = tip.getBoundingClientRect();
+    const pad = 8;
+    const left = Math.max(pad, Math.min(box.left, window.innerWidth - size.width - pad));
+    const below = box.bottom + 6;
+    const top = below + size.height > window.innerHeight - pad
+      ? Math.max(pad, box.top - size.height - 6)
+      : below;
+    tip.style.left = left + "px";
+    tip.style.top = top + "px";
+  };
+
+  document.addEventListener("mouseover", (event) => {
+    const target = event.target instanceof Element ? event.target.closest("[title]") : null;
+    if (target === current) return;
+    hide();
+    if (!target) return;
+    const text = target.getAttribute("title");
+    if (!text) return;
+    current = target;
+    target.dataset.tip = text;
+    target.removeAttribute("title");
+    timer = setTimeout(() => {
+      if (current !== target) return;
+      tip.textContent = text;
+      place(target);
+    }, TOOLTIP_DELAY_MS);
+  });
+
+  document.addEventListener("mouseout", (event) => {
+    if (!current) return;
+    if (event.relatedTarget instanceof Node && current.contains(event.relatedTarget)) return;
+    hide();
+  });
+  document.addEventListener("mousedown", hide, true);
+  // A scroll (the transcript follows new traffic several times a second) must
+  // not cancel a tooltip that is still on its way: it only re-places one that
+  // is already up.
+  const reflow = () => {
+    if (!current || tip.hidden) return;
+    if (!current.isConnected) {
+      hide();
+      return;
+    }
+    place(current);
+  };
+  window.addEventListener("scroll", reflow, true);
+  window.addEventListener("resize", reflow);
+  window.addEventListener("blur", hide);
+}
+
+function renderIfChanged(key, h, fn) {
+  if (seenHashes[key] === h) return;
+  try {
+    fn();
+    // Commit only after a successful render (UI-16): a renderer that
+    // throws must be retried on the next poll, never skipped against
+    // a cached hash recorded before the failure.
+    seenHashes[key] = h;
+  } catch (e) {
+    console.error("render failed for " + key, e);
+  }
+}
+
+// Forgets a render hash so the next render rebuilds that region even when its
+// payload is unchanged. Closing an inline editor restores DOM a poll never sees,
+// and the payload hash alone would skip the rebuild and leave the field on
+// screen.
+//
+// # Arguments
+//
+// * `key` — the render region to invalidate.
+function invalidate(key) {
+  delete seenHashes[key];
+}
+
+async function api(path, options = {}) {
+  // The login cookie rides every same-origin fetch; no credential is
+  // ever attached from page memory.
+  const sentGeneration = authGeneration;
+  const res = await fetch(path, options);
+  if (res.status === 401) {
+    // A stale 401 (a request begun before the current login attempt)
+    // must not yank the UI back to the login card: only a rejection
+    // of the CURRENT generation may do that. The server never clears
+    // the cookie on a 401, so the cookie itself is untouched either
+    // way.
+    if (sentGeneration === authGeneration) {
+      authGeneration += 1;
+      showLogin();
+    }
+    const error = new Error("unauthorized");
+    error.auth = true; // a genuine rejection of the current session
+    throw error;
+  }
+  if (!res.ok) {
+    let detail = "";
+    try { detail = (await res.json()).error || ""; } catch {}
+    throw new Error(res.status + " " + detail);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+const el = (id) => document.getElementById(id);
+const clear = (node) => { while (node.firstChild) node.removeChild(node.firstChild); };
+const btn = (label, onClick, cls, title) => {
+  const b = document.createElement("button");
+  b.textContent = label;
+  b.onclick = onClick;
+  if (cls) b.className = cls;
+  if (title) b.title = title;
+  return b;
+};
+// Closes every open delivery menu. Clicking a delivery button toggles its own
+// menu, and any click outside one closes the rest so two are never open at once.
+function closeDeliveryMenus() {
+  for (const menu of document.querySelectorAll(".delivery-menu")) menu.hidden = true;
+}
+
+// What a delivery state means, spelled out for the hover title so the row can
+// stay a name, a dot, and its controls.
+const DELIVERY_STATE_TEXT = {
+  stored: "stored — committed, not yet claimed",
+  eligible: "eligible — cleared for delivery",
+  held: "held — gated pending operator review",
+  blocked: "blocked by an operator",
+  delivered: "delivered — recorded by the recipient's node",
+  expired: "expired under the retention policy",
+};
+
+// A duration with no words: hours and seconds, nothing else. The cohort row
+// shows two of these side by side, so "enrol 20h ago · 1s ago" becomes "20h 1s".
+function span(updatedAt) {
+  if (!updatedAt) return null;
+  const seconds = Math.max(0, Math.round((Date.now() - Date.parse(updatedAt)) / 1000));
+  if (seconds < 60) return seconds + "s";
+  if (seconds < 3600) return Math.round(seconds / 60) + "m";
+  if (seconds < 86400) return Math.round(seconds / 3600) + "h";
+  return Math.round(seconds / 86400) + "d";
+}
+
+// How long an entry has existed, with every unit that matters: days and hours,
+// or hours and minutes, or minutes. It is measured from enrolment, so it only
+// ever grows — the earlier version measured presence, which reset every five
+// seconds and read as a clock running backwards.
+function elapsed(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const total = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  if (days > 0) return days + "d " + hours + "h " + pad(minutes) + "m " + pad(seconds) + "s";
+  if (hours > 0) return hours + "h " + pad(minutes) + "m " + pad(seconds) + "s";
+  return minutes + "m " + pad(seconds) + "s";
+}
+
+// Ticks the counters every second without re-rendering the roster: a full
+// render rides the five-second presence poll, so seconds would otherwise
+// advance in fives. Each counter carries the enrolment stamp it measures.
+function startCounterTicker() {
+  setInterval(() => {
+    for (const node of document.querySelectorAll(".peer-counter[data-enrolled]")) {
+      node.textContent = elapsed(node.dataset.enrolled);
+    }
+  }, 1000);
+}
+
+// The absolute time of a report, in the operator's own clock. A relative age
+// recomputed on every render bounced between 0s and the poll interval, which
+// reads as a clock running backwards. A timestamp only ever moves forward.
+function clock(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const pad = (n) => String(n).padStart(2, "0");
+  const hms = pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+  if (d.toDateString() === new Date().toDateString()) return hms;
+  return d.toLocaleString(undefined, { month: "short" }) + " " + d.getDate() + " " + hms;
+}
+
+function age(updatedAt) {
+  if (!updatedAt) return "—";
+  const seconds = Math.max(0, Math.round((Date.now() - Date.parse(updatedAt)) / 1000));
+  if (seconds < 60) return seconds + "s ago";
+  if (seconds < 3600) return Math.round(seconds / 60) + "m ago";
+  if (seconds < 86400) return Math.round(seconds / 3600) + "h ago";
+  return Math.round(seconds / 86400) + "d ago";
+}
+
+async function loadConversations() {
+  let conversations = [];
+  try { conversations = await api("/api/conversations"); } catch { return; }
+  if (editingConversation) return; // an inline rename is open: freeze the list
+  renderIfChanged("convos", hash(JSON.stringify(conversations) + selected), () => {
+    const list = el("convo-list");
+    clear(list);
+    for (const c of conversations) {
+      // A div, not a button: the row owns an inline rename field and two
+      // controls, and interactive elements cannot nest inside a button.
+      const block = document.createElement("div");
+      block.className = "convo" + (c.id === selected ? " selected" : "");
+      block.tabIndex = 0;
+      block.onclick = () => select(c.id);
+      block.onkeydown = (event) => { if (event.key === "Enter") select(c.id); };
+      const top = document.createElement("div");
+      top.className = "convo-top";
+      const name = document.createElement("span");
+      name.className = "cname";
+      name.textContent = c.name || "unnamed room";
+      name.title = c.name || "this room has no name yet";
+      const cid = document.createElement("span");
+      cid.className = "cid";
+      cid.textContent = c.id.slice(0, 8);
+      // Both controls live in one right-pinned cluster, so they line up and
+      // behave the same however long the name is.
+      const actions = document.createElement("div");
+      actions.className = "convo-actions";
+      const edit = document.createElement("span");
+      edit.className = "convo-edit";
+      edit.textContent = "✎";
+      edit.title = "rename this room";
+      edit.onclick = (event) => {
+        event.stopPropagation();
+        startRoomRename(block, c);
+      };
+      const del = document.createElement("span");
+      del.className = "convo-del";
+      del.textContent = "✕";
+      del.title = "delete this room (click again to confirm)";
+      // Two-click confirm: Chrome silently swallows a blocked window.confirm, so
+      // a one-click delete was one stray click away from losing a transcript.
+      let armed = false;
+      let armTimer = null;
+      del.onclick = async (event) => {
+        event.stopPropagation();
+        if (!armed) {
+          armed = true;
+          del.textContent = "✓";
+          del.title = "click again to delete " + (c.name || c.id.slice(0, 8));
+          armTimer = setTimeout(() => {
+            armed = false;
+            del.textContent = "✕";
+            del.title = "delete this room (click again to confirm)";
+          }, 4000);
+          return;
+        }
+        clearTimeout(armTimer);
+        try {
+          await api("/api/conversations/" + encodeURIComponent(c.id), { method: "DELETE" });
+        } catch (e) {
+          del.title = "delete failed: " + e.message;
+          return;
+        }
+        if (selected === c.id) {
+          // Deleting the OPEN room tears its whole surface down
+          // (UI-15): the stale transcript, gates, and composer must
+          // not stay visible for a room that no longer exists.
+          selected = null;
+          transcriptEvents = [];
+          viewGeneration += 1;
+          seenHashes = {};
+          el("transcript").textContent = "";
+          el("gates-list").textContent = "";
+          el("compose-text").value = "";
+        }
+        invalidate("convos");
+        await loadConversations();
+      };
+      actions.append(edit, del);
+      top.append(name, cid, actions);
+      const members = document.createElement("span");
+      members.className = "members";
+      members.textContent = c.members.map(peerLabel).join(", ");
+      const when = document.createElement("span");
+      when.className = "when";
+      when.textContent = "created " + age(c.created_at);
+      block.append(top, members, when);
+      list.appendChild(block);
+    }
+  });
+  if (selected) {
+    const meta = conversations.find((c) => c.id === selected);
+    if (meta) {
+      renderRoomHeader(meta);
+    }
+  }
+}
+
+// Renders the conversation strip's room line and member line.
+//
+// The strip is one block: the room's name and short id, then its members. The
+// gates menu lives in the same strip and is rendered by renderAll, which is the
+// only place the room's active fences are known.
+//
+// # Arguments
+//
+// * `meta` — the conversation view from `/api/conversations`.
+function renderRoomHeader(meta) {
+  el("room-name").textContent = meta.name || "unnamed room";
+  el("room-id").textContent = meta.id.slice(0, 8);
+  el("room-members").textContent = meta.members.map(peerLabel).join(", ");
+}
+
+// Arms a two-click delete on a room control.
+//
+// Chrome silently swallows a blocked `window.confirm`, so a one-click delete
+// was one stray click away from losing a room's transcript. The first click
+// arms, the second fires, and the arm lapses on its own.
+//
+// # Arguments
+//
+// * `control` — the element to arm and fire.
+// * `conversation` — the room it deletes.
+function wireRoomDelete(control, conversation) {
+  let armed = false;
+  let armTimer = null;
+  const label = conversation.name || conversation.id.slice(0, 8);
+  control.onclick = async (event) => {
+    event.stopPropagation();
+    if (!armed) {
+      armed = true;
+      control.textContent = "✓";
+      control.title = "click again to delete " + label;
+      armTimer = setTimeout(() => {
+        armed = false;
+        control.textContent = "✕";
+        control.title = "delete this room (click again to confirm)";
+      }, 4000);
+      return;
+    }
+    clearTimeout(armTimer);
+    try {
+      await api("/api/conversations/" + encodeURIComponent(conversation.id), { method: "DELETE" });
+    } catch (e) {
+      control.title = "delete failed: " + e.message;
+      return;
+    }
+    if (selected === conversation.id) {
+      // Deleting the OPEN room tears its whole surface down (UI-15):
+      // no stale transcript, gates, or composer for a dead room.
+      selected = null;
+      transcriptEvents = [];
+      viewGeneration += 1;
+      seenHashes = {};
+      el("transcript").textContent = "";
+      el("gates-list").textContent = "";
+      el("compose-text").value = "";
+    }
+    invalidate("convos");
+    await loadConversations();
+  };
+}
+
+// Opens an inline field that renames a room.
+//
+// Renaming takes the block: a full-width field, then the room's id on the left
+// and the same two controls beneath it, so nothing shifts sideways. Names are
+// vanity metadata: blanking the field clears the name, the room stays usable,
+// and the id remains the key. Enter commits, Escape cancels, clicking the edit
+// control again cancels, and blur commits.
+//
+// # Arguments
+//
+// * `block` — the room's block in the left column.
+// * `conversation` — the room being renamed.
+function startRoomRename(block, conversation) {
+  if (editingConversation) return;
+  const top = block.querySelector(".convo-top");
+  if (!top) return;
+  editingConversation = conversation.id;
+
+  let settled = false;
+  const shell = document.createElement("div");
+  shell.className = "convo-rename";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = conversation.name || "";
+  input.maxLength = 64;
+  input.placeholder = "unnamed room";
+  input.className = "convo-rename-input";
+  input.onclick = (event) => event.stopPropagation();
+
+  const foot = document.createElement("div");
+  foot.className = "convo-rename-foot";
+  const cid = document.createElement("span");
+  cid.className = "cid";
+  cid.textContent = conversation.id.slice(0, 8);
+  const actions = document.createElement("div");
+  actions.className = "convo-actions";
+  const cancel = document.createElement("span");
+  cancel.className = "convo-edit";
+  cancel.textContent = "✎";
+  cancel.title = "cancel renaming";
+  cancel.onclick = (event) => {
+    event.stopPropagation();
+    close(false);
+  };
+  const remove = document.createElement("span");
+  remove.className = "convo-del";
+  remove.textContent = "✕";
+  remove.title = "delete this room (click again to confirm)";
+  wireRoomDelete(remove, conversation);
+  // Pressing either control blurs the field first, and the blur handler commits.
+  // Mark the edit settled on pointerdown — which reaches us before the blur — so
+  // cancel cancels and delete deletes instead of each quietly saving the name.
+  for (const control of [cancel, remove]) {
+    control.onpointerdown = (event) => {
+      event.stopPropagation();
+      settled = true;
+    };
+  }
+  actions.append(cancel, remove);
+  foot.append(cid, actions);
+  shell.append(input, foot);
+  top.replaceWith(shell);
+  input.focus();
+  input.select();
+
+  // `close(true, value)` commits that value (null clears the name); `close(false)`
+  // abandons the edit. Either way the block is rebuilt from the store, because
+  // replacing DOM the poll never sees leaves the render hash unchanged.
+  const close = async (commit, value) => {
+    if (editingConversation === null) return;
+    editingConversation = null;
+    invalidate("convos");
+    if (commit) {
+      try {
+        await api("/api/conversations/" + encodeURIComponent(conversation.id), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: value }),
+        });
+      } catch (e) {
+        // A refused name (bad value, or hub-owned on a connected node)
+        // is reported; the old name stays in place (UI-17).
+        alert("rename failed: " + e.message);
+      }
+    }
+    await loadConversations();
+  };
+  const submit = (commit) => {
+    const next = input.value.trim();
+    close(commit, next === "" ? null : next);
+  };
+  input.addEventListener("keydown", (event) => {
+    event.stopPropagation();
+    if (event.key === "Enter") {
+      settled = true;
+      submit(true);
+    } else if (event.key === "Escape") {
+      settled = true;
+      close(false);
+    }
+  });
+  input.addEventListener("blur", () => {
+    if (settled) return;
+    settled = true;
+    submit(true);
+  });
+}
+
+async function loadPeers() {
+  let peers = [];
+  try { peers = await api("/api/peers"); rosterEntries = peers; } catch { return; }
+  if (editingPeer) return; // an inline rename is open: the section stays frozen until it commits
+  // Always a copy: the pin below sorts it, and the roster array itself stays as
+  // the API returned it.
+  const visible = hideEjected
+    ? peers.filter((p) => (p.status || "enrolled") === "enrolled")
+    : [...peers];
+  // The operator is the human at this console: it is in every room by
+  // construction, so it holds the top of the cohort permanently instead of
+  // drifting with the rest of the roster. Everything below keeps its own order.
+  visible.sort((a, b) => (b.peer_id === "operator") - (a.peer_id === "operator"));
+  // The key carries the client state that shapes this list (UI-14):
+  // the ejected-peer filter and the picker selection. Omitting them
+  // left a stale hash skipping the rebuild after a filter or pick
+  // changed only client state.
+  renderIfChanged(
+    "peers",
+    hash(
+      JSON.stringify(peers) +
+        JSON.stringify(moderationCache) +
+        JSON.stringify(hideEjected) +
+        JSON.stringify([...pickedPeers]),
+    ),
+    () => {
+    const list = el("peer-list");
+    clear(list);
+    if (!visible.length) {
+      const note = document.createElement("div");
+      note.className = "empty-note";
+      note.textContent = peers.length ? "no enrolled peers (ejected peers hidden)" : "no peers reported yet";
+      list.appendChild(note);
+      return;
+    }
+    for (const p of visible) {
+      const row = document.createElement("div");
+      row.className = "peer-row";
+      const dot = document.createElement("span");
+      dot.className = "dot " + (p.state || "unknown");
+      const name = document.createElement("span");
+      name.className = "peer-name";
+      name.textContent = p.alias || p.peer_id;
+      name.title = p.alias ? p.peer_id : "";
+      const host = document.createElement("span");
+      host.className = "host";
+      host.title = p.host_id || "";
+      host.textContent = (p.host_id || "").replace(/\.mtls\.devlocal\.home\.arpa$/, "");
+      row.appendChild(dot); row.appendChild(name);
+      if ((p.status || "enrolled") !== "enrolled") {
+        const badge = document.createElement("span");
+        badge.className = "peer-status " + p.status;
+        badge.textContent = p.status;
+        row.appendChild(badge);
+      }
+      // Every control pins to the right edge of the column, so the name keeps
+      // the left of the row to itself however many buttons a row carries.
+      const actions = document.createElement("div");
+      actions.className = "peer-actions";
+      row.appendChild(actions);
+      if (p.peer_id !== "operator") {
+        const rename = peerBtn("✎", "rename", () => {
+          editingPeer = p.peer_id;
+          const input = document.createElement("input");
+          input.type = "text";
+          input.value = p.alias || p.peer_id;
+          input.maxLength = 64;
+          input.className = "peer-rename-input";
+          name.replaceWith(input);
+          input.focus();
+          input.select();
+          const commit = async () => {
+            editingPeer = null;
+            const alias = input.value.trim();
+            const next = alias && alias !== p.peer_id ? alias : null;
+            try { await api("/api/peers/" + encodeURIComponent(p.peer_id), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ alias: next }) }); }
+            catch { /* surface the error on the next poll */ }
+            await refreshCohort();
+          };
+          let done = false;
+          input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") { done = true; commit(); }
+            else if (e.key === "Escape") { done = true; editingPeer = null; refreshCohort(); }
+          });
+          input.addEventListener("blur", () => { if (!done) commit(); });
+        });
+        actions.appendChild(rename);
+        if ((p.status || "enrolled") === "enrolled") {
+          actions.appendChild(peerBtn("⊘", "boot (eject from the hub)", () =>
+            setPeerStatus(p.peer_id, "booted", "boot " + (p.alias || p.peer_id) + " from the hub? their node stays enrolled-named but can't participate.")));
+          actions.appendChild(peerBtn("⛔", "ban (eject + revoke certificate)", () =>
+            setPeerStatus(p.peer_id, "banned", "ban " + (p.alias || p.peer_id) + "? their certificate is revoked and they cannot reconnect.")));
+        } else {
+          actions.appendChild(peerBtn("↺", "restore to enrolled", () =>
+            setPeerStatus(p.peer_id, "enrolled", "restore " + (p.alias || p.peer_id) + " to enrolled?")));
+        }
+        {
+          // Two-click confirm: a blocked window.confirm returns false silently
+          // and the click looks dead.
+          let armed = false, armTimer = null;
+          const del = peerBtn("✕", "delete from the cohort (click again to confirm)", () => {
+            if (!armed) {
+              armed = true;
+              del.textContent = "✓";
+              del.title = "click again to delete " + (p.alias || p.peer_id);
+              armTimer = setTimeout(() => { armed = false; del.textContent = "✕"; del.title = "delete from the cohort (click again to confirm)"; }, 4000);
+              return;
+            }
+            clearTimeout(armTimer);
+            del.disabled = true;
+            (async () => {
+              try { await api("/api/peers/" + encodeURIComponent(p.peer_id), { method: "DELETE" }); }
+              catch { del.title = "delete failed"; del.disabled = false; del.textContent = "✕"; return; }
+              await refreshCohort();
+            })();
+          });
+          actions.appendChild(del);
+        }
+      }
+      const lastMod = moderationCache.find((e) => e.peer_id === p.peer_id);
+      const meta = document.createElement("div");
+      meta.className = "peer-meta";
+      meta.appendChild(host);
+      const counter = document.createElement("span");
+      counter.className = "peer-counter";
+      // One number: how long since this peer last reported. Pairing it with
+      // the cohort-action age produced lines like "20h · 16h" and "20h · 2s" —
+      // two different clocks on one line read as a broken single duration. The
+      // action stays in the tooltip, where it cannot be misread.
+      // The operator is this console, not a reporting peer: a last-seen timer
+      // on it would only climb forever.
+      const isHuman = (p.class || "") === "human";
+      // How long this entry has been in the cohort, which is what the row is
+      // for. Presence and the last action stay in the tooltip.
+      counter.textContent = isHuman ? "—" : elapsed(p.enrolled_at);
+      if (!isHuman && p.enrolled_at) counter.dataset.enrolled = p.enrolled_at;
+      counter.title = isHuman
+        ? "you, at this console"
+        : [
+            "in the cohort since " + clock(p.enrolled_at),
+            "last presence " + clock(p.updated_at),
+            lastMod ? "last cohort action: " + lastMod.action + " " + age(lastMod.at) : null,
+          ]
+            .filter(Boolean)
+            .join(" · ");
+      meta.appendChild(counter);
+      row.appendChild(meta);
+      list.appendChild(row);
+    }
+  });
+}
+
+/* ---- peer cohort controls ---- */
+
+// A tiny per-peer action button.
+function peerBtn(label, title, onClick) {
+  const b = document.createElement("button");
+  b.className = "peer-btn";
+  b.textContent = label;
+  b.title = title;
+  b.onclick = onClick;
+  return b;
+}
+
+// Applies an operator status change after a destructive-action confirm.
+async function setPeerStatus(id, status, confirmText) {
+  if (!window.confirm(confirmText)) return;
+  try {
+    await api("/api/peers/" + encodeURIComponent(id), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) });
+  } catch { /* the next poll surfaces the error */ }
+  await refreshCohort();
+}
+
+// The cohort moderation audit feed (newest first) — drives each peer
+// row's last-action stamp.
+async function loadModeration() {
+  try { moderationCache = await api("/api/moderation?limit=200"); } catch { return; }
+}
+
+// One cohort refresh: audit feed + roster, in the order the render
+// hash expects.
+async function refreshCohort() {
+  await loadModeration();
+  await loadPeers();
+}
+
+// The display label for a peer id: its operator alias when set.
+function peerLabel(id) {
+  const p = (rosterEntries || []).find((x) => x.peer_id === id);
+  return p && p.alias ? p.alias : id;
+}
+
+// A legible-on-dark palette for agent names in the centre column. An agent
+// keeps its colour across refreshes within a room: assignment is a stable
+// hash of the peer id with collision resolution over the room's agent set
+// in sorted order — no randomness, no per-load reshuffling. The operator
+// keeps its own violet, so palette entries close to it are excluded. If a
+// room somehow has more agents than palette entries, the overflow falls
+// back to a golden-angle hue rotation (still deterministic, never repeats).
+const AGENT_COLORS = [
+  "#8ab4ff", "#8ee8a0", "#f28bb0", "#ffc76e", "#7fdfd8",
+  "#ff9d8a", "#b5e86f", "#ffd97a", "#8fe3c8", "#f4b48c",
+  "#9fd4ff", "#e8a9e0", "#f8a07a", "#c3e88d", "#8ad7f0",
+  "#f5b7d0", "#a5e8b0", "#ffc9a3", "#74c7e8", "#eac48a",
+];
+
+function colorForAgents(ids) {
+  const out = new Map();
+  const used = new Set();
+  for (const id of ids) {
+    let hashValue = 0;
+    for (let i = 0; i < id.length; i++) hashValue = (hashValue * 31 + id.charCodeAt(i)) | 0;
+    const primary = Math.abs(hashValue) % AGENT_COLORS.length;
+    let free = -1;
+    for (let step = 0; step < AGENT_COLORS.length; step++) {
+      const candidate = (primary + step) % AGENT_COLORS.length;
+      if (!used.has(candidate)) { free = candidate; break; }
+    }
+    if (free !== -1) {
+      used.add(free);
+      out.set(id, AGENT_COLORS[free]);
+    } else {
+      // Palette exhausted in a very large room: golden-angle hue, stable
+      // per agent, and the probe loop above can never wrap forever.
+      const hue = (Math.abs(hashValue) * 137.508) % 360;
+      out.set(id, "hsl(" + hue.toFixed(1) + ", 62%, 74%)");
+    }
+  }
+  return out;
+}
+
+/* ---- conversation-creation modal ---- */
+let pickedPeers = new Set();
+
+async function openConversationModal() {
+  pickedPeers = new Set();
+  el("modal-error").textContent = "";
+  el("modal-extra").value = "";
+  const grid = el("modal-pick");
+  clear(grid);
+  let peers = [];
+  try { peers = await api("/api/peers"); } catch { /* freeform ids still work */ }
+  const makeChip = (id) => {
+    const chip = document.createElement("span");
+    chip.className = "pick-chip" + (pickedPeers.has(id) ? " on" : "");
+    chip.textContent = id;
+    chip.onclick = () => {
+      if (pickedPeers.has(id)) pickedPeers.delete(id); else pickedPeers.add(id);
+      chip.classList.toggle("on");
+    };
+    return chip;
+  };
+  const op = makeChip("operator");
+  op.classList.add("on");
+  pickedPeers.add("operator");
+  grid.appendChild(op);
+  for (const p of peers) {
+    if (p.peer_id === "operator") continue;
+    grid.appendChild(makeChip(p.peer_id));
+  }
+  el("modal-backdrop").hidden = false;
+}
+
+function closeConversationModal() {
+  el("modal-backdrop").hidden = true;
+}
+
+async function createConversation() {
+  const extra = el("modal-extra").value.split(",").map((s) => s.trim()).filter(Boolean);
+  const members = [...pickedPeers];
+  for (const id of extra) if (!members.includes(id)) members.push(id);
+  if (members.length < 2) {
+    el("modal-error").textContent = "pick at least one participant besides the operator";
+    return;
+  }
+  try {
+    const res = await api("/api/conversations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ members }),
+    });
+    closeConversationModal();
+    await select(res.id);
+  } catch (e) {
+    el("modal-error").textContent = e.message;
+  }
+}
+
+/* ---- compose (message / guidance switch) ---- */
+function setComposeMode(mode) {
+  composeMode = mode;
+  el("compose-mode-msg").classList.toggle("active", mode === "message");
+  el("compose-mode-guidance").classList.toggle("active", mode === "guidance");
+  el("compose-text").placeholder = mode === "message"
+    ? "post a message to the conversation"
+    : "operator guidance — rides the next prompt in this conversation";
+  el("compose-send").textContent = mode === "message" ? "send" : "send guidance";
+}
+
+/* ---- @ mentions: directed posts (delivery-scoped; transcript stays shared) ---- */
+// Resolves "@name" tokens (alias first, then peer id) against the roster.
+// The message still lands in the shared transcript; only the resolved
+// targets receive a delivery and take a turn.
+function composeTargets(text) {
+  const targets = [];
+  const unknown = [];
+  for (const match of text.matchAll(/(^|\s)@([A-Za-z0-9._-]+)/g)) {
+    const token = match[2];
+    const peer = rosterEntries.find((p) => p.alias === token)
+      || rosterEntries.find((p) => p.peer_id === token);
+    if (!peer) {
+      if (!unknown.includes(token)) unknown.push(token);
+      continue;
+    }
+    if (!targets.includes(peer.peer_id)) targets.push(peer.peer_id);
+  }
+  return { targets, unknown };
+}
+
+function refreshComposeHint() {
+  const { targets, unknown } = composeTargets(el("compose-text").value);
+  if (unknown.length) {
+    el("compose-hint").textContent = "unknown @" + unknown.join(", @") + " — fix or remove to send";
+    return;
+  }
+  if (targets.length) {
+    const names = targets.map((id) => {
+      const peer = rosterEntries.find((p) => p.peer_id === id);
+      return "@" + ((peer && peer.alias) || id);
+    });
+    el("compose-hint").textContent = "directed to " + names.join(", ") + " — others read only, no turn";
+    return;
+  }
+  el("compose-hint").textContent = "";
+}
+
+// Sending is single-flight (UI-12): a second click while a send is in
+// flight is ignored, and the composer is cleared only for the exact
+// draft the send owned — a newer draft typed mid-flight survives.
+let sendInFlight = false;
+let sendDraft = null;
+async function sendComposed() {
+  const box = el("compose-text");
+  const text = box.value.trim();
+  if (!text || !selected) return;
+  if (sendInFlight) return;
+  sendInFlight = true;
+  sendDraft = { text, conversation: selected };
+  try {
+    if (composeMode === "message") {
+      const { targets, unknown } = composeTargets(text);
+      if (unknown.length) { refreshComposeHint(); return; }
+      const body = { content: text };
+      if (targets.length) body.recipients = targets;
+      await api("/api/conversations/" + selected + "/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } else {
+      await api("/api/conversations/" + selected + "/guidance", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+    }
+    // Clear only the SAME draft in the SAME room: an edit or a room
+    // switch while the request was in flight keeps its text (UI-12).
+    if (sendDraft && box.value.trim() === sendDraft.text && selected === sendDraft.conversation) {
+      box.value = "";
+    }
+    refreshComposeHint();
+    await renderAll();
+  } catch (e) {
+    alert("send failed: " + e.message);
+    // The draft stays in the composer for retry (UI-12).
+  } finally {
+    sendInFlight = false;
+    sendDraft = null;
+  }
+}
+
+/* ---- markdown (safe subset) ---- */
+const MD_FENCE = /^\s*(```|~~~)/;
+const MD_HEADING = /^\s{0,3}#{1,6}\s+(.*?)(?:\s+#+)?\s*$/;
+const MD_RULE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
+const MD_QUOTE = /^\s*>/;
+const MD_ITEM = /^\s*(?:[-*+]|(\d{1,9})[.)])\s+/;
+// Inline spans, leftmost first: code, link, bare URL, bold, italic.
+const MD_INLINE = /`([^`\n]+)`|\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)|(https?:\/\/[^\s<>()]*[^\s<>().,;:!?'"])|\*\*([^*\n]+)\*\*|__([^_\n]+)__|\*([^*\n]+)\*|(?<!\w)_([^_\n]+)_(?!\w)/g;
+const MD_LINK_PROTOCOLS = ["http:", "https:", "mailto:"];
+
+// Renders message and turn text as markdown — fenced code, headings,
+// quotes, lists, rules and paragraphs; inline code, links, bare URLs, bold
+// and italic — building DOM with createElement/textContent, never
+// innerHTML, so the text can't inject markup. An unclosed fence (a turn
+// still streaming) runs to the end of the text.
+//
+// Quote nesting is BOUNDED (UI-16): a hostile `>` run thousands deep
+// must not grow the recursion stack without limit — levels beyond the
+// bound render as inert text instead.
+const MAX_QUOTE_DEPTH = 50;
+function unnestQuote(line) {
+  let depth = 0;
+  let rest = line;
+  while (depth < MAX_QUOTE_DEPTH && MD_QUOTE.test(rest)) {
+    rest = rest.replace(/^\s*>\s?/, "");
+    depth++;
+  }
+  return { depth, rest };
+}
+function renderMarkdown(source) {
+  const out = document.createDocumentFragment();
+  const lines = String(source ?? "").replace(/\r\n?/g, "\n").split("\n");
+  const isBlockStart = (line) =>
+    MD_FENCE.test(line) || MD_HEADING.test(line) || MD_RULE.test(line) || MD_QUOTE.test(line) || MD_ITEM.test(line);
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) { i++; continue; }
+    const fence = MD_FENCE.exec(line);
+    if (fence) {
+      const code = [];
+      for (i++; i < lines.length && !lines[i].trim().startsWith(fence[1]); i++) code.push(lines[i]);
+      i++; // the closing fence, when present
+      out.appendChild(document.createElement("pre")).appendChild(document.createElement("code")).textContent = code.join("\n");
+      continue;
+    }
+    const heading = MD_HEADING.exec(line);
+    if (heading) {
+      const p = out.appendChild(document.createElement("p"));
+      p.className = "md-heading";
+      appendInline(p, heading[1]);
+      i++;
+      continue;
+    }
+    if (MD_RULE.test(line)) { out.appendChild(document.createElement("hr")); i++; continue; }
+    if (MD_QUOTE.test(line)) {
+      const quoted = [];
+      for (; i < lines.length && MD_QUOTE.test(lines[i]); i++) {
+        // Unnest iteratively within the bound; the `>` glyphs beyond
+        // it stay as inert text (UI-16).
+        const { depth, rest } = unnestQuote(lines[i]);
+        quoted.push(depth > 1 ? ">".repeat(depth - 1) + rest : rest);
+      }
+      out.appendChild(document.createElement("blockquote")).appendChild(renderMarkdown(quoted.join("\n")));
+      continue;
+    }
+    const first = MD_ITEM.exec(line);
+    if (first) {
+      const ordered = first[1] !== undefined;
+      const list = out.appendChild(document.createElement(ordered ? "ol" : "ul"));
+      if (ordered && first[1] !== "1") list.start = Number(first[1]);
+      for (let m; i < lines.length && (m = MD_ITEM.exec(lines[i])) && (m[1] !== undefined) === ordered; i++) {
+        appendInline(list.appendChild(document.createElement("li")), lines[i].slice(m[0].length));
+      }
+      continue;
+    }
+    const para = [];
+    do { para.push(lines[i]); i++; } while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i]));
+    appendInline(out.appendChild(document.createElement("p")), para.join("\n").trim());
+  }
+  return out;
+}
+
+// Appends `text` to `parent` with inline markdown spans rendered.
+function appendInline(parent, text) {
+  let last = 0;
+  for (const m of text.matchAll(MD_INLINE)) {
+    if (m.index > last) parent.appendChild(document.createTextNode(text.slice(last, m.index)));
+    last = m.index + m[0].length;
+    const [, code, label, target, url, bold, bold2, em, em2] = m;
+    if (code !== undefined) parent.appendChild(document.createElement("code")).textContent = code;
+    else if (label !== undefined) parent.appendChild(mdLink(label, target));
+    else if (url !== undefined) parent.appendChild(mdLink(url, url));
+    else {
+      const strong = (bold ?? bold2) !== undefined;
+      appendInline(parent.appendChild(document.createElement(strong ? "strong" : "em")), bold ?? bold2 ?? em ?? em2);
+    }
+  }
+  if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)));
+}
+
+// A link to an http(s)/mailto target opens in a new tab; any other target
+// (a local file path, javascript:, a relative link) keeps only its label,
+// with the target as a tooltip.
+function mdLink(label, target) {
+  let url = null;
+  try { url = new URL(target); } catch { /* relative or malformed */ }
+  if (url && MD_LINK_PROTOCOLS.includes(url.protocol)) {
+    const a = document.createElement("a");
+    a.href = url.href;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = label;
+    return a;
+  }
+  const span = document.createElement("span");
+  span.title = target;
+  span.textContent = label;
+  return span;
+}
+
+/* ---- transcript rows ---- */
+// Gutter times use the viewer's local clock ("Nov 2, 03:00:00"); the
+// tooltip carries the full local date, time and zone.
+const TIME_SHORT = new Intl.DateTimeFormat(undefined, {
+  month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+});
+const TIME_FULL = new Intl.DateTimeFormat(undefined, { dateStyle: "full", timeStyle: "long" });
+
+// Appends `entry` to the transcript in a row with its real timestamp in the
+// left gutter. Store timestamps are RFC 3339 with microseconds; they are
+// cut to milliseconds before parsing, and an unparsable one leaves the
+// gutter blank rather than showing a wrong time.
+// Milliseconds for ordering. The store writes nanoseconds, which Date.parse
+// truncates inconsistently across engines, so trim to milliseconds first.
+function stampOf(iso) {
+  const at = new Date(String(iso ?? "").replace(/(\.\d{3})\d+/, "$1"));
+  return Number.isNaN(at.getTime()) ? 0 : at.getTime();
+}
+
+// How close to the bottom a scroller must be to count as following it.
+const STICK_PX = 60;
+
+// Which scrollers are following their newest content. Rebuilding a list resets
+// scrollTop, so a reader who scrolled up would be yanked to the top on every
+// update: the position is recorded before the rebuild and restored after.
+const following = new WeakMap();
+
+// Scrollers that already carry the scroll listener. Kept apart from
+// [[following]] so re-arming the follow cannot suppress the listener.
+const tracked = new WeakSet();
+
+// Attaches the scroll listener that decides whether a pane is following.
+//
+// # Arguments
+//
+// * `scroller` — the element that scrolls.
+function trackScroll(scroller) {
+  if (tracked.has(scroller)) return;
+  tracked.add(scroller);
+  following.set(scroller, true);
+  scroller.addEventListener(
+    "scroll",
+    () => {
+      const gap = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+      following.set(scroller, gap < STICK_PX);
+    },
+    { passive: true },
+  );
+}
+
+// Records a scroller's position before its contents are rebuilt.
+//
+// # Arguments
+//
+// * `scroller` — the element that scrolls.
+//
+// # Returns
+//
+// The previous scrollTop and scrollHeight.
+function rememberScroll(scroller) {
+  return { top: scroller.scrollTop, height: scroller.scrollHeight };
+}
+
+// Restores a scroller after a rebuild.
+//
+// Following scrollers jump to the newest content; a reader who scrolled up
+// keeps the same content in view, and resuming the follow is their own scroll
+// back to the bottom.
+//
+// # Arguments
+//
+// * `scroller` — the element that scrolls.
+// * `before` — what [[rememberScroll]] returned for it.
+function restoreScroll(scroller, before) {
+  trackScroll(scroller);
+  if (following.get(scroller)) {
+    scroller.scrollTop = scroller.scrollHeight;
+    return;
+  }
+  // These lists only ever grow at the bottom, so holding the recorded position
+  // keeps the same content in view; adding the height delta would scroll the
+  // reader away by exactly the amount that arrived.
+  scroller.scrollTop = before.top;
+}
+
+// Re-arms the follow for both readers after a conversation switch, so opening a
+// room lands on its newest content whatever the previous room's scroll was.
+function resetFollow() {
+  for (const id of ["transcript-scroll", "events-feed"]) {
+    const scroller = el(id);
+    trackScroll(scroller);
+    following.set(scroller, true);
+  }
+}
+
+function appendRow(transcript, entry, createdAt) {
+  const time = document.createElement("time");
+  const at = new Date(String(createdAt ?? "").replace(/(\.\d{3})\d+/, "$1"));
+  if (!Number.isNaN(at.getTime())) {
+    time.dateTime = at.toISOString();
+    time.textContent = TIME_SHORT.format(at);
+    time.title = TIME_FULL.format(at);
+  }
+  if (entry.classList.contains("msg")) {
+    // Chat blocks span the full column: the absolute time sits in the meta
+    // line between the agent name and the pinned elapsed age.
+    time.className = "dt";
+    const when = entry.querySelector(".meta .when");
+    (when ? when.parentNode : entry).insertBefore(time, when);
+  } else if (!entry.classList.contains("report")) {
+    // Authored event lines head with their time instead of a gutter stamp.
+    // Work-report blocks carry their own time inside the header line, so
+    // they opt out with the "report" class.
+    time.className = "ts";
+    entry.insertBefore(time, entry.firstChild);
+  }
+  transcript.appendChild(entry);
+}
+
+/* ---- conversation view ---- */
+let rosterEntries = [];
+async function select(id) {
+  selected = id;
+  eventCursor = 0;
+  transcriptEvents = [];
+  viewGeneration += 1;
+  const generation = viewGeneration;
+  seenHashes = {};
+  el("transcript").textContent = "";
+  resetFollow();
+  // Loading state in the response area while the conversation's
+  // content is fetched and rendered.
+  el("transcript-scroll").classList.add("loading");
+  try {
+    await renderAll();
+  } finally {
+    // Only the LATEST selection owns the loading cleanup (UI-11): an
+    // older selection completing must not clear a newer one's gate
+    // while it is still pending.
+    if (generation === viewGeneration) {
+      el("transcript-scroll").classList.remove("loading");
+    }
+  }
+  await loadConversations();
+}
+
+// Events a participant authored: they belong in the transcript beside the
+// messages. Everything else is the hub narrating itself and belongs in the
+// right-hand feed. A work report is a peer's claim about work, not a verdict.
+const AUTHORED_EVENTS = new Set(["work.report"]);
+
+// Builds a feed line's clock stamp, in the same short clock the transcript
+// gutters use. Every event carries `created_at`, so a feed line without a time
+// was simply missing one.
+//
+// # Arguments
+//
+// * `iso` — the event's commit time (RFC 3339).
+//
+// # Returns
+//
+// The `<time>` element, empty when the stamp cannot be parsed.
+function feedStamp(iso) {
+  const node = document.createElement("time");
+  node.className = "feed-ts";
+  const at = new Date(String(iso ?? "").replace(/(\.\d{3})\d+/, "$1"));
+  if (!Number.isNaN(at.getTime())) {
+    node.dateTime = at.toISOString();
+    node.textContent = TIME_SHORT.format(at);
+    node.title = TIME_FULL.format(at);
+  }
+  return node;
+}
+
+// A feed line's header row: the absolute commit time on the left, the
+// relative age pinned right, and a copy control that captures the line's
+// text. The event's content renders beneath the header.
+//
+// # Arguments
+//
+// * `iso` — the event's commit time (RFC 3339).
+// * `copyText` — what the line's copy control puts on the clipboard.
+//
+// # Returns
+//
+// The header `<div>`, carrying both time readings and the copy control.
+function feedHead(iso, copyText) {
+  const head = document.createElement("div");
+  head.className = "feed-head";
+  const ago = document.createElement("span");
+  ago.className = "feed-age";
+  ago.textContent = age(iso);
+  head.append(feedStamp(iso), ago);
+  if (copyText) head.appendChild(copyButton(() => copyText));
+  return head;
+}
+
+// A small clipboard control: copies `getText()` on click and flashes a
+// checkmark briefly so the copy registers without any toast plumbing.
+function copyButton(getText) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "copy-btn";
+  button.textContent = "⧉";
+  button.title = "copy to clipboard";
+  button.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(getText());
+      button.classList.add("copied");
+      button.textContent = "✓";
+      setTimeout(() => { button.classList.remove("copied"); button.textContent = "⧉"; }, 1200);
+    } catch { /* clipboard refused — leave the button alone */ }
+  });
+  return button;
+}
+
+function eventSummary(e) {
+  const p = e.payload || {};
+  const kind = e.kind || "event";
+  // Known payload fields only — never dump raw JSON into the transcript.
+  const text = (p.text || p.content || p.summary || p.reason || p.sender_id || "");
+  if (kind === "turn.chunk" && text) return { text: text, cls: "" };
+  if (kind === "message.accepted") return { text: "accepted · sender " + (p.sender_id || "?") + (p.execution_requested ? " · execution requested" : ""), cls: "" };
+  if (kind === "work.report") return { text: "work report · " + (p.summary || ""), cls: "" };
+  if (kind === "dispatch.stopped") return { text: "dispatcher " + (p.state || "stopped") + (p.reason ? " · " + p.reason : ""), cls: p.state === "canceled" ? "attention" : "" };
+  if (kind === "dispatch.unknown" || kind === "dispatch.failed") return { text: "dispatcher " + kind.replace("dispatch.", "") + (p.reason ? " · " + p.reason : ""), cls: "failure" };
+  if (kind === "attempt.claimed" || kind === "dispatch.started") return { text: kind.replace("attempt.", "") + " · " + (p.recipient_id || ""), cls: "" };
+  if (kind === "delivery.acked") return { text: "delivery acked · " + (p.peer_id || ""), cls: "" };
+  if (text) return { text: text, cls: "" };
+  return { text: "", cls: "" };
+}
+
+// Page size for /events reads: a full page means more may follow.
+const EVENT_PAGE = 500;
+
+// Reads every event of conversation `id` after seq `after`, paging until a
+// short page, so a render holds the whole backlog rather than one page of
+// it. Stops early once the view changes (that result is discarded) or a
+// page fails to advance the seq (guards against an endless loop).
+async function fetchEventsAfter(id, after, generation) {
+  const pages = [];
+  for (;;) {
+    const page = await api("/api/conversations/" + id + "/events?after_seq=" + after + "&limit=" + EVENT_PAGE);
+    pages.push(page);
+    const last = page.length ? page[page.length - 1].seq : after;
+    if (page.length < EVENT_PAGE || last <= after || generation !== viewGeneration) return pages.flat();
+    after = last;
+  }
+}
+
+// Renders the right-hand system feed: everything the hub did, in feed order.
+//
+// A delivery produces a claimed event and an acked event for the same task; one
+// line per delivery is enough, so the ack updates the claim's row in place and
+// the row keeps its original position.
+//
+// # Arguments
+//
+// * `events` — the conversation's events that are not authored content, in
+//   `seq` order.
+function renderEventFeed(events) {
+  renderIfChanged("eventfeed", hash(JSON.stringify(events)), () => {
+    const box = el("events-feed");
+    const before = rememberScroll(box);
+    clear(box);
+    const lines = new Map(); // delivery task id -> its line
+    const rows = []; // { seq: number, node: Element }
+    for (const e of events) {
+      const p = e.payload || {};
+      if (e.kind === "delivery.claimed" || e.kind === "delivery.acked") {
+        const key = p.task_id || p.message_id || "?";
+        // Older claim events predate the recipient field, so a delivery's peer
+        // is taken from whichever hop reports it — usually the ack. Latching
+        // the first hop's unknown left the row reading "delivery · ?".
+        const peer = p.recipient_peer || p.peer_id || null;
+        const state = e.kind === "delivery.acked" ? "acked" : "claimed";
+        const known = lines.get(key);
+        if (known) {
+          known.state = state;
+          if (peer) known.peer = peer;
+          known.node.replaceChildren(feedHead(e.created_at,
+            "delivery · " + known.peer + " · " + state),
+            document.createTextNode("delivery · " + known.peer + " · " + state));
+          continue;
+        }
+        const line = document.createElement("div");
+        line.className = "feed-line";
+        line.replaceChildren(feedHead(e.created_at,
+          "delivery · " + (peer || "?") + " · " + state),
+          document.createTextNode("delivery · " + (peer || "?") + " · " + state));
+        lines.set(key, { peer: peer || "?", state, node: line });
+        rows.push({ seq: e.seq, node: line });
+        continue;
+      }
+      const s = eventSummary(e);
+      const line = document.createElement("div");
+      line.className = "feed-line" + (s.cls ? " " + s.cls : "");
+      const kind = document.createElement("span");
+      kind.className = "ekind";
+      kind.textContent = e.kind;
+      line.appendChild(feedHead(e.created_at, e.kind + " " + s.text));
+      line.appendChild(kind);
+      line.appendChild(document.createTextNode(s.text));
+      rows.push({ seq: e.seq, node: line });
+    }
+    rows.sort((a, b) => a.seq - b.seq);
+    for (const row of rows) box.appendChild(row.node);
+    if (!rows.length) {
+      const note = document.createElement("div");
+      note.className = "empty-note";
+      note.textContent = "no system events yet";
+      box.appendChild(note);
+    }
+    restoreScroll(box, before);
+  });
+}
+
+async function renderAll() {
+  if (!selected) return;
+  const generation = viewGeneration;
+  const current = { startedAt: Date.now() };
+  refresh = current;
+  let messages, events, fences, members;
+  try {
+    // The transcript's initial load is BOUNDED (UI-19): the latest
+    // window only — the whole history is fetched on demand, never at
+    // startup or on a room switch.
+    const bounded = !FULL_HISTORY_ROOMS.has(selected);
+    [messages, events, fences, members] = await Promise.all([
+      api("/api/conversations/" + selected + "/messages" + (bounded ? "?window=" + INITIAL_WINDOW : "")),
+      fetchEventsAfter(selected, eventCursor, generation),
+      api("/api/conversations/" + selected + "/fences"),
+      api("/api/conversations/" + selected).then((c) => c.members),
+    ]);
+  } catch {
+    // A failed fetch must not wedge the view-ownership token: this
+    // refresh is dead either way, so release it if it still owns the
+    // view before bailing (UI-11).
+    if (refresh === current) refresh = null;
+    return;
+  }
+  // A fetch begun for an earlier view (another conversation, or before a
+  // re-select) must not render into the current one.
+  if (generation !== viewGeneration) return;
+  // Same-view overlap: a NEWER refresh owns the view — a stale response
+  // finishing last must not roll back its newer state (UI-11).
+  if (refresh !== current) return;
+  // This refresh is the latest owner: it renders now, so the token no
+  // longer needs to block anyone. (Clearing it in a `finally` above the
+  // ownership check made `refresh !== current` always true — a successful
+  // fetch could never render.)
+  refresh = null;
+  // The events endpoint is an incremental feed (seq-ordered, append-only):
+  // keep only what is new, since overlapping polls can return the same
+  // events, so the transcript shows the whole history, not the last batch.
+  for (const e of events) {
+    if (e.seq > eventCursor) {
+      transcriptEvents.push(e);
+      eventCursor = e.seq;
+    }
+  }
+
+  // The transcript renders authored content only: messages, streamed
+  // turn output, and authored events. System narration (fence/claim/
+  // ack events) advances the cursor and the side feed WITHOUT
+  // rebuilding every authored row (UI-20).
+  const authoredSeq = transcriptEvents
+    .filter((e) => e.kind === "turn.chunk" || e.kind === "dispatch.started" || AUTHORED_EVENTS.has(e.kind))
+    .map((e) => e.seq + ":" + e.kind + ":" + (e.payload.attempt_id || "")
+      + (e.kind === "work.report" ? ":" + (e.payload.peer_id || "") + ":" + (e.payload.summary || "") : ""))
+    .join(",");
+  renderIfChanged("transcript", hash(JSON.stringify(messages) + "#" + authoredSeq), () => {
+    const scroll = el("transcript-scroll");
+    const before = rememberScroll(scroll);
+    const transcript = el("transcript");
+    clear(transcript);
+    // One chronological timeline of authored content — messages, streamed turn
+    // output, and work reports — so a report lands beside the message it
+    // answers. Hub narration goes to the right-hand feed rather than splitting
+    // this column into "everything said" followed by "everything that happened".
+    // Each agent's name carries a stable per-room colour.
+    const agentsInView = new Set();
+    for (const m of messages) if (m.sender_id !== "operator") agentsInView.add(m.sender_id);
+    for (const e of transcriptEvents) {
+      if (e.kind === "dispatch.started" && e.payload.recipient_id && e.payload.recipient_id !== "operator") {
+        agentsInView.add(e.payload.recipient_id);
+      }
+      if (e.kind === "work.report" && e.payload.peer_id && e.payload.peer_id !== "operator") {
+        agentsInView.add(e.payload.peer_id);
+      }
+    }
+    const palette = colorForAgents([...agentsInView].sort());
+    const rows = []; // { at: ms, ord: number, when: string, node: Element }
+    for (const m of messages) {
+      const box = document.createElement("div");
+      box.className = "msg";
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      const sender = document.createElement("span");
+      sender.className = "sender" + (m.sender_id === "operator" ? " operator" : "");
+      sender.textContent = peerLabel(m.sender_id);
+      if (m.sender_id !== "operator") sender.style.color = palette.get(m.sender_id) || "";
+      const when = document.createElement("span");
+      when.className = "when";
+      when.textContent = age(m.created_at);
+      meta.appendChild(sender); meta.appendChild(when);
+      meta.appendChild(copyButton(() => m.content));
+      box.appendChild(meta);
+      const content = document.createElement("div");
+      content.className = "content md";
+      content.appendChild(renderMarkdown(m.content));
+      box.appendChild(content);
+      const harnessDeliveries = (m.deliveries || []).filter((d) => d.peer_id !== "operator");
+      if (harnessDeliveries.length) {
+        const row = document.createElement("div");
+        row.className = "deliveries";
+        row.title = "delivery state and controls, per cohort member";
+        for (const d of harnessDeliveries) {
+          // One control per recipient: its name and state are the button, and
+          // the actions open beneath it as icons, so the row stays a row of
+          // names instead of a wall of text buttons.
+          const chip = document.createElement("span");
+          chip.className = "delivery";
+          const name = document.createElement("span");
+          name.className = "dname";
+          name.textContent = peerLabel(d.peer_id);
+          const state = document.createElement("span");
+          state.className = "dstate " + (d.state || "stored");
+          state.title = DELIVERY_STATE_TEXT[d.state] || d.state;
+          const open = document.createElement("button");
+          open.className = "delivery-btn";
+          open.title = (d.state ? d.state + " — " : "") + "delivery to " + d.peer_id + "; click for actions";
+          open.append(name, state);
+          const menu = document.createElement("span");
+          menu.className = "delivery-menu";
+          menu.hidden = true;
+          menu.append(
+            btn("⏸", () => act("/api/messages/" + m.id + "/deliveries/" + d.peer_id + "/hold", "POST"), "peer-btn", "hold this delivery pending review"),
+            btn("▶", () => act("/api/messages/" + m.id + "/deliveries/" + d.peer_id + "/release", "POST"), "peer-btn", "release the held delivery"),
+            btn("✕", () => act("/api/messages/" + m.id + "/deliveries/" + d.peer_id + "/cancel", "POST"), "peer-btn danger", "cancel this delivery"),
+          );
+          open.addEventListener("click", (event) => {
+            event.stopPropagation();
+            const wasOpen = !menu.hidden;
+            closeDeliveryMenus();
+            menu.hidden = wasOpen;
+          });
+          chip.append(open, menu);
+          row.appendChild(chip);
+        }
+        box.appendChild(row);
+      }
+      rows.push({ at: stampOf(m.created_at), ord: 0, when: m.created_at, node: box });
+    }
+    // A turn streams as many turn.chunk events sharing an attempt_id. Each turn
+    // renders as one block at its first fragment, labelled with the agent named
+    // by its dispatch.started, growing as the turn streams.
+    const turns = new Map(); // attempt_id -> { kind, body, parts, messageId, node }
+    const agents = new Map(); // attempt_id -> recipient_id
+    const feed = []; // narration for the right-hand column
+    for (const e of transcriptEvents) {
+      const p = e.payload || {};
+      if (e.kind === "dispatch.started" && p.attempt_id) agents.set(p.attempt_id, p.recipient_id);
+      if (e.kind === "turn.chunk" && p.attempt_id) {
+        let turn = turns.get(p.attempt_id);
+        if (!turn) {
+          const line = document.createElement("div");
+          line.className = "event turn";
+          const kind = document.createElement("span");
+          kind.className = "ekind";
+          const body = document.createElement("div");
+          body.className = "turn-body md";
+          line.appendChild(kind);
+          line.appendChild(body);
+          turn = { kind, body, parts: [], messageId: null, node: line };
+          turns.set(p.attempt_id, turn);
+          rows.push({ at: stampOf(e.created_at), ord: e.seq, when: e.created_at, node: line });
+        }
+        const messageId = p.message_id ?? null;
+        if (messageId !== null) {
+          if (turn.messageId !== null && messageId !== turn.messageId) turn.parts.push("\n\n");
+          turn.messageId = messageId;
+        }
+        turn.parts.push(eventSummary(e).text);
+        continue;
+      }
+      if (!AUTHORED_EVENTS.has(e.kind)) {
+        feed.push(e);
+        continue;
+      }
+      const s = eventSummary(e);
+      const line = document.createElement("div");
+      line.className = "event report" + (s.cls ? " " + s.cls : "");
+      if (e.kind === "work.report") {
+        // A work report reads as its own block: the reporting agent leads,
+        // in its room colour, followed by the kind label and the commit
+        // time on the header line, the copy control pinned right, and the
+        // report data beneath.
+        const head = document.createElement("div");
+        head.className = "report-head";
+        const kind = document.createElement("span");
+        kind.className = "ekind";
+        kind.textContent = e.kind;
+        const reporter = p.peer_id ? peerLabel(String(p.peer_id)) : "";
+        if (reporter) {
+          const who = document.createElement("span");
+          who.className = "report-who";
+          who.textContent = reporter;
+          if (p.peer_id !== "operator") who.style.color = palette.get(String(p.peer_id)) || "";
+          head.appendChild(who);
+          const sep = document.createElement("span");
+          sep.className = "ekind";
+          sep.textContent = " · ";
+          head.appendChild(sep);
+        }
+        head.appendChild(kind);
+        const body = document.createElement("div");
+        body.className = "report-body";
+        body.textContent = "work report: " + (p.summary || "");
+        const ago = document.createElement("span");
+        ago.className = "report-age";
+        ago.textContent = age(e.created_at);
+        head.append(feedStamp(e.created_at), ago);
+        head.appendChild(copyButton(() =>
+          (reporter ? reporter + " · " : "") + "work.report"
+          + " " + (e.created_at || "") + "\n" + body.textContent));
+        line.append(head, body);
+        rows.push({ at: stampOf(e.created_at), ord: e.seq, when: e.created_at, node: line });
+        continue;
+      }
+      const kind = document.createElement("span");
+      kind.className = "ekind";
+      kind.textContent = e.kind;
+      line.appendChild(kind);
+      line.appendChild(document.createTextNode(s.text));
+      rows.push({ at: stampOf(e.created_at), ord: e.seq, when: e.created_at, node: line });
+    }
+    rows.sort((a, b) => (a.at - b.at) || (a.ord - b.ord));
+    for (const row of rows) appendRow(transcript, row.node, row.when);
+    // The bounded window's disclosure control (UI-19): when older
+    // messages exist, the operator loads them explicitly — memory
+    // stays bounded for the common case.
+    if (!FULL_HISTORY_ROOMS.has(selected) && messages.length >= INITIAL_WINDOW) {
+      const more = document.createElement("button");
+      more.className = "load-earlier";
+      more.textContent = "older messages may exist — load the full history";
+      more.onclick = loadFullHistory;
+      transcript.insertBefore(more, transcript.firstChild);
+    }
+    if (!rows.length) {
+      const note = document.createElement("div");
+      note.className = "empty-note";
+      note.textContent = "no messages yet — post one below";
+      transcript.appendChild(note);
+    }
+    for (const [attemptId, turn] of turns) {
+      const agent = agents.get(attemptId);
+      turn.kind.textContent = "turn output";
+      if (agent) {
+        const who = document.createElement("span");
+        who.className = "turn-who";
+        who.textContent = " · " + agent;
+        who.style.color = palette.get(agent) || "";
+        turn.kind.appendChild(who);
+      }
+      turn.body.appendChild(renderMarkdown(turn.parts.join("")));
+    }
+    restoreScroll(scroll, before);
+    renderEventFeed(feed);
+  });
+
+  // The gates menu: one row per gateable member, with pause/block toggles and
+  // kick. The operator is not gateable — it is in every room by construction and
+  // has no deliveries to gate — so it is neither listed nor offered a control.
+  const gateable = members.filter((peer) => peer !== "operator");
+  roomMembers = gateable;
+  roomFences = fences;
+  renderIfChanged("gates", hash(JSON.stringify(gateable) + JSON.stringify(fences)
+    + JSON.stringify(gateable.map((p) => {
+      const entry = (rosterEntries || []).find((x) => x.peer_id === p);
+      return entry ? entry.host_id : "";
+    })) + selected), () => {
+    const list = el("gates-list");
+    clear(list);
+    for (const peer of gateable) {
+      const row = document.createElement("div");
+      row.className = "gate-row";
+      // Name over the host, in the cohort list's subdued two-line idiom, so
+      // the gate rows read like mini peer blocks. The actions stay pinned
+      // right as the row's dominant element.
+      const id = document.createElement("span");
+      id.className = "gate-id";
+      const name = document.createElement("span");
+      name.className = "gate-name";
+      name.textContent = peerLabel(peer);
+      name.title = peer;
+      id.appendChild(name);
+      const entry = (rosterEntries || []).find((x) => x.peer_id === peer);
+      const hostId = String(entry && entry.host_id ? entry.host_id : "").replace(/\.mtls\.devlocal\.home\.arpa$/, "");
+      if (hostId) {
+        const host = document.createElement("span");
+        host.className = "gate-host";
+        host.textContent = hostId;
+        host.title = hostId;
+        id.appendChild(host);
+      }
+      row.appendChild(id);
+      for (const kind of ["pause", "block"]) {
+        const fence = fences.find((f) => f.peer_id === peer && f.kind === kind);
+        const label = kind === "pause" ? "⏸" : "⛔";
+        // "block" already blocks everything, so it reads as the stronger gate.
+        const title = fence
+          ? "clear the " + kind + " gate on " + peer
+          : (kind === "pause" ? "no NEW deliveries to " : "no delivery to ") + peer;
+        row.appendChild(btn(label, () => toggleFence(peer, kind, fence),
+          "peer-btn" + (fence ? " on" : "") + (kind === "block" ? " block" : ""), title));
+      }
+      // Two-click confirm: a blocked window.confirm returns false silently, so
+      // one click would look dead.
+      let armed = false;
+      let armTimer = null;
+      const kick = btn("✕", () => {
+        if (!armed) {
+          armed = true;
+          kick.textContent = "✓";
+          kick.title = "click again to kick " + peer + " from this room";
+          armTimer = setTimeout(() => {
+            armed = false;
+            kick.textContent = "✕";
+            kick.title = "kick " + peer + " from this room";
+          }, 4000);
+          return;
+        }
+        clearTimeout(armTimer);
+        kick.disabled = true;
+        kickMember(peer);
+      }, "peer-btn danger", "kick " + peer + " from this room (stays enrolled)");
+      row.appendChild(kick);
+      list.appendChild(row);
+    }
+  });
+}
+
+// Sets or clears one gate on one member.
+//
+// # Arguments
+//
+// * `peerId` — the member.
+// * `kind` — `pause` or `block`.
+// * `existing` — the fence already set for this member and kind, if any.
+async function toggleFence(peerId, kind, existing) {
+  if (existing) {
+    await act("/api/fences/" + existing.id, "DELETE");
+    return;
+  }
+  await api("/api/conversations/" + selected + "/fences", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ peer_id: peerId, kind }),
+  });
+  await renderAll();
+}
+
+// Applies a bulk gate action to every member of the room.
+//
+// # Arguments
+//
+// * `action` — `pause`, `block`, or `clear` for every gate in the room.
+async function applyBulkGate(action) {
+  // Capture the target room and its membership ONCE (UI-06): a room
+  // switch mid-action must not redirect later requests to the newly
+  // selected room, and the per-row loops must not read mutable globals.
+  const room = selected;
+  const members = roomMembers.slice();
+  const fences = roomFences.slice();
+  if (action === "clear") {
+    for (const gate of fences) {
+      await api("/api/fences/" + gate.id, { method: "DELETE" });
+    }
+  } else {
+    for (const peer of members) {
+      if (fences.some((gate) => gate.peer_id === peer && gate.kind === action)) continue;
+      await api("/api/conversations/" + room + "/fences", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ peer_id: peer, kind: action }),
+      });
+    }
+  }
+  if (selected === room) await renderAll();
+}
+
+// Kicks a member out of this room. The peer stays enrolled in the hub and in
+// its other rooms; only this room's membership changes.
+//
+// # Arguments
+//
+// * `peerId` — the member to remove.
+async function kickMember(peerId) {
+  // Capture the target room once: a switch mid-request must not kick
+  // from the newly selected room (UI-06).
+  const room = selected;
+  try {
+    await api("/api/conversations/" + room + "/members/" + encodeURIComponent(peerId), {
+      method: "DELETE",
+    });
+  } catch (e) {
+    // A failed moderation action is PRESENTED as a failure (UI-17) —
+    // never suppressed on the theory that a later poll surfaces it.
+    alert("kick failed: " + e.message);
+  }
+  if (selected === room) await renderAll();
+}
+
+// Opens or closes the gates menu. It floats over the transcript, so opening it
+// never reflows the pane.
+//
+// # Arguments
+//
+// * `open` — force a state; omitted toggles.
+function toggleGatesMenu(open) {
+  const menu = el("gates-menu");
+  const next = open ?? menu.hidden;
+  menu.hidden = !next;
+  el("gates-toggle").setAttribute("aria-expanded", String(next));
+}
+
+async function act(path, method) {
+  try {
+    await api(path, { method });
+  } catch (e) {
+    // Moderation failures are presented, not hidden (UI-17).
+    alert("action failed: " + e.message);
+  }
+  await renderAll();
+}
+
+async function renderUnknown() {
+  let attempts = [];
+  try {
+    attempts = await api("/api/attempts/unknown");
+  } catch (e) {
+    // A failed read must never leave the stale "none" claim visible
+    // (UI-17): the region says the read failed until it succeeds.
+    const list = el("unknown-list");
+    list.textContent = "could not load unknown attempts: " + e.message;
+    return;
+  }
+  renderIfChanged("unknown", hash(JSON.stringify(attempts)), () => {
+    const list = el("unknown-list");
+    const banner = el("unknown-banner");
+    clear(list);
+    if (attempts.length === 0) {
+      banner.hidden = true;
+      const note = document.createElement("div");
+      note.className = "empty";
+      note.textContent = "none — nothing is silently stuck";
+      list.appendChild(note);
+      return;
+    }
+    banner.hidden = false;
+    banner.textContent = attempts.length + " attempt(s) with undeterminable outcomes — operator decision required";
+    for (const a of attempts) {
+      const box = document.createElement("div");
+      box.className = "attempt";
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = "attempt " + a.attempt_id.slice(0, 8) + " → " + a.recipient_id + (a.stop_reason ? " · " + a.stop_reason : "");
+      box.appendChild(meta);
+      const row = document.createElement("div");
+      row.className = "row";
+      row.appendChild(btn("retry", () => reconcile(a.attempt_id, { decision: "retry" }), "primary", "re-queue the turn"));
+      row.appendChild(btn("close failed", () => reconcile(a.attempt_id, { decision: "close", state: "failed" }), "", "record the turn as failed"));
+      row.appendChild(btn("close completed", () => reconcile(a.attempt_id, { decision: "close", state: "completed" }), "", "record the turn as completed"));
+      box.appendChild(row);
+      list.appendChild(box);
+    }
+  });
+}
+
+async function reconcile(attemptId, body) {
+  await api("/api/attempts/" + attemptId + "/reconcile", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  await renderUnknown();
+  if (selected) await renderAll();
+}
+
+el("compose-send").onclick = sendComposed;
+el("compose-text").addEventListener("input", refreshComposeHint);
+el("compose-mode-msg").onclick = () => setComposeMode("message");
+el("compose-mode-guidance").onclick = () => setComposeMode("guidance");
+el("new-convo-open").onclick = openConversationModal;
+el("hide-ejected").onclick = () => {
+  hideEjected = !hideEjected;
+  el("hide-ejected").textContent = hideEjected ? "show ejected" : "hide ejected";
+  loadPeers();
+};
+el("modal-cancel").onclick = closeConversationModal;
+el("modal-create").onclick = createConversation;
+
+setInterval(async () => {
+  if (!el("boot").hidden) return; // nothing to refresh behind the login card
+  try {
+    await loadConversations();
+    await loadModeration();
+    await loadPeers();
+    const refreshing = refresh !== null && Date.now() - refresh.startedAt < REFRESH_STALE_MS;
+    if (selected && !refreshing) await renderAll();
+    await renderUnknown();
+  } catch (e) { /* transient — the next tick retries */ }
+}, 1000);
+
+async function bestConversation(conversations) {
+  let best = null, bestAt = -1, bestHasMessages = false;
+  for (const c of conversations) {
+    let hasMessages = false;
+    let activity = Date.parse(c.created_at) || 0;
+    try {
+      const msgs = await api("/api/conversations/" + c.id + "/messages");
+      if (msgs.length) {
+        hasMessages = true;
+        // Messages are ordered oldest-first; the newest one decides.
+        const last = Date.parse(msgs[msgs.length - 1].created_at);
+        if (last > activity) activity = last;
+      }
+    } catch { /* keep created_at */ }
+    // A conversation with real traffic always outranks an empty one,
+    // no matter how recently the empty one was created.
+    if (hasMessages && !bestHasMessages) { best = c; bestAt = activity; bestHasMessages = true; continue; }
+    if (hasMessages !== bestHasMessages) continue;
+    if (activity > bestAt) { bestAt = activity; best = c; }
+  }
+  return best || conversations[conversations.length - 1] || null;
+}
+
+// Boot is invoked at the END of this script: it reads
+// `appWired` and `connecting`, which are declared below, so a
+// remembered session must never bootstrap into a temporal dead zone.
+async function boot() {
+  // Remembered login is the server-managed cookie: just try the API.
+  // A 401 (no cookie, or a cookie the server no longer accepts) lands
+  // on the login card.
+  el("boot").classList.add("connecting");
+  try {
+    await startApp();
+  } catch (error) {
+    showLogin();
+    if (error.auth) {
+      // Neutral and honest for both a fresh browser and a rejected
+      // remembered session: the page cannot read the HttpOnly cookie,
+      // so it cannot tell which case this was.
+      el("login-error").textContent = "log in to continue";
+    } else {
+      // A non-auth startup failure: say what actually failed, and let
+      // a reload or a manual login recover.
+      el("login-error").textContent = "could not start — " + error.message + " · reload to retry, or log in again";
+    }
+  }
+}
+
+function showLogin() {
+  dropGate();
+  el("boot").hidden = false;
+  el("boot").classList.remove("connecting");
+  el("login-error").textContent = "";
+  el("login-token").focus();
+}
+
+// Removes the first-frame loading gate once a full render is on screen.
+function dropGate() {
+  const gate = document.getElementById("boot-gate");
+  if (gate) gate.remove();
+}
+
+// Login attempts are serialized and stale responses disregarded
+// (UI-13): overlapping submissions must not race the token state or
+// double-install the app.
+let connecting = false;
+async function connectWith(value) {
+  const candidate = value.trim();
+  if (!candidate || connecting) return;
+  connecting = true;
+  el("login-error").textContent = "";
+  el("boot").classList.add("connecting");
+  authGeneration += 1;
+  // Verification first: the credential goes to the server, which
+  // remembers it as an HttpOnly cookie. The page never stores it.
+  try {
+    const res = await fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: candidate }),
+    });
+    if (res.status === 401) {
+      el("boot").classList.remove("connecting");
+      el("login-error").textContent = "rejected — check the token";
+      connecting = false;
+      return;
+    }
+    if (!res.ok) {
+      el("boot").classList.remove("connecting");
+      el("login-error").textContent =
+        "could not verify the credential — " + res.status + " · try again";
+      connecting = false;
+      return;
+    }
+  } catch (error) {
+    // A transport failure: the credential was neither accepted nor
+    // rejected — say so, and leave the candidate in the input for the
+    // retry.
+    el("boot").classList.remove("connecting");
+    el("login-error").textContent =
+      "could not verify the credential — " + error.message + " · try again";
+    connecting = false;
+    return;
+  }
+  // Startup runs separately from verification: an accepted credential
+  // must survive a network/render failure, and only a genuine
+  // current-session rejection may discard it.
+  try {
+    await startApp();
+  } catch (error) {
+    if (error.auth) {
+      el("login-error").textContent = "rejected — check the token";
+    } else {
+      el("boot").classList.remove("connecting");
+      el("boot").hidden = false;
+      el("login-error").textContent =
+        "connected, but the app could not start — " + error.message + " · connect again to retry";
+    }
+  }
+  connecting = false;
+}
+
+// ---- resizable side rails ----
+// Both side columns START at the same width — the left column's — and each
+// stays independently adjustable within bounds; each column's choice
+// persists across refreshes.
+
+const RAIL_MIN_REM = 14;
+const RAIL_MAX_REM = 32;
+const RAIL_DEFAULT_REM = 22; // the left column's width
+const LEFT_RAIL_KEY = "wrkspc-ui.left-rail.v3";
+const RIGHT_RAIL_KEY = "wrkspc-ui.right-rail.v3";
+
+// Clamps a pixel width into the rail bounds. The upper bound also never
+// exceeds 40% of the viewport, so the centre column keeps breathing room
+// however wide the window.
+function clampRailPx(px) {
+  const floor = RAIL_MIN_REM * 16;
+  const ceiling = Math.max(floor, Math.min(RAIL_MAX_REM * 16, window.innerWidth * 0.4));
+  return Math.min(ceiling, Math.max(floor, px));
+}
+
+function railWidthCss(key) {
+  const saved = Number(localStorage.getItem(key));
+  if (Number.isFinite(saved) && saved > 0) {
+    return clampRailPx(saved * 16) / 16 + "rem";
+  }
+  return RAIL_DEFAULT_REM + "rem";
+}
+
+function applyRailWidths() {
+  // Widths saved by earlier column builds (independent, shared, or the v2
+  // pair) are superseded: the two rails always START MATCHED. A v2-era
+  // left-rail width carries over to BOTH sides — that keeps the left
+  // column at the width the operator last chose for it — and everything
+  // else starts at the shared default, the left column's width.
+  localStorage.removeItem("wrkspc-ui.rail-width");
+  localStorage.removeItem("wrkspc-ui.left-rail");
+  localStorage.removeItem("wrkspc-ui.right-rail");
+  const v2Left = Number(localStorage.getItem("wrkspc-ui.left-rail.v2"));
+  localStorage.removeItem("wrkspc-ui.left-rail.v2");
+  localStorage.removeItem("wrkspc-ui.right-rail.v2");
+  if (Number.isFinite(v2Left) && v2Left > 0 && localStorage.getItem(LEFT_RAIL_KEY) === null) {
+    localStorage.setItem(LEFT_RAIL_KEY, String(v2Left));
+    localStorage.setItem(RIGHT_RAIL_KEY, String(v2Left));
+  }
+  el("conversations").style.width = railWidthCss(LEFT_RAIL_KEY);
+  el("unknown").style.width = railWidthCss(RIGHT_RAIL_KEY);
+}
+
+// Wires one divider; dragging it resizes ONLY its own column — the left
+// handle widens by dragging right, the right handle by dragging left. The
+// centre panel absorbs the difference.
+function wireRailHandle(handle, aside, key) {
+  let dragging = false;
+  let startX = 0;
+  let startWidth = 0;
+  handle.addEventListener("pointerdown", (event) => {
+    dragging = true;
+    startX = event.clientX;
+    startWidth = aside.getBoundingClientRect().width;
+    handle.classList.add("dragging");
+    document.body.classList.add("rail-resizing");
+    try { handle.setPointerCapture(event.pointerId); } catch { /* not fatal */ }
+    event.preventDefault();
+  });
+  handle.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    const direction = aside.id === "conversations" ? 1 : -1;
+    aside.style.width = clampRailPx(startWidth + direction * (event.clientX - startX)) + "px";
+  });
+  const done = () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove("dragging");
+    document.body.classList.remove("rail-resizing");
+    localStorage.setItem(key, String(parseFloat(aside.style.width) / 16));
+  };
+  handle.addEventListener("pointerup", done);
+  handle.addEventListener("pointercancel", done);
+}
+
+function initRailResize() {
+  applyRailWidths();
+  const leftHandle = document.createElement("div");
+  leftHandle.className = "rail-handle";
+  leftHandle.title = "drag to resize the left column";
+  const rightHandle = document.createElement("div");
+  rightHandle.className = "rail-handle";
+  rightHandle.title = "drag to resize the right column";
+  el("conversations").after(leftHandle);
+  el("unknown").before(rightHandle);
+  wireRailHandle(leftHandle, el("conversations"), LEFT_RAIL_KEY);
+  wireRailHandle(rightHandle, el("unknown"), RIGHT_RAIL_KEY);
+}
+
+// One-time DOM wiring runs exactly once (UI-13): a reconnect without a
+// page reload must not stack duplicate listeners, tooltips, or
+// counter timers (a second install made one toggle click open-then-
+// close and doubled bulk actions).
+let appWired = false;
+async function startApp() {
+  if (!appWired) {
+    appWired = true;
+    initRailResize();
+    installTooltips();
+    startCounterTicker();
+    document.addEventListener("click", (event) => {
+      if (!event.target.closest(".delivery")) closeDeliveryMenus();
+    });
+    el("gates-toggle").addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleGatesMenu();
+    });
+    for (const bulk of document.querySelectorAll("#gates-menu [data-bulk]")) {
+      bulk.addEventListener("click", (event) => {
+        event.stopPropagation();
+        applyBulkGate(bulk.dataset.bulk);
+      });
+    }
+    document.addEventListener("click", (event) => {
+      if (!event.target.closest("#convo-head")) toggleGatesMenu(false);
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") toggleGatesMenu(false);
+    });
+  }
+  el("boot").classList.add("connecting");
+  await loadConversations();
+  await loadModeration();
+  await loadPeers();
+  await renderUnknown();
+  const conversations = await api("/api/conversations");
+  const best = await bestConversation(conversations);
+  if (best) await select(best.id);
+  dropGate();
+  el("boot").hidden = true;
+}
+
+el("login-submit").onclick = () => connectWith(el("login-token").value);
+el("login-token").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") connectWith(el("login-token").value);
+});
+// Boot LAST: every declaration it reads — appWired,
+// connecting, the wiring above — is initialized by this point.
+boot();
+</script>
+</body>
+</html>

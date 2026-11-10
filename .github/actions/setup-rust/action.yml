@@ -1,0 +1,263 @@
+name: Setup Rust and just
+description: Install the pinned Rust toolchain (from rust-toolchain.toml), just, and optional cargo tools.
+
+inputs:
+  targets:
+    description: Optional space-separated list of additional Rust targets to install.
+    required: false
+    default: ""
+  install-rust:
+    description: Whether to install the pinned Rust toolchain at all (false for jobs that only need just).
+    required: false
+    default: "true"
+  install-just:
+    description: Whether to install the pinned just command runner.
+    required: false
+    default: "true"
+  just-version:
+    description: just runner version to install (not the Rust compiler version).
+    required: false
+    default: "1.51.0"
+  install-cargo-deny:
+    description: Whether to install cargo-deny.
+    required: false
+    default: "false"
+  install-cargo-audit:
+    description: Whether to install cargo-audit.
+    required: false
+    default: "false"
+  cargo-deny-version:
+    description: cargo-deny version to install.
+    required: false
+    default: "0.20.2"
+  cargo-audit-version:
+    description: cargo-audit version to install.
+    required: false
+    default: "0.22.2"
+  install-target-dir:
+    description: Cargo target directory for tool installation builds.
+    required: false
+    default: target/cargo-install
+  zig-version:
+    description: Zig release to install for cross compilation (the clippy-linux cc shim and cargo zigbuild execute `zig`).
+    required: false
+    default: "0.16.0"
+  cargo-zigbuild-version:
+    description: cargo-zigbuild version to install for Linux cross builds.
+    required: false
+    default: "0.24.1"
+
+runs:
+  using: composite
+  steps:
+    # Installs the toolchain and components pinned in rust-toolchain.toml.
+    - name: Install pinned Rust toolchain
+      if: ${{ inputs.install-rust == 'true' }}
+      shell: bash
+      env:
+        RUST_TARGETS: ${{ inputs.targets }}
+      run: |
+        set -euo pipefail
+        if ! command -v rustup >/dev/null 2>&1; then
+          echo "rustup must be preinstalled; refusing to run an unpinned remote installer" >&2
+          exit 1
+        fi
+        if [[ -n "${GITHUB_PATH:-}" ]]; then
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi
+        # Installs the toolchain and components pinned in rust-toolchain.toml.
+        rustup show
+        if [[ -n "$RUST_TARGETS" ]]; then
+          rustup target add $RUST_TARGETS
+        fi
+
+    # The clippy-linux gate's cc shim and the Linux release legs both
+    # execute `zig`; the pinned platform tarball is sha256-verified
+    # before it lands on PATH.
+    - name: Install pinned Zig (cross-build linker)
+      if: ${{ inputs.install-rust == 'true' }}
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.zig-version }}
+      run: |
+        set -euo pipefail
+        # Probe by RUNNING the binary, not `command -v` (T12): an
+        # ambient copy of any other version must not win silently.
+        # The pinned install dir is prepended to GITHUB_PATH so the
+        # real pinned binary shadows whatever was already there.
+        if found="$(zig version 2>/dev/null)"; then
+          if [[ "$found" == "$ZIG_VERSION" ]]; then
+            echo "zig already at the pinned version: $(command -v zig) -> $found"
+            exit 0
+          fi
+          echo "zig version mismatch: found '$found', pinned is '$ZIG_VERSION'; installing the pinned release"
+        else
+          echo "no runnable zig found; installing pinned zig $ZIG_VERSION"
+        fi
+        case "$(uname -s)/$(uname -m)" in
+          Linux/x86_64)
+            zig_platform=x86_64-linux
+            zig_sha256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+            ;;
+          Linux/aarch64|Linux/arm64)
+            zig_platform=aarch64-linux
+            zig_sha256=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+            ;;
+          Darwin/x86_64)
+            zig_platform=x86_64-macos
+            zig_sha256=0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7
+            ;;
+          Darwin/arm64)
+            zig_platform=aarch64-macos
+            zig_sha256=b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489
+            ;;
+          *)
+            echo "zig: unsupported platform for cross builds" >&2
+            exit 1
+            ;;
+        esac
+        temporary="$(mktemp -d)"
+        trap 'rm -rf "$temporary"' EXIT
+        curl --fail --silent --show-error --location --retry 3 \
+          "https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_platform}-${ZIG_VERSION}.tar.xz" \
+          -o "$temporary/zig.tar.xz"
+        actual="$(sha256sum "$temporary/zig.tar.xz" | cut -d ' ' -f 1)"
+        [[ "$actual" == "$zig_sha256" ]] || { echo 'zig tarball checksum mismatch.' >&2; exit 1; }
+        tar -xJf "$temporary/zig.tar.xz" -C "$temporary"
+        install -d "$HOME/.local/zig"
+        cp -r "$temporary/zig-${zig_platform}-${ZIG_VERSION}/." "$HOME/.local/zig/"
+        echo "$HOME/.local/zig" >> "$GITHUB_PATH"
+        # Recheck the SELECTED executable after installation (T12).
+        "$HOME/.local/zig/zig" version
+        [[ "$("$HOME/.local/zig/zig" version)" == "$ZIG_VERSION" ]] || {
+          echo "zig: installed binary reports the wrong version" >&2
+          exit 1
+        }
+
+    # Linux release legs cross-build through cargo-zigbuild.
+    - name: Install cargo-zigbuild
+      if: ${{ inputs.install-rust == 'true' }}
+      shell: bash
+      env:
+        CARGO_ZIGBUILD_VERSION: ${{ inputs.cargo-zigbuild-version }}
+        CARGO_INSTALL_TARGET_DIR: ${{ inputs.install-target-dir }}
+      run: |
+        set -euo pipefail
+        install_pinned() {
+          cargo install cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION" --locked --target-dir "$CARGO_INSTALL_TARGET_DIR"
+          if [[ -n "${GITHUB_PATH:-}" ]]; then
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          # Recheck the selected executable (T12).
+          "$HOME/.cargo/bin/cargo-zigbuild" --version
+          "$HOME/.cargo/bin/cargo-zigbuild" --version | grep -q "$CARGO_ZIGBUILD_VERSION" || {
+            echo "cargo-zigbuild: installed binary reports the wrong version" >&2
+            exit 1
+          }
+        }
+        if found="$(cargo-zigbuild --version 2>/dev/null)"; then
+          if echo "$found" | grep -q "$CARGO_ZIGBUILD_VERSION"; then
+            echo "cargo-zigbuild already at the pinned version: $(command -v cargo-zigbuild) -> $found"
+          else
+            echo "cargo-zigbuild version mismatch: found '$found', pinned is '$CARGO_ZIGBUILD_VERSION'; installing the pinned version"
+            install_pinned
+          fi
+        else
+          echo "no runnable cargo-zigbuild found; installing pinned $CARGO_ZIGBUILD_VERSION"
+          install_pinned
+        fi
+
+    - name: Install just
+      if: ${{ inputs.install-just == 'true' }}
+      shell: bash
+      env:
+        JUST_VERSION: ${{ inputs.just-version }}
+        CARGO_INSTALL_TARGET_DIR: ${{ inputs.install-target-dir }}
+      run: |
+        set -euo pipefail
+        # Probe by actually running `just`, not `command -v just`: a mise/asdf
+        # shim on PATH satisfies `command -v` but fails at call time with
+        # "No version is set for shim: just" when no version is pinned. If it
+        # does not run, or runs but reports a version other than the pin, install
+        # the pinned just and prepend ~/.cargo/bin so the real binary shadows
+        # any lingering shim for the rest of the job.
+        install_pinned_just() {
+          cargo install just --version "$JUST_VERSION" --locked --target-dir "$CARGO_INSTALL_TARGET_DIR"
+          if [[ -n "${GITHUB_PATH:-}" ]]; then
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          "$HOME/.cargo/bin/just" --version
+        }
+        if found="$(just --version 2>/dev/null)"; then
+          # `just --version` reports "just X.Y.Z"
+          found_version="${found#just }"
+          if [[ "$found_version" == "$JUST_VERSION" ]]; then
+            echo "just already available at pinned version: $(command -v just) -> $found"
+          else
+            echo "just version mismatch: found '$found', pinned is 'just $JUST_VERSION'; installing pinned version"
+            install_pinned_just
+          fi
+        else
+          echo "no runnable just found; installing pinned just $JUST_VERSION"
+          install_pinned_just
+        fi
+
+    - name: Install cargo-deny
+      if: ${{ inputs.install-cargo-deny == 'true' }}
+      shell: bash
+      env:
+        CARGO_DENY_VERSION: ${{ inputs.cargo-deny-version }}
+        CARGO_INSTALL_TARGET_DIR: ${{ inputs.install-target-dir }}
+      run: |
+        set -euo pipefail
+        install_pinned() {
+          cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked --target-dir "$CARGO_INSTALL_TARGET_DIR"
+          if [[ -n "${GITHUB_PATH:-}" ]]; then
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          "$HOME/.cargo/bin/cargo-deny" --version | grep -q "$CARGO_DENY_VERSION" || {
+            echo "cargo-deny: installed binary reports the wrong version" >&2
+            exit 1
+          }
+        }
+        if found="$(cargo-deny --version 2>/dev/null)"; then
+          if echo "$found" | grep -q "$CARGO_DENY_VERSION"; then
+            echo "cargo-deny already at the pinned version: $(command -v cargo-deny) -> $found"
+          else
+            echo "cargo-deny version mismatch: found '$found', pinned is '$CARGO_DENY_VERSION'; installing the pinned version"
+            install_pinned
+          fi
+        else
+          echo "no runnable cargo-deny found; installing pinned $CARGO_DENY_VERSION"
+          install_pinned
+        fi
+
+    - name: Install cargo-audit
+      if: ${{ inputs.install-cargo-audit == 'true' }}
+      shell: bash
+      env:
+        CARGO_AUDIT_VERSION: ${{ inputs.cargo-audit-version }}
+        CARGO_INSTALL_TARGET_DIR: ${{ inputs.install-target-dir }}
+      run: |
+        set -euo pipefail
+        install_pinned() {
+          cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked --target-dir "$CARGO_INSTALL_TARGET_DIR"
+          if [[ -n "${GITHUB_PATH:-}" ]]; then
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          "$HOME/.cargo/bin/cargo-audit" --version | grep -q "$CARGO_AUDIT_VERSION" || {
+            echo "cargo-audit: installed binary reports the wrong version" >&2
+            exit 1
+          }
+        }
+        if found="$(cargo-audit --version 2>/dev/null)"; then
+          if echo "$found" | grep -q "$CARGO_AUDIT_VERSION"; then
+            echo "cargo-audit already at the pinned version: $(command -v cargo-audit) -> $found"
+          else
+            echo "cargo-audit version mismatch: found '$found', pinned is '$CARGO_AUDIT_VERSION'; installing the pinned version"
+            install_pinned
+          fi
+        else
+          echo "no runnable cargo-audit found; installing pinned $CARGO_AUDIT_VERSION"
+          install_pinned
+        fi
