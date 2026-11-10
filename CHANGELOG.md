@@ -38,7 +38,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release pipeline with an OSV security gate, checksums, and minisign
   signatures across a five-leg package matrix.
 
+### Changed
+
+- Updated protocol SDKs and supporting dependencies, retaining ACP protocol
+  v1, stdio and HTTP MCP, and the existing SQLite schema.
+- The operator UI renders work reports as attributed blocks (reporting
+  agent, kind, commit time, relative age, and a copy control), shows each
+  agent's host on the gate menu rows, and matches the two side rails at a
+  shared starting width with per-rail adjustments kept across reloads.
+- Chat blocks, work reports, and system events each carry a copy control
+  that puts the block's text on the clipboard, and agent names in the
+  transcript take stable per-room colours.
+- The cohort's hide-ejected checkbox is a toggle button styled like New
+  Room, and the cohort and conversations sections carry explainer lines.
+
 ### Security
+
+- Updated rmcp to 3.9.0 for the OAuth SSRF and Streamable HTTP response-body
+  fixes (RUSTSEC-2026-0457 and RUSTSEC-2026-0462).
+- Updated bundled SQLite to 3.54.1 for the WAL page-size memory disclosure
+  fix (RUSTSEC-2026-0459), with a runtime engine-version regression test.
+- Repeated UI-token resolution preserves the active token file on Linux,
+  so the hub's listeners continue to accept the same credential.
+- Fence and cancel transactions wait for the SQLite writer before reading
+  state, preventing stale-snapshot lock failures under concurrent writes.
 
 - mTLS with client certificates on the node↔hub coordination link. The
   hub's operator UI rides the same TLS listener with the browser's

@@ -29,6 +29,19 @@
   html, body { height: 100%; }
   body { margin: 0; display: flex; overflow: hidden; }
 
+  /* Quiet scrollbars: the browser's native thumb reads near-white against
+     the dark panels and brightens further on hover — pin it to the border
+     tone in every state. */
+  * { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+  *::-webkit-scrollbar { width: 10px; height: 10px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px;
+    border: 2px solid transparent; background-clip: padding-box; }
+  *::-webkit-scrollbar-thumb:hover,
+  *::-webkit-scrollbar-thumb:active { background: var(--muted);
+    border: 2px solid transparent; background-clip: padding-box; }
+  *::-webkit-scrollbar-corner { background: transparent; }
+
   /* first-frame gate: an opaque, var-free cover that exists in the very
      first paint (before JS or theme) and is removed only when the first
      full render (login card or transcript) is on screen. */
@@ -126,27 +139,32 @@
   }
   h2:first-child { margin-top: 0; }
   .explain { color: var(--faint); font-size: 0.72rem; margin: 0.2rem 0 0.5rem; line-height: 1.4; }
-  .cohort-tools { display: flex; align-items: center; font-size: 0.72rem; color: var(--faint); margin: 0 0 0 auto; }
-  .cohort-tools label { cursor: pointer; display: flex; align-items: center; gap: 0.3rem; }
+
 
   /* ---- conversation strip: room, members, gates ---- */
   #convo-head { border-bottom: 1px solid var(--border); background: var(--panel);
-    padding: 0.5rem 0.9rem 0.45rem; }
+    padding: 0.5rem 0.9rem 0.45rem; position: relative; }
   /* The gates trigger sits inline with the room name, pinned to the right of
      the centre column, and its menu drops from there over the transcript. */
-  .room-line { display: flex; align-items: baseline; gap: 0.5rem; position: relative; }
+  .room-line { display: flex; align-items: center; gap: 0.5rem; padding-right: 3.6rem; }
   .room-name { font-size: 0.95rem; font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
   .room-id { font-family: ui-monospace, monospace; font-size: 0.72rem; color: var(--faint); }
   .room-line #unknown-banner { margin-left: auto; }
   .room-members { margin-top: 0.2rem; font-size: 0.72rem; color: var(--faint); overflow-wrap: anywhere; }
   /* The banner and the gates trigger share the right end of the room line, so
      the trigger is pinned where the menu opens and nothing drifts left. */
-  .room-actions { margin-left: auto; display: flex; align-items: center; gap: 0.5rem; position: relative; }
+  .room-actions { margin-left: auto; display: flex; align-items: center; gap: 0.5rem; }
   #gates-toggle { border: 1px solid var(--border-strong); background: var(--surface);
-    color: var(--muted); border-radius: 6px; padding: 0.02rem 0.4rem; font-size: 0.8rem; cursor: pointer; }
+    color: var(--muted); border-radius: 8px; height: 2.3rem; min-width: 2.5rem;
+    padding: 0 0.55rem; font-size: 1.15rem; line-height: 1; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+    /* Dead-centre of the header strip, out of the text flow: the room name
+       and the members line keep their original layout untouched. */
+    position: absolute; right: 0.9rem; top: 50%; transform: translateY(-50%);
+    margin: 0; }
   #gates-toggle:hover { color: var(--text); border-color: var(--accent); }
   /* The menu floats over the transcript: opening it never reflows the pane. */
-  .gates-menu { position: absolute; top: 100%; right: 0; z-index: 40; margin-top: 0.25rem;
+  .gates-menu { position: absolute; top: 100%; right: 0.9rem; z-index: 40; margin-top: 0.25rem;
     width: min(24rem, 90vw); background: var(--surface); border: 1px solid var(--border-strong);
     border-radius: 8px; box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45); }
   .gates-menu[hidden] { display: none; }
@@ -157,7 +175,9 @@
   .gates-list { max-height: 14rem; overflow-y: auto; padding: 0.2rem; }
   .gate-row { display: flex; align-items: center; gap: 0.25rem; padding: 0.15rem 0.3rem; border-radius: 5px; }
   .gate-row:hover { background: var(--surface-2); }
-  .gate-row .gate-name { margin-right: auto; font-size: 0.76rem; color: var(--text); overflow-wrap: anywhere; }
+  .gate-id { display: flex; flex-direction: column; margin-right: auto; min-width: 0; }
+  .gate-row .gate-name { font-size: 0.76rem; color: var(--text); overflow-wrap: anywhere; }
+  .gate-row .gate-host { color: var(--faint); font-size: 0.68rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .gate-row .peer-btn.on { color: var(--amber); }
   .gate-row .peer-btn.on.block { color: var(--red); }
 
@@ -208,7 +228,7 @@
   .peer-meta { flex: 1 1 100%; display: flex; align-items: center; gap: 0.45rem; min-width: 0; }
   .peer-row .host { min-width: 0; color: var(--faint);
     font-size: 0.7rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .peer-counter { color: var(--faint); font-size: 0.68rem; white-space: nowrap; flex: none; }
+  .peer-counter { color: var(--faint); font-size: 0.68rem; white-space: nowrap; flex: none; margin-left: auto; }
   .peer-status { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; padding: 0.02rem 0.32rem; border-radius: 8px; flex: none; }
   .peer-status.booted { color: var(--amber); border: 1px solid var(--amber); }
   .peer-status.banned { color: var(--red); border: 1px solid var(--red); }
@@ -267,7 +287,15 @@
   .msg .meta { display: flex; align-items: baseline; gap: 0.5rem; margin-bottom: 0.3rem; }
   .msg .sender { font-weight: 600; font-size: 0.85rem; color: var(--accent); }
   .msg .sender.operator { color: #d2a8ff; }
-  .msg .when { font-size: 0.72rem; color: var(--faint); }
+  /* Absolute time joins the sender in the meta line; the relative age is
+     pinned to the block's right edge. */
+  .msg .dt { font-size: 0.72rem; color: var(--faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .msg .when { font-size: 0.72rem; color: var(--faint); margin-left: auto; white-space: nowrap; }
+  /* Copy control: rides the right edge of a block's meta/feed header line. */
+  .copy-btn { background: none; border: none; padding: 0 0.05rem; cursor: pointer;
+    color: var(--faint); font-size: 0.72rem; line-height: 1; }
+  .copy-btn:hover { color: var(--text); }
+  .copy-btn.copied { color: var(--green); }
   .msg .content { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.9rem; }
   .msg .deliveries { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.5rem; align-items: center; }
   .msg .deliveries .label { color: var(--faint); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -306,6 +334,17 @@
   .event .ekind { color: var(--faint); font-weight: 600; margin-right: 0.4rem; }
   .event.turn .ekind { display: block; }
   .event.turn .turn-body { color: var(--text); font-size: 0.85rem; margin-top: 0.15rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* A work report block: kind + commit time on the header line with the
+     copy control pinned right, the report data beneath it. The right
+     padding matches the chat blocks' so the copy controls share one
+     vertical column down the transcript's right edge. */
+  .event.report { padding-right: 0.8rem; }
+  .report-head { display: flex; align-items: baseline; gap: 0.5rem; }
+  .report-head .ekind { margin-right: 0; }
+  .report-head .report-who { font-weight: 600; }
+  .report-head .feed-ts { color: var(--faint); font-size: 0.72rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .report-head .report-age { margin-left: auto; color: var(--faint); font-size: 0.72rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .report-body { color: var(--text); font-size: 0.85rem; margin-top: 0.15rem; white-space: pre-wrap; overflow-wrap: anywhere; }
 
   /* rendered markdown: message bodies and turn output */
   .md p { margin: 0 0 0.5em; }
@@ -319,10 +358,11 @@
   .md a { color: var(--accent); }
   .md hr { border: none; border-top: 1px solid var(--border); margin: 0.6em 0; }
 
-  /* transcript rows: the entry's real time in a left gutter, then the entry */
-  .tx-row { display: grid; grid-template-columns: 7.4rem minmax(0, 1fr); column-gap: 0.6rem; align-items: start; }
-  .tx-row > .ts { padding-top: 0.35rem; text-align: right; white-space: nowrap; font-size: 0.68rem; color: var(--faint); font-variant-numeric: tabular-nums; }
-  .tx-row.msg-row > .ts { padding-top: 1.4rem; }
+  /* Transcript rows span the full column, flush with the composer: the entry's
+     real time lives inside the entry itself — in the message meta line for
+     chat blocks, at the head of authored event lines. */
+  .event .ts { font-size: 0.68rem; color: var(--faint); font-variant-numeric: tabular-nums; white-space: nowrap; margin-right: 0.4rem; }
+  .event.turn .ts { display: block; margin-right: 0; }
   .event.attention { border-left-color: var(--amber); color: #e3b341; }
   .event.failure { border-left-color: var(--red); color: #f08880; }
 
@@ -331,6 +371,13 @@
     border-top: 1px solid var(--border);
     background: var(--panel);
   }
+  /* Draggable dividers between the side columns and the centre. Each rail
+     keeps its own width, bounded and persisted (see initRailResize). */
+  .rail-handle { width: 6px; flex: none; cursor: col-resize; touch-action: none;
+    position: relative; z-index: 10; }
+  .rail-handle::after { content: ""; position: absolute; inset: 0 -4px; }
+  .rail-handle:hover, .rail-handle.dragging { background: var(--border-strong); }
+  body.rail-resizing { user-select: none; cursor: col-resize; }
   #compose-panel .inner { max-width: 52rem; margin: 0 auto; }
   #compose-panel .hint { color: var(--faint); font-size: 0.72rem; }
   /* The composer is one box: the mode tabs sit inside its top edge and the send
@@ -353,7 +400,7 @@
   .seg button.active { background: var(--accent); color: #fff; }
 
   /* ---- right rail ---- */
-  #unknown { width: 19rem; flex: none; border-left: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; overflow: hidden; }
+  #unknown { width: 22rem; flex: none; border-left: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; overflow: hidden; }
   #unknown .empty { color: var(--faint); font-style: italic; font-size: 0.8rem; }
   #unknown-banner {
     background: rgba(248, 81, 73, 0.12);
@@ -369,7 +416,13 @@
   #unknown .attempt .meta { font-size: 0.74rem; color: var(--muted); margin-bottom: 0.35rem; }
   #unknown .attempt .row { display: flex; flex-wrap: wrap; gap: 0.3rem; }
 
-  #events-feed .feed-line .feed-ts { color: var(--faint); margin-right: 0.45rem;
+  #events-feed .feed-line .feed-ts { color: var(--faint);
+    font-variant-numeric: tabular-nums; white-space: nowrap; }
+  /* Each feed line opens with a header row — absolute time left, relative
+     age pinned right — and the event's content sits beneath it, so the left
+     clock column scans cleanly. */
+  #events-feed .feed-line .feed-head { display: flex; align-items: baseline; gap: 0.45rem; }
+  #events-feed .feed-line .feed-age { margin-left: auto; color: var(--faint);
     font-variant-numeric: tabular-nums; white-space: nowrap; }
   #events-feed .feed-line { font-size: 0.72rem; color: var(--muted); padding: 0.12rem 0;
     border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
@@ -448,8 +501,9 @@
   <section class="split-slot">
     <div class="rail-row">
       <h2>cohort</h2>
-      <label class="cohort-tools"><input type="checkbox" id="hide-ejected"> hide ejected</label>
+      <button id="hide-ejected" class="primary rail-action">hide ejected</button>
     </div>
+    <p class="explain">every enrolled agent, its host, and how long it has been in the cohort. ejected peers drop out unless shown.</p>
     <div id="peer-list" class="split-scroll"></div>
   </section>
   <section class="split-slot">
@@ -457,6 +511,7 @@
       <h2>conversations</h2>
       <button id="new-convo-open" class="primary rail-action">New Room</button>
     </div>
+    <p class="explain">the rooms you're in — pick one to open its transcript.</p>
     <div id="convo-list" class="split-scroll"></div>
   </section>
 </aside>
@@ -512,7 +567,13 @@
 </aside>
 <script>
 "use strict";
-let token = localStorage.getItem("wrkspc_token");
+// The operator credential is a server-managed HttpOnly cookie: the
+// page never stores or reads it. The generation counter tracks LOGIN
+// ATTEMPTS instead — every request captures the generation at send
+// time, and only a 401 that still belongs to the current generation
+// may reset the UI to the login card. An older request's late 401
+// must never wipe a newer valid login.
+let authGeneration = 0;
 let selected = null;
 // The conversation whose name is being edited inline. While set, renders are
 // skipped so a poll cannot replace the input mid-edit.
@@ -674,14 +735,23 @@ function invalidate(key) {
 }
 
 async function api(path, options = {}) {
-  const opts = { headers: { ...(options.headers || {}) }, ...options };
-  if (token) opts.headers["Authorization"] = "Bearer " + token;
-  const res = await fetch(path, opts);
+  // The login cookie rides every same-origin fetch; no credential is
+  // ever attached from page memory.
+  const sentGeneration = authGeneration;
+  const res = await fetch(path, options);
   if (res.status === 401) {
-    token = null;
-    localStorage.removeItem("wrkspc_token");
-    showLogin();
-    throw new Error("unauthorized");
+    // A stale 401 (a request begun before the current login attempt)
+    // must not yank the UI back to the login card: only a rejection
+    // of the CURRENT generation may do that. The server never clears
+    // the cookie on a 401, so the cookie itself is untouched either
+    // way.
+    if (sentGeneration === authGeneration) {
+      authGeneration += 1;
+      showLogin();
+    }
+    const error = new Error("unauthorized");
+    error.auth = true; // a genuine rejection of the current session
+    throw error;
   }
   if (!res.ok) {
     let detail = "";
@@ -1246,6 +1316,45 @@ function peerLabel(id) {
   return p && p.alias ? p.alias : id;
 }
 
+// A legible-on-dark palette for agent names in the centre column. An agent
+// keeps its colour across refreshes within a room: assignment is a stable
+// hash of the peer id with collision resolution over the room's agent set
+// in sorted order — no randomness, no per-load reshuffling. The operator
+// keeps its own violet, so palette entries close to it are excluded. If a
+// room somehow has more agents than palette entries, the overflow falls
+// back to a golden-angle hue rotation (still deterministic, never repeats).
+const AGENT_COLORS = [
+  "#8ab4ff", "#8ee8a0", "#f28bb0", "#ffc76e", "#7fdfd8",
+  "#ff9d8a", "#b5e86f", "#ffd97a", "#8fe3c8", "#f4b48c",
+  "#9fd4ff", "#e8a9e0", "#f8a07a", "#c3e88d", "#8ad7f0",
+  "#f5b7d0", "#a5e8b0", "#ffc9a3", "#74c7e8", "#eac48a",
+];
+
+function colorForAgents(ids) {
+  const out = new Map();
+  const used = new Set();
+  for (const id of ids) {
+    let hashValue = 0;
+    for (let i = 0; i < id.length; i++) hashValue = (hashValue * 31 + id.charCodeAt(i)) | 0;
+    const primary = Math.abs(hashValue) % AGENT_COLORS.length;
+    let free = -1;
+    for (let step = 0; step < AGENT_COLORS.length; step++) {
+      const candidate = (primary + step) % AGENT_COLORS.length;
+      if (!used.has(candidate)) { free = candidate; break; }
+    }
+    if (free !== -1) {
+      used.add(free);
+      out.set(id, AGENT_COLORS[free]);
+    } else {
+      // Palette exhausted in a very large room: golden-angle hue, stable
+      // per agent, and the probe loop above can never wrap forever.
+      const hue = (Math.abs(hashValue) * 137.508) % 360;
+      out.set(id, "hsl(" + hue.toFixed(1) + ", 62%, 74%)");
+    }
+  }
+  return out;
+}
+
 /* ---- conversation-creation modal ---- */
 let pickedPeers = new Set();
 
@@ -1614,18 +1723,27 @@ function resetFollow() {
 }
 
 function appendRow(transcript, entry, createdAt) {
-  const row = document.createElement("div");
-  row.className = entry.classList.contains("msg") ? "tx-row msg-row" : "tx-row";
-  const time = row.appendChild(document.createElement("time"));
-  time.className = "ts";
+  const time = document.createElement("time");
   const at = new Date(String(createdAt ?? "").replace(/(\.\d{3})\d+/, "$1"));
   if (!Number.isNaN(at.getTime())) {
     time.dateTime = at.toISOString();
     time.textContent = TIME_SHORT.format(at);
     time.title = TIME_FULL.format(at);
   }
-  row.appendChild(entry);
-  transcript.appendChild(row);
+  if (entry.classList.contains("msg")) {
+    // Chat blocks span the full column: the absolute time sits in the meta
+    // line between the agent name and the pinned elapsed age.
+    time.className = "dt";
+    const when = entry.querySelector(".meta .when");
+    (when ? when.parentNode : entry).insertBefore(time, when);
+  } else if (!entry.classList.contains("report")) {
+    // Authored event lines head with their time instead of a gutter stamp.
+    // Work-report blocks carry their own time inside the header line, so
+    // they opt out with the "report" class.
+    time.className = "ts";
+    entry.insertBefore(time, entry.firstChild);
+  }
+  transcript.appendChild(entry);
 }
 
 /* ---- conversation view ---- */
@@ -1681,6 +1799,49 @@ function feedStamp(iso) {
     node.title = TIME_FULL.format(at);
   }
   return node;
+}
+
+// A feed line's header row: the absolute commit time on the left, the
+// relative age pinned right, and a copy control that captures the line's
+// text. The event's content renders beneath the header.
+//
+// # Arguments
+//
+// * `iso` — the event's commit time (RFC 3339).
+// * `copyText` — what the line's copy control puts on the clipboard.
+//
+// # Returns
+//
+// The header `<div>`, carrying both time readings and the copy control.
+function feedHead(iso, copyText) {
+  const head = document.createElement("div");
+  head.className = "feed-head";
+  const ago = document.createElement("span");
+  ago.className = "feed-age";
+  ago.textContent = age(iso);
+  head.append(feedStamp(iso), ago);
+  if (copyText) head.appendChild(copyButton(() => copyText));
+  return head;
+}
+
+// A small clipboard control: copies `getText()` on click and flashes a
+// checkmark briefly so the copy registers without any toast plumbing.
+function copyButton(getText) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "copy-btn";
+  button.textContent = "⧉";
+  button.title = "copy to clipboard";
+  button.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(getText());
+      button.classList.add("copied");
+      button.textContent = "✓";
+      setTimeout(() => { button.classList.remove("copied"); button.textContent = "⧉"; }, 1200);
+    } catch { /* clipboard refused — leave the button alone */ }
+  });
+  return button;
 }
 
 function eventSummary(e) {
@@ -1747,13 +1908,15 @@ function renderEventFeed(events) {
         if (known) {
           known.state = state;
           if (peer) known.peer = peer;
-          known.node.replaceChildren(feedStamp(e.created_at),
+          known.node.replaceChildren(feedHead(e.created_at,
+            "delivery · " + known.peer + " · " + state),
             document.createTextNode("delivery · " + known.peer + " · " + state));
           continue;
         }
         const line = document.createElement("div");
         line.className = "feed-line";
-        line.replaceChildren(feedStamp(e.created_at),
+        line.replaceChildren(feedHead(e.created_at,
+          "delivery · " + (peer || "?") + " · " + state),
           document.createTextNode("delivery · " + (peer || "?") + " · " + state));
         lines.set(key, { peer: peer || "?", state, node: line });
         rows.push({ seq: e.seq, node: line });
@@ -1765,7 +1928,7 @@ function renderEventFeed(events) {
       const kind = document.createElement("span");
       kind.className = "ekind";
       kind.textContent = e.kind;
-      line.appendChild(feedStamp(e.created_at));
+      line.appendChild(feedHead(e.created_at, e.kind + " " + s.text));
       line.appendChild(kind);
       line.appendChild(document.createTextNode(s.text));
       rows.push({ seq: e.seq, node: line });
@@ -1833,7 +1996,8 @@ async function renderAll() {
   // rebuilding every authored row (UI-20).
   const authoredSeq = transcriptEvents
     .filter((e) => e.kind === "turn.chunk" || e.kind === "dispatch.started" || AUTHORED_EVENTS.has(e.kind))
-    .map((e) => e.seq + ":" + e.kind + ":" + (e.payload.attempt_id || ""))
+    .map((e) => e.seq + ":" + e.kind + ":" + (e.payload.attempt_id || "")
+      + (e.kind === "work.report" ? ":" + (e.payload.peer_id || "") + ":" + (e.payload.summary || "") : ""))
     .join(",");
   renderIfChanged("transcript", hash(JSON.stringify(messages) + "#" + authoredSeq), () => {
     const scroll = el("transcript-scroll");
@@ -1844,6 +2008,18 @@ async function renderAll() {
     // output, and work reports — so a report lands beside the message it
     // answers. Hub narration goes to the right-hand feed rather than splitting
     // this column into "everything said" followed by "everything that happened".
+    // Each agent's name carries a stable per-room colour.
+    const agentsInView = new Set();
+    for (const m of messages) if (m.sender_id !== "operator") agentsInView.add(m.sender_id);
+    for (const e of transcriptEvents) {
+      if (e.kind === "dispatch.started" && e.payload.recipient_id && e.payload.recipient_id !== "operator") {
+        agentsInView.add(e.payload.recipient_id);
+      }
+      if (e.kind === "work.report" && e.payload.peer_id && e.payload.peer_id !== "operator") {
+        agentsInView.add(e.payload.peer_id);
+      }
+    }
+    const palette = colorForAgents([...agentsInView].sort());
     const rows = []; // { at: ms, ord: number, when: string, node: Element }
     for (const m of messages) {
       const box = document.createElement("div");
@@ -1853,10 +2029,12 @@ async function renderAll() {
       const sender = document.createElement("span");
       sender.className = "sender" + (m.sender_id === "operator" ? " operator" : "");
       sender.textContent = peerLabel(m.sender_id);
+      if (m.sender_id !== "operator") sender.style.color = palette.get(m.sender_id) || "";
       const when = document.createElement("span");
       when.className = "when";
       when.textContent = age(m.created_at);
       meta.appendChild(sender); meta.appendChild(when);
+      meta.appendChild(copyButton(() => m.content));
       box.appendChild(meta);
       const content = document.createElement("div");
       content.className = "content md";
@@ -1942,7 +2120,44 @@ async function renderAll() {
       }
       const s = eventSummary(e);
       const line = document.createElement("div");
-      line.className = "event" + (s.cls ? " " + s.cls : "");
+      line.className = "event report" + (s.cls ? " " + s.cls : "");
+      if (e.kind === "work.report") {
+        // A work report reads as its own block: the reporting agent leads,
+        // in its room colour, followed by the kind label and the commit
+        // time on the header line, the copy control pinned right, and the
+        // report data beneath.
+        const head = document.createElement("div");
+        head.className = "report-head";
+        const kind = document.createElement("span");
+        kind.className = "ekind";
+        kind.textContent = e.kind;
+        const reporter = p.peer_id ? peerLabel(String(p.peer_id)) : "";
+        if (reporter) {
+          const who = document.createElement("span");
+          who.className = "report-who";
+          who.textContent = reporter;
+          if (p.peer_id !== "operator") who.style.color = palette.get(String(p.peer_id)) || "";
+          head.appendChild(who);
+          const sep = document.createElement("span");
+          sep.className = "ekind";
+          sep.textContent = " · ";
+          head.appendChild(sep);
+        }
+        head.appendChild(kind);
+        const body = document.createElement("div");
+        body.className = "report-body";
+        body.textContent = "work report: " + (p.summary || "");
+        const ago = document.createElement("span");
+        ago.className = "report-age";
+        ago.textContent = age(e.created_at);
+        head.append(feedStamp(e.created_at), ago);
+        head.appendChild(copyButton(() =>
+          (reporter ? reporter + " · " : "") + "work.report"
+          + " " + (e.created_at || "") + "\n" + body.textContent));
+        line.append(head, body);
+        rows.push({ at: stampOf(e.created_at), ord: e.seq, when: e.created_at, node: line });
+        continue;
+      }
       const kind = document.createElement("span");
       kind.className = "ekind";
       kind.textContent = e.kind;
@@ -1970,7 +2185,14 @@ async function renderAll() {
     }
     for (const [attemptId, turn] of turns) {
       const agent = agents.get(attemptId);
-      turn.kind.textContent = "turn output" + (agent ? " · " + agent : "");
+      turn.kind.textContent = "turn output";
+      if (agent) {
+        const who = document.createElement("span");
+        who.className = "turn-who";
+        who.textContent = " · " + agent;
+        who.style.color = palette.get(agent) || "";
+        turn.kind.appendChild(who);
+      }
       turn.body.appendChild(renderMarkdown(turn.parts.join("")));
     }
     restoreScroll(scroll, before);
@@ -1983,17 +2205,36 @@ async function renderAll() {
   const gateable = members.filter((peer) => peer !== "operator");
   roomMembers = gateable;
   roomFences = fences;
-  renderIfChanged("gates", hash(JSON.stringify(gateable) + JSON.stringify(fences) + selected), () => {
+  renderIfChanged("gates", hash(JSON.stringify(gateable) + JSON.stringify(fences)
+    + JSON.stringify(gateable.map((p) => {
+      const entry = (rosterEntries || []).find((x) => x.peer_id === p);
+      return entry ? entry.host_id : "";
+    })) + selected), () => {
     const list = el("gates-list");
     clear(list);
     for (const peer of gateable) {
       const row = document.createElement("div");
       row.className = "gate-row";
+      // Name over the host, in the cohort list's subdued two-line idiom, so
+      // the gate rows read like mini peer blocks. The actions stay pinned
+      // right as the row's dominant element.
+      const id = document.createElement("span");
+      id.className = "gate-id";
       const name = document.createElement("span");
       name.className = "gate-name";
       name.textContent = peerLabel(peer);
       name.title = peer;
-      row.appendChild(name);
+      id.appendChild(name);
+      const entry = (rosterEntries || []).find((x) => x.peer_id === peer);
+      const hostId = String(entry && entry.host_id ? entry.host_id : "").replace(/\.mtls\.devlocal\.home\.arpa$/, "");
+      if (hostId) {
+        const host = document.createElement("span");
+        host.className = "gate-host";
+        host.textContent = hostId;
+        host.title = hostId;
+        id.appendChild(host);
+      }
+      row.appendChild(id);
       for (const kind of ["pause", "block"]) {
         const fence = fences.find((f) => f.peer_id === peer && f.kind === kind);
         const label = kind === "pause" ? "⏸" : "⛔";
@@ -2182,11 +2423,16 @@ el("compose-text").addEventListener("input", refreshComposeHint);
 el("compose-mode-msg").onclick = () => setComposeMode("message");
 el("compose-mode-guidance").onclick = () => setComposeMode("guidance");
 el("new-convo-open").onclick = openConversationModal;
-el("hide-ejected").onchange = (e) => { hideEjected = e.target.checked; loadPeers(); };
+el("hide-ejected").onclick = () => {
+  hideEjected = !hideEjected;
+  el("hide-ejected").textContent = hideEjected ? "show ejected" : "hide ejected";
+  loadPeers();
+};
 el("modal-cancel").onclick = closeConversationModal;
 el("modal-create").onclick = createConversation;
 
 setInterval(async () => {
+  if (!el("boot").hidden) return; // nothing to refresh behind the login card
   try {
     await loadConversations();
     await loadModeration();
@@ -2220,14 +2466,30 @@ async function bestConversation(conversations) {
   return best || conversations[conversations.length - 1] || null;
 }
 
-(async function boot() {
-  if (token) {
-    el("boot").classList.add("connecting");
-    try { await startApp(); } catch { showLogin(); }
-  } else {
+// Boot is invoked at the END of this script: it reads
+// `appWired` and `connecting`, which are declared below, so a
+// remembered session must never bootstrap into a temporal dead zone.
+async function boot() {
+  // Remembered login is the server-managed cookie: just try the API.
+  // A 401 (no cookie, or a cookie the server no longer accepts) lands
+  // on the login card.
+  el("boot").classList.add("connecting");
+  try {
+    await startApp();
+  } catch (error) {
     showLogin();
+    if (error.auth) {
+      // Neutral and honest for both a fresh browser and a rejected
+      // remembered session: the page cannot read the HttpOnly cookie,
+      // so it cannot tell which case this was.
+      el("login-error").textContent = "log in to continue";
+    } else {
+      // A non-auth startup failure: say what actually failed, and let
+      // a reload or a manual login recover.
+      el("login-error").textContent = "could not start — " + error.message + " · reload to retry, or log in again";
+    }
   }
-})();
+}
 
 function showLogin() {
   dropGate();
@@ -2253,18 +2515,148 @@ async function connectWith(value) {
   connecting = true;
   el("login-error").textContent = "";
   el("boot").classList.add("connecting");
-  token = candidate;
+  authGeneration += 1;
+  // Verification first: the credential goes to the server, which
+  // remembers it as an HttpOnly cookie. The page never stores it.
   try {
-    await api("/api/conversations");
-    localStorage.setItem("wrkspc_token", token);
-    await startApp();
-  } catch (e) {
-    token = null;
+    const res = await fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: candidate }),
+    });
+    if (res.status === 401) {
+      el("boot").classList.remove("connecting");
+      el("login-error").textContent = "rejected — check the token";
+      connecting = false;
+      return;
+    }
+    if (!res.ok) {
+      el("boot").classList.remove("connecting");
+      el("login-error").textContent =
+        "could not verify the credential — " + res.status + " · try again";
+      connecting = false;
+      return;
+    }
+  } catch (error) {
+    // A transport failure: the credential was neither accepted nor
+    // rejected — say so, and leave the candidate in the input for the
+    // retry.
     el("boot").classList.remove("connecting");
-    el("login-error").textContent = "rejected — check the token";
-  } finally {
+    el("login-error").textContent =
+      "could not verify the credential — " + error.message + " · try again";
     connecting = false;
+    return;
   }
+  // Startup runs separately from verification: an accepted credential
+  // must survive a network/render failure, and only a genuine
+  // current-session rejection may discard it.
+  try {
+    await startApp();
+  } catch (error) {
+    if (error.auth) {
+      el("login-error").textContent = "rejected — check the token";
+    } else {
+      el("boot").classList.remove("connecting");
+      el("boot").hidden = false;
+      el("login-error").textContent =
+        "connected, but the app could not start — " + error.message + " · connect again to retry";
+    }
+  }
+  connecting = false;
+}
+
+// ---- resizable side rails ----
+// Both side columns START at the same width — the left column's — and each
+// stays independently adjustable within bounds; each column's choice
+// persists across refreshes.
+
+const RAIL_MIN_REM = 14;
+const RAIL_MAX_REM = 32;
+const RAIL_DEFAULT_REM = 22; // the left column's width
+const LEFT_RAIL_KEY = "wrkspc-ui.left-rail.v3";
+const RIGHT_RAIL_KEY = "wrkspc-ui.right-rail.v3";
+
+// Clamps a pixel width into the rail bounds. The upper bound also never
+// exceeds 40% of the viewport, so the centre column keeps breathing room
+// however wide the window.
+function clampRailPx(px) {
+  const floor = RAIL_MIN_REM * 16;
+  const ceiling = Math.max(floor, Math.min(RAIL_MAX_REM * 16, window.innerWidth * 0.4));
+  return Math.min(ceiling, Math.max(floor, px));
+}
+
+function railWidthCss(key) {
+  const saved = Number(localStorage.getItem(key));
+  if (Number.isFinite(saved) && saved > 0) {
+    return clampRailPx(saved * 16) / 16 + "rem";
+  }
+  return RAIL_DEFAULT_REM + "rem";
+}
+
+function applyRailWidths() {
+  // Widths saved by earlier column builds (independent, shared, or the v2
+  // pair) are superseded: the two rails always START MATCHED. A v2-era
+  // left-rail width carries over to BOTH sides — that keeps the left
+  // column at the width the operator last chose for it — and everything
+  // else starts at the shared default, the left column's width.
+  localStorage.removeItem("wrkspc-ui.rail-width");
+  localStorage.removeItem("wrkspc-ui.left-rail");
+  localStorage.removeItem("wrkspc-ui.right-rail");
+  const v2Left = Number(localStorage.getItem("wrkspc-ui.left-rail.v2"));
+  localStorage.removeItem("wrkspc-ui.left-rail.v2");
+  localStorage.removeItem("wrkspc-ui.right-rail.v2");
+  if (Number.isFinite(v2Left) && v2Left > 0 && localStorage.getItem(LEFT_RAIL_KEY) === null) {
+    localStorage.setItem(LEFT_RAIL_KEY, String(v2Left));
+    localStorage.setItem(RIGHT_RAIL_KEY, String(v2Left));
+  }
+  el("conversations").style.width = railWidthCss(LEFT_RAIL_KEY);
+  el("unknown").style.width = railWidthCss(RIGHT_RAIL_KEY);
+}
+
+// Wires one divider; dragging it resizes ONLY its own column — the left
+// handle widens by dragging right, the right handle by dragging left. The
+// centre panel absorbs the difference.
+function wireRailHandle(handle, aside, key) {
+  let dragging = false;
+  let startX = 0;
+  let startWidth = 0;
+  handle.addEventListener("pointerdown", (event) => {
+    dragging = true;
+    startX = event.clientX;
+    startWidth = aside.getBoundingClientRect().width;
+    handle.classList.add("dragging");
+    document.body.classList.add("rail-resizing");
+    try { handle.setPointerCapture(event.pointerId); } catch { /* not fatal */ }
+    event.preventDefault();
+  });
+  handle.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    const direction = aside.id === "conversations" ? 1 : -1;
+    aside.style.width = clampRailPx(startWidth + direction * (event.clientX - startX)) + "px";
+  });
+  const done = () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove("dragging");
+    document.body.classList.remove("rail-resizing");
+    localStorage.setItem(key, String(parseFloat(aside.style.width) / 16));
+  };
+  handle.addEventListener("pointerup", done);
+  handle.addEventListener("pointercancel", done);
+}
+
+function initRailResize() {
+  applyRailWidths();
+  const leftHandle = document.createElement("div");
+  leftHandle.className = "rail-handle";
+  leftHandle.title = "drag to resize the left column";
+  const rightHandle = document.createElement("div");
+  rightHandle.className = "rail-handle";
+  rightHandle.title = "drag to resize the right column";
+  el("conversations").after(leftHandle);
+  el("unknown").before(rightHandle);
+  wireRailHandle(leftHandle, el("conversations"), LEFT_RAIL_KEY);
+  wireRailHandle(rightHandle, el("unknown"), RIGHT_RAIL_KEY);
 }
 
 // One-time DOM wiring runs exactly once (UI-13): a reconnect without a
@@ -2275,6 +2667,7 @@ let appWired = false;
 async function startApp() {
   if (!appWired) {
     appWired = true;
+    initRailResize();
     installTooltips();
     startCounterTicker();
     document.addEventListener("click", (event) => {
@@ -2313,6 +2706,9 @@ el("login-submit").onclick = () => connectWith(el("login-token").value);
 el("login-token").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter") connectWith(el("login-token").value);
 });
+// Boot LAST: every declaration it reads — appWired,
+// connecting, the wiring above — is initialized by this point.
+boot();
 </script>
 </body>
 </html>
