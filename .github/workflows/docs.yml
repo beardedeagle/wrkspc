@@ -83,3 +83,38 @@ jobs:
 
       - name: just docs
         run: just docs
+
+      # The book is a static site, so pushes to main (and manual runs)
+      # publish it to GitHub Pages; pull requests only verify the build.
+      # configure-pages' enablement also repairs the Pages site config if
+      # it is ever reset, so publication self-heals on the next run.
+      - name: Configure Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+        with:
+          enablement: true
+
+      - name: Upload pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: docs/book
+
+  # The deployment is atomic: it only ever publishes a completed build's
+  # artifact, and the workflow-level concurrency means a superseded build
+  # never deploys a half-written book.
+  deploy:
+    name: Deploy book
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
