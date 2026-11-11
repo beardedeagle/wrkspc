@@ -14,6 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BEGIN IMMEDIATE` transactions instead of deferred ones, eliminating
   the SQLITE_BUSY deadlock that could fail an operator ban racing a
   concurrent presence write.
+- The release pipeline's macOS packaging leg no longer passes the
+  invalid `native` target to the toolchain installer (a pseudo-ternary
+  whose empty true arm fell through to the fallback).
+
+### Changed
+
+- Release builds consume only freshly fetched, pinned inputs — cache
+  restoration is removed from the pipeline — and run under minimal
+  job-scoped permissions instead of workflow-wide `contents: write`.
+- Release signing sits behind a protected `release-signing`
+  environment: the minisign key and password only mount into the
+  sign+publish job after the operator's explicit approval. Tarball
+  verification instructions live in `DISTRIBUTION.md`, and a zizmor
+  workflow-audit job guards the Actions definitions.
 
 ## [0.1.0] - 2026-11-10
 

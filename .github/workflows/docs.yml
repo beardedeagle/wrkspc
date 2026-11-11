@@ -61,7 +61,7 @@ jobs:
             ${{ runner.os }}-book-target-
 
       - name: Setup Rust and just
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
 
 

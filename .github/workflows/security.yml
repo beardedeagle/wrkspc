@@ -42,7 +42,7 @@ jobs:
             ${{ runner.os }}-scan-target-
 
       - name: Setup Rust and just
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
         with:
           install-cargo-deny: "true"
           install-cargo-audit: "true"

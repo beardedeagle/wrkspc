@@ -14,8 +14,10 @@ on:
         required: true
         default: ""
 
-permissions:
-  contents: write
+# No workflow-wide privileges: gate and package jobs need nothing, and the
+# release job alone receives contents: write for the GitHub Release publish
+# (the container job's narrower grants are declared on it).
+permissions: {}
 
 jobs:
   gate:
@@ -23,29 +25,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      # The caches restore BEFORE setup-rust: its version probes must
-      # run against the restored pinned tools. Hand-rolled cargo cache
-      # (the two-step split); official SHA-pinned actions only.
-      - name: Cache Cargo registry and tools
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+          persist-credentials: false
 
-      - name: Cache Cargo target
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
-        with:
-          path: target
-          key: ${{ runner.os }}-gate-target-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'Justfile', 'rust-toolchain.toml', '.github/workflows/release.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-gate-target-
-
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
         with:
           install-cargo-deny: "true"
           install-cargo-audit: "true"
@@ -76,35 +59,20 @@ jobs:
             target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      # The caches restore BEFORE setup-rust: its version probes must
-      # run against the restored pinned tools. Hand-rolled cargo cache
-      # (the two-step split); official SHA-pinned actions only.
-      - name: Cache Cargo registry and tools
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+          persist-credentials: false
 
-      - name: Cache Cargo target
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
-        with:
-          path: target
-          key: ${{ runner.os }}-package-${{ matrix.name }}-target-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'Justfile', 'rust-toolchain.toml', '.github/workflows/release.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-package-${{ matrix.name }}-target-
-
-      - uses: ./.github/actions/setup-rust
+      # No caches in the release pipeline: a release build must consume
+      # only freshly fetched, pinned inputs — restored cache entries are a
+      # poisoning path straight into the published binaries.
+      - uses: $/.github/actions/setup-rust
         with:
           # Linux legs cross-build: their target's std must be installed
           # (the toolchain file only self-installs x86_64-unknown-linux-gnu),
           # and the zig/cargo-zigbuild provisioning in the action covers the
-          # `just release-tarball` zigbuild call.
-          targets: ${{ matrix.target == 'native' && '' || matrix.target }}
+          # `just release-tarball` zigbuild call. The native leg passes an
+          # empty target list; the true arm here is never falsy.
+          targets: ${{ matrix.target != 'native' && matrix.target || '' }}
 
       - name: build + tarball
         run: just release-tarball ${{ matrix.target }}
@@ -125,9 +93,19 @@ jobs:
     name: sign + publish
     needs: package
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    # The signing material never mounts into an un-approved run: this job
+    # waits on the operator's approval for the protected environment before
+    # it can read MINISIGN_KEY / MINISIGN_PASSWORD. Approval gates WHEN the
+    # key is exposed, not what approved code does with it.
+    environment:
+      name: release-signing
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: ./.github/actions/setup-rust
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup-rust
       # v8.0.2
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -139,6 +117,11 @@ jobs:
       - name: minisign signatures (when key is configured)
         env:
           MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+          # minisign reads the password for an encrypted key from
+          # MINISIGN_PASSWORD natively, so signing needs no TTY. An
+          # encrypted key without its password fails the job loudly —
+          # it never silently publishes unsigned.
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           set -euo pipefail
           if [[ -z "${MINISIGN_KEY:-}" ]]; then
@@ -154,15 +137,14 @@ jobs:
       - name: publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        # The version is a maintainer-pushed tag or a workflow_dispatch
-        # input (write-access-only), never an untrusted event payload;
-        # release-publish still shape-checks it before touching the shell.
-        # github.sha anchors the release to the exact commit the packaged
-        # binaries were built from (T11).
+          RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }} # zizmor: ignore[unsound-ternary]
+          # github.sha anchors the release to the exact commit the
+          # packaged binaries were built from (T11).
+          RELEASE_SHA: ${{ github.sha }}
         run: >-
           just release-publish
-          ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
-          ${{ github.sha }}
+          "$RELEASE_VERSION"
+          "$RELEASE_SHA"
 
   container:
     name: container image (ghcr)
@@ -175,9 +157,11 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       # just only — the image wraps the prebuilt tarball binaries, so
       # this job needs no Rust toolchain.
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
         with:
           install-rust: "false"
       # v8.0.2
@@ -186,12 +170,10 @@ jobs:
           pattern: wrkspc-linux-*
           path: dist
           merge-multiple: true
-      # The version is a maintainer-pushed tag or a workflow_dispatch
-      # input (write-access-only), never an untrusted event payload;
-      # publish-image.sh still shape-checks it before touching the shell.
       # GITHUB_TOKEN is not exported by Actions by default; the publish
       # script requires it for the GHCR login.
       - name: publish image to ghcr
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: just release-image ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
+          IMAGE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }} # zizmor: ignore[unsound-ternary]
+        run: just release-image "$IMAGE_VERSION"

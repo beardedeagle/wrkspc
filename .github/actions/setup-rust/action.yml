@@ -49,6 +49,11 @@ inputs:
 
 runs:
   using: composite
+  # The GITHUB_PATH writes below are literal trusted paths (zizmor:
+  # ignore[github-env]): this action only runs in push/PR-triggered
+  # workflows of this repository — never attacker-triggered ones — the
+  # zig directory is sha256-verified before install, and the
+  # cargo-installed tools are version-probed after install.
   steps:
     # Installs the toolchain and components pinned in rust-toolchain.toml.
     - name: Install pinned Rust toolchain
@@ -56,7 +61,7 @@ runs:
       shell: bash
       env:
         RUST_TARGETS: ${{ inputs.targets }}
-      run: |
+      run: | # zizmor: ignore[github-env]
         set -euo pipefail
         if ! command -v rustup >/dev/null 2>&1; then
           echo "rustup must be preinstalled; refusing to run an unpinned remote installer" >&2
@@ -79,7 +84,7 @@ runs:
       shell: bash
       env:
         ZIG_VERSION: ${{ inputs.zig-version }}
-      run: |
+      run: | # zizmor: ignore[github-env]
         set -euo pipefail
         # Probe by RUNNING the binary, not `command -v` (T12): an
         # ambient copy of any other version must not win silently.
@@ -141,7 +146,7 @@ runs:
       env:
         CARGO_ZIGBUILD_VERSION: ${{ inputs.cargo-zigbuild-version }}
         CARGO_INSTALL_TARGET_DIR: ${{ inputs.install-target-dir }}
-      run: |
+      run: | # zizmor: ignore[github-env]
         set -euo pipefail
         install_pinned() {
           cargo install cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION" --locked --target-dir "$CARGO_INSTALL_TARGET_DIR"
@@ -173,7 +178,7 @@ runs:
       env:
         JUST_VERSION: ${{ inputs.just-version }}
         CARGO_INSTALL_TARGET_DIR: ${{ inputs.install-target-dir }}
-      run: |
+      run: | # zizmor: ignore[github-env]
         set -euo pipefail
         # Probe by actually running `just`, not `command -v just`: a mise/asdf
         # shim on PATH satisfies `command -v` but fails at call time with
@@ -208,7 +213,7 @@ runs:
       env:
         CARGO_DENY_VERSION: ${{ inputs.cargo-deny-version }}
         CARGO_INSTALL_TARGET_DIR: ${{ inputs.install-target-dir }}
-      run: |
+      run: | # zizmor: ignore[github-env]
         set -euo pipefail
         install_pinned() {
           cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked --target-dir "$CARGO_INSTALL_TARGET_DIR"
@@ -238,7 +243,7 @@ runs:
       env:
         CARGO_AUDIT_VERSION: ${{ inputs.cargo-audit-version }}
         CARGO_INSTALL_TARGET_DIR: ${{ inputs.install-target-dir }}
-      run: |
+      run: | # zizmor: ignore[github-env]
         set -euo pipefail
         install_pinned() {
           cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked --target-dir "$CARGO_INSTALL_TARGET_DIR"

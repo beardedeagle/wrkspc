@@ -1,0 +1,48 @@
+name: Workflow Security
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - ".github/workflows/workflow-security.yml"
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - ".github/workflows/workflow-security.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: workflow-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  zizmor:
+    name: zizmor workflow audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      # Official tool, run as a plain binary (no third-party action), pinned
+      # by exact artifact digest — the same pattern the OSV audit uses.
+      - name: Install zizmor (pinned)
+        env:
+          ZIZMOR_VERSION: v1.32.0
+          ZIZMOR_SHA256: bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/zizmorcore/zizmor/releases/download/${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz" -o /tmp/zizmor.tar.gz
+          echo "${ZIZMOR_SHA256}  /tmp/zizmor.tar.gz" | sha256sum -c -
+          mkdir -p /tmp/zizmor-extract
+          tar -xzf /tmp/zizmor.tar.gz -C /tmp/zizmor-extract
+
+      - name: Audit workflows
+        run: /tmp/zizmor-extract/zizmor .github/workflows .github/actions

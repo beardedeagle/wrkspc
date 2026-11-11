@@ -51,7 +51,7 @@ jobs:
             ${{ runner.os }}-ci-rust-target-
 
       - name: Setup Rust and just
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: just ci-rust
         run: just ci-rust
