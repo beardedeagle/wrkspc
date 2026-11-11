@@ -485,11 +485,13 @@ release-sign:
 # packaged binaries were built from — the release is anchored to IT,
 # never to the default branch's head (T11): a dispatch that raced new
 # commits must not tag them.
-release-publish:
+release-publish version sha:
     #!/usr/bin/env bash
     set -euo pipefail
-    VERSION="${1:-}"
-    SHA="${2:-}"
+    # just interpolates declared parameters into the recipe text; it does
+    # not forward positionals to shebang scripts (verified on just 1.57).
+    VERSION="{{ version }}"
+    SHA="{{ sha }}"
     [[ "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
         echo "release-publish: invalid version '$VERSION' (want X.Y.Z, optional v prefix)" >&2
         exit 1
