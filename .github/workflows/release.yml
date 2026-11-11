@@ -40,6 +40,11 @@ jobs:
     name: package (${{ matrix.name }})
     needs: gate
     runs-on: ${{ matrix.os }}
+    permissions:
+      # Attestations bind each tarball to this workflow run and commit
+      # over the ambient OIDC identity — keyless: no long-lived secrets.
+      attestations: write
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -88,17 +93,26 @@ jobs:
             dist/wrkspc-*.tar.gz
             dist/SHA256SUMS-*
           if-no-files-found: error
+      # v2 — the release's integrity signature: Sigstore attestations
+      # over each tarball's digest, issued to this workflow's OIDC
+      # identity. No long-lived signing key exists anywhere.
+      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45
+        with:
+          subject-path: |
+            dist/wrkspc-*.tar.gz
+            dist/SHA256SUMS-*
 
   release:
-    name: sign + publish
+    name: publish
     needs: package
     runs-on: ubuntu-24.04
     permissions:
       contents: write
-    # The signing material never mounts into an un-approved run: this job
-    # waits on the operator's approval for the protected environment before
-    # it can read MINISIGN_KEY / MINISIGN_PASSWORD. Approval gates WHEN the
-    # key is exposed, not what approved code does with it.
+    # The publish waits on the operator's approval for the protected
+    # environment: a GitHub Release is a write-only privileged action,
+    # and approval is the human gate before it goes out. No key material
+    # exists — artifact integrity rides the keyless attestations made on
+    # the package legs.
     environment:
       name: release-signing
     steps:
@@ -114,26 +128,6 @@ jobs:
           merge-multiple: true
       - name: checksums
         run: just release-checksum
-      - name: minisign signatures (when key is configured)
-        env:
-          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
-          # minisign reads the password for an encrypted key from
-          # MINISIGN_PASSWORD natively, so signing needs no TTY. An
-          # encrypted key without its password fails the job loudly —
-          # it never silently publishes unsigned.
-          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${MINISIGN_KEY:-}" ]]; then
-            echo "::warning::MINISIGN_KEY unset; tarballs are unsigned"
-          else
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq minisign
-            printf '%s' "$MINISIGN_KEY" > /tmp/minisign.key
-            chmod 600 /tmp/minisign.key
-            MINISIGN_KEY_FILE=/tmp/minisign.key just release-sign
-            rm -f /tmp/minisign.key
-          fi
       - name: publish release
         env:
           GH_TOKEN: ${{ github.token }}

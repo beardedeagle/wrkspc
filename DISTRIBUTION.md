@@ -6,27 +6,28 @@ Every stable release (`vX.Y.Z` tag) produces:
   Linux x86_64 (gnu and musl), and Linux arm64, each holding the single
   `wrkspc` binary.
 - **`SHA256SUMS`** — one file covering every tarball in the release.
-- **Minisign signatures** — one `.minisig` file per tarball, produced with
-  the maintainer's release key during the release pipeline.
+- **Sigstore attestations** — every tarball and the checksums file carry
+  an attestation over their digest, issued to the release workflow's
+  ambient OIDC identity. Keyless: no long-lived signing key exists
+  anywhere.
 - **A container image** — `ghcr.io/beardedeagle/wrkspc-hub:<version>`,
-  signed keyless with cosign over the ambient GitHub OIDC identity.
+  signed keyless with cosign over the same ambient GitHub OIDC identity.
 
 ## Verifying a release
 
-The release signing key's public half is committed in this repository at
-[`keys/minisign.pub`](keys/minisign.pub). Verify each tarball before use:
+Verify each tarball against its attestation before use:
 
 ```console
-# 1. The tarball's checksum matches the published SHA256SUMS.
-sha256sum -c --ignore-missing SHA256SUMS
+# 1. The tarball's digest is attested by the release workflow.
+gh attestation verify wrkspc-<platform>.tar.gz --repo beardedeagle/wrkspc
 
-# 2. The signature is valid and was made by this key.
-minisign -Vm wrkspc-<platform>.tar.gz -P keys/minisign.pub
+# 2. The checksums file is attested too; verify it, then check the tarball.
+gh attestation verify SHA256SUMS --repo beardedeagle/wrkspc
+sha256sum -c --ignore-missing SHA256SUMS
 ```
 
-A successful `minisign -Vm` reports `Signature and comment signature
-verified` and `Trusted comment: signature from minisign secret key`. Do not
-use a tarball that fails either check.
+A successful verification prints the attestation, the workflow identity,
+and the artifact digest. Do not use a tarball that fails either check.
 
 To verify the container image instead:
 
@@ -35,3 +36,8 @@ cosign verify ghcr.io/beardedeagle/wrkspc-hub:<version> \
   --certificate-identity-regexp 'https://github.com/beardedeagle/wrkspc/.github/workflows/.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
+
+The operator can additionally sign tarballs locally with a private
+minisign key (`just release-sign`); that key never enters GitHub and is
+documented separately in the vault.
+

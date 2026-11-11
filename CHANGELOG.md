@@ -23,11 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release builds consume only freshly fetched, pinned inputs — cache
   restoration is removed from the pipeline — and run under minimal
   job-scoped permissions instead of workflow-wide `contents: write`.
-- Release signing sits behind a protected `release-signing`
-  environment: the minisign key and password only mount into the
-  sign+publish job after the operator's explicit approval. Tarball
-  verification instructions live in `DISTRIBUTION.md`, and a zizmor
-  workflow-audit job guards the Actions definitions.
+- Release artifacts carry Sigstore attestations over their digests,
+  issued to the release workflow's OIDC identity — keyless, with no
+  long-lived signing key — and the GitHub Release publish waits on
+  operator approval through the protected `release-signing`
+  environment. Verification instructions live in `DISTRIBUTION.md`,
+  and a zizmor workflow-audit job guards the Actions definitions.
 
 ## [0.1.0] - 2026-11-10
 
