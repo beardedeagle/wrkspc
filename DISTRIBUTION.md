@@ -42,4 +42,3 @@ cosign verify ghcr.io/beardedeagle/wrkspc-hub:<version> \
 The operator can additionally sign tarballs locally with a private
 minisign key (`just release-sign`); that key never enters GitHub and is
 documented separately in the vault.
-

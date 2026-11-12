@@ -63,9 +63,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Distroless container image for the hub role, built from source.
 - Published container image on GHCR (`ghcr.io/<owner>/wrkspc-hub`):
   multi-arch `linux/amd64` + `linux/arm64`, cosign keyless-signed,
-  assembled from the same release binaries as the signed tarballs.
-- Release pipeline with an OSV security gate, checksums, and minisign
-  signatures across a five-leg package matrix.
+  assembled from the same release binaries as the attested archives.
+- Release pipeline with an OSV security gate, checksums, and Sigstore
+  attestations over every artifact, publishing the GitHub Release and
+  the container image behind operator approval, across a seven-leg
+  package matrix (macOS arm64/x86_64, Linux x86_64 glibc+musl and
+  arm64, Windows x86_64/arm64).
 
 ### Changed
 
