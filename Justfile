@@ -167,11 +167,11 @@ docs:
     trap 'rm -rf docs/src/rustdoc; mkdir -p docs/src/rustdoc/wrkspc_core; printf "# Rust API Reference\\n\\nGenerated API documentation is embedded here at build time.\\n" > docs/src/rustdoc/wrkspc_core/index.html; rm -f docs/src/changelog.md docs/src/hub-container-deployment.md' EXIT
     cp CHANGELOG.md docs/src/changelog.md
     cp deploy/README.md docs/src/hub-container-deployment.md
-    cargo doc --no-deps --workspace --locked
+    cargo +{{ toolchain }} doc --no-deps --workspace --locked
     # Resolve Cargo's effective target directory instead of assuming
     # target/: CARGO_TARGET_DIR or [build] target-dir redirects the
     # doc output too, and the embedded API reference must follow it.
-    target_dir="$(cargo metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)"
+    target_dir="$(cargo +{{ toolchain }} metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)"
     # mdbook parses the SUMMARY chapter as content: keep the tiny
     # placeholder in src during the build (a full rustdoc index.html
     # panics the mdbook HTML parser), then drop the real tree into the
@@ -208,8 +208,8 @@ docs-serve:
     trap cleanup EXIT
     cp CHANGELOG.md docs/src/changelog.md
     cp deploy/README.md docs/src/hub-container-deployment.md
-    cargo doc --no-deps --workspace --locked
-    target_dir="$(cargo metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)"
+    cargo +{{ toolchain }} doc --no-deps --workspace --locked
+    target_dir="$(cargo +{{ toolchain }} metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)"
     rm -rf docs/src/rustdoc
     mkdir -p docs/src/rustdoc/wrkspc_core
     printf "# Rust API Reference\\n\\nGenerated API documentation is embedded here at build time.\\n" > docs/src/rustdoc/wrkspc_core/index.html
