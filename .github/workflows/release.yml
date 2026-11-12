@@ -165,7 +165,11 @@ jobs:
 
   container:
     name: container image (ghcr)
-    needs: package
+    # The image only publishes AFTER the release job completes — which
+    # itself waits on the operator's approval for the protected
+    # environment. No public artifact may appear from an un-approved
+    # run: the approval gates the entire publish phase.
+    needs: [package, release]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
