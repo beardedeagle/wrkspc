@@ -24,8 +24,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
-      # The analysis upload feeds the repository's code scanning alerts,
-      # which the default-branch ruleset consumes.
+      # Job-level permissions replace the workflow-level map, so
+      # contents: read must be carried here for checkout (private-repo
+      # clones need it) alongside the code-scanning upload scope.
+      contents: read
       security-events: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -36,16 +38,16 @@ jobs:
       # language matrix carries `rust`; the extractor hooks the Cargo
       # build that autobuild runs for it.
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@b7b84b636b4f90c9b31da1bc5f72bfadd5b31410 # v3
+        uses: github/codeql-action/init@9418214df1f2c4b8128c770156c409013b07d6b9 # v3
         with:
           languages: rust
           queries: security-and-quality
 
       # autobuild runs `cargo build` for Rust under the CodeQL extractor.
       - name: Autobuild
-        uses: github/codeql-action/autobuild@b7b84b636b4f90c9b31da1bc5f72bfadd5b31410 # v3
+        uses: github/codeql-action/autobuild@9418214df1f2c4b8128c770156c409013b07d6b9 # v3
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@b7b84b636b4f90c9b31da1bc5f72bfadd5b31410 # v3
+        uses: github/codeql-action/analyze@9418214df1f2c4b8128c770156c409013b07d6b9 # v3
         with:
           category: "/language:rust"
