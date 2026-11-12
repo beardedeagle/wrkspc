@@ -419,12 +419,19 @@ deploy-node $host="":
 # Release packaging — GitHub release tarballs (.github/workflows/release.yml)
 # =============================================================================
 
+# On Windows, non-shebang recipes run through PowerShell — never Git
+# Bash — so the MSVC environment arrives intact and MSYS can neither
+# shadow link.exe with its coreutils `link` nor convert LIB/INCLUDE to
+# POSIX paths. (just 1.51 writes shebang scripts to extension-less
+# temp files, which pwsh -File refuses; windows-shell avoids that
+# entirely.) The [unix] release-tarball variant is a bash shebang
+# recipe and is unaffected.
+set windows-shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]
+
 # Package one platform's release binary in dist/ with a per-artifact
 # sha256. Two OS variants carry the same recipe name — just selects by
 # host. [unix] covers macOS (native) and Linux (cargo-zigbuild cross);
-# [windows] runs under PowerShell — never Git Bash — so the MSVC
-# environment arrives intact (no MSYS link.exe shadowing, no LIB/INCLUDE
-# path conversion) and Compress-Archive is the native zip writer.
+# [windows] runs under PowerShell and ships .zip via Compress-Archive.
 [unix]
 release-tarball target="native":
     #!/usr/bin/env bash
@@ -457,14 +464,10 @@ release-tarball target="native":
     (cd dist && shasum -a 256 "wrkspc-${name}.tar.gz" >> "SHA256SUMS-${name}")
     echo "dist/wrkspc-${name}.tar.gz"
 
-# Windows packaging (x86_64 and arm64 MSVC). PowerShell-native: the
-# recipe runs in the runner's pwsh, not Git Bash, so MSYS can neither
-# shadow link.exe with its coreutils `link` nor convert LIB/INCLUDE to
-# POSIX paths. The workflow's Windows steps stay on their default pwsh
-# shell for the same reason.
+# Windows packaging (x86_64 and arm64 MSVC). PowerShell-native via the
+# windows-shell setting above: no shebang, no Git Bash, no MSYS.
 [windows]
 release-tarball target:
-    #!/usr/bin/env pwsh
     $ErrorActionPreference = 'Stop'
     $Target = '{{ target }}'
     $Toolchain = '{{ toolchain }}'
