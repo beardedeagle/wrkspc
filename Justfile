@@ -423,7 +423,8 @@ deploy-node $host="":
 # sha256. Native targets build with plain cargo; Linux cross-targets
 # build via cargo-zigbuild; Windows targets build natively with the
 # runner's MSVC toolchain (windows = x86_64, windows-arm = arm64) and
-# ship as .zip.
+# ship as .zip via PowerShell Compress-Archive — the only zip writer
+# guaranteed present on Windows.
 release-tarball target="native":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -467,15 +468,18 @@ release-tarball target="native":
     stage="$(mktemp -d)"
     trap 'rm -rf "$stage"' EXIT
     if [[ "$bin" == *.exe ]]; then
-        # Windows artifacts ship as zip. `tar -a` (bsdtar) writes zip
-        # from the extension on every platform, avoiding a zip dep.
-        # The archive name is RELATIVE and written from inside dist/:
-        # an absolute C:\ path handed to the native Windows bsdtar is
-        # misparsed as the remote-archive `host:path` form
-        # ("Cannot connect to C: resolve failed").
+        # Windows artifacts ship as zip — this branch is unreachable on
+        # macOS/Linux. PowerShell Compress-Archive is the ONLY zip
+        # writer guaranteed present on Windows: Git Bash ships no `zip`
+        # binary, and Microsoft's bsdtar cannot WRITE the zip format
+        # (`tar -a -cf x.zip` silently emits a tar file under a .zip
+        # name — caught on the Windows test box). cygpath converts the
+        # MSYS paths to Windows form for the PowerShell call.
         cp "$bin" "$stage/wrkspc.exe"
         cp LICENSE "$stage/LICENSE"
-        (cd dist && tar -a -cf "wrkspc-${name}.zip" -C "$stage" wrkspc.exe LICENSE)
+        win_stage="$(cygpath -w "$stage")"
+        win_zip="$(cygpath -w "$(pwd)/dist/wrkspc-${name}.zip")"
+        powershell.exe -NoProfile -Command "Compress-Archive -Force -Path \"${win_stage}\\*\" -DestinationPath \"${win_zip}\""
         (cd dist && hash_file "wrkspc-${name}.zip" >> "SHA256SUMS-${name}")
         echo "dist/wrkspc-${name}.zip"
     else
