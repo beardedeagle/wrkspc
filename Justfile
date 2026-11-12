@@ -453,7 +453,7 @@ release-tarball target="native":
     trap 'rm -rf "$stage"' EXIT
     cp "$bin" "$stage/wrkspc"
     cp LICENSE "$stage/LICENSE"
-    (cd dist && tar -czf "wrkspc-${name}.tar.gz" -C "$stage" wrkspc LICENSE)
+    tar -C "$stage" -czf "dist/wrkspc-${name}.tar.gz" wrkspc LICENSE
     (cd dist && shasum -a 256 "wrkspc-${name}.tar.gz" >> "SHA256SUMS-${name}")
     echo "dist/wrkspc-${name}.tar.gz"
 
