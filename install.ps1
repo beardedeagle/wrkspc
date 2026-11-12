@@ -277,8 +277,13 @@ function Invoke-SetupHub {
     if ((Invoke-Ask "Run the hub on this machine too? (y/n)" "n") -ne "y") { return }
     $db = Invoke-Ask "Hub database path" (Join-Path $WrkspcShare "hub\hub.db")
     # SQLite does not create parent directories: the printed command
-    # fails on a fresh install unless the hub directory exists.
-    New-Item -ItemType Directory -Path (Split-Path -Parent $db) -Force | Out-Null
+    # fails on a fresh install unless the hub directory exists. A bare
+    # relative filename has no parent component (Split-Path returns an
+    # empty string) -- skip the mkdir in that case rather than error.
+    $dbParent = Split-Path -Parent $db
+    if ($dbParent) {
+        New-Item -ItemType Directory -Path $dbParent -Force | Out-Null
+    }
     $cardUrl = Invoke-Ask "External card URL (must match the hub certificate)" "https://hub.example.com:8443"
     $bind = Invoke-Ask "A2A/UI listener bind address" "0.0.0.0:8443"
     Write-Step "the hub is started with:"
