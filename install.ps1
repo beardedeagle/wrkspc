@@ -36,12 +36,12 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = "latest",
-    [string]$BaseUrl = "https://github.com/beardedeagle/wrkspc/releases/download",
-    [string]$InstallDir = "$env:LOCALAPPDATA\wrkspc\bin",
-    [switch]$NoSetup,
-    [switch]$Yes,
-    [switch]$NoAttestation
+    [string]$Version = $(if ($env:WRKSPC_VERSION) { $env:WRKSPC_VERSION } else { "latest" }),
+    [string]$BaseUrl = $(if ($env:WRKSPC_BASE_URL) { $env:WRKSPC_BASE_URL } else { "https://github.com/beardedeagle/wrkspc/releases/download" }),
+    [string]$InstallDir = $(if ($env:WRKSPC_INSTALL_DIR) { $env:WRKSPC_INSTALL_DIR } else { "$env:LOCALAPPDATA\wrkspc\bin" }),
+    [switch]$NoSetup = [bool]$env:WRKSPC_NO_SETUP,
+    [switch]$Yes = [bool]$env:WRKSPC_YES,
+    [switch]$NoAttestation = [bool]$env:WRKSPC_NO_ATTESTATION
 )
 
 $ErrorActionPreference = "Stop"
@@ -265,6 +265,9 @@ command = "$adapterEscaped"
 function Invoke-SetupHub {
     if ((Invoke-Ask "Run the hub on this machine too? (y/n)" "n") -ne "y") { return }
     $db = Invoke-Ask "Hub database path" (Join-Path $WrkspcShare "hub\hub.db")
+    # SQLite does not create parent directories: the printed command
+    # fails on a fresh install unless the hub directory exists.
+    New-Item -ItemType Directory -Path (Split-Path -Parent $db) -Force | Out-Null
     $cardUrl = Invoke-Ask "External card URL (must match the hub certificate)" "https://hub.example.com:8443"
     $bind = Invoke-Ask "A2A/UI listener bind address" "0.0.0.0:8443"
     Write-Step "the hub is started with:"
@@ -282,7 +285,17 @@ function Invoke-SetupHub {
 function Invoke-SetupSkills {
     if ((Invoke-Ask "Install the wrkspc skill into a harness now? (y/n)" "y") -ne "y") { return }
     $harness = Invoke-Ask "Harness for the skill install" "codex"
-    & (Join-Path $InstallDir "wrkspc.exe") skill install --harness $harness 2>&1 | ForEach-Object { Write-Host "$_" }
+    # The binding short names differ from the registry ids the skill
+    # installer resolves (registry.rs): map them before invoking.
+    $skillId = switch ($harness) {
+        "claude" { "claude-code" }
+        "gemini" { "gemini-cli" }
+        "qwen" { "qwen-code" }
+        "kimi" { "kimi-code-cli" }
+        "mcode" { "minimax-code" }
+        default { $harness }
+    }
+    & (Join-Path $InstallDir "wrkspc.exe") skill install --harness $skillId 2>&1 | ForEach-Object { Write-Host "$_" }
 }
 
 function Show-TokenPointer {

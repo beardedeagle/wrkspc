@@ -59,7 +59,11 @@ detect_target() {
             fi
             case "$arch" in
                 x86_64) echo "wrkspc-x86_64-unknown-linux-$libc" ;;
-                aarch64|arm64) echo "wrkspc-aarch64-unknown-linux-gnu" ;;
+                aarch64|arm64)
+                    if [[ "$libc" == "musl" ]]; then
+                        die "no ARM64 musl artifact exists in the release matrix — install glibc or build from source"
+                    fi
+                    echo "wrkspc-aarch64-unknown-linux-gnu" ;;
                 *) die "unsupported Linux architecture: $arch" ;;
             esac ;;
         *)
@@ -221,12 +225,14 @@ setup_pki() {
             openssl genrsa -out "$PKI_DIR/hub.key" 2048
             openssl req -new -key "$PKI_DIR/hub.key" -subj "/CN=$hub_host" \
                 -addext "subjectAltName=DNS:$hub_host" -out "$PKI_DIR/hub.csr"
-            # x509 -req drops CSR extensions by default: without
-            # -copy_extensions the issued certificate carries no SAN
-            # and hostname verification fails.
+            # x509 -req drops CSR extensions by default, and the
+            # -copy_extensions flag does not exist in LibreSSL
+            # (/usr/bin/openssl on macOS). -extfile with the SAN
+            # extension is the portable form.
             openssl x509 -req -in "$PKI_DIR/hub.csr" -CA "$PKI_DIR/ca.pem" \
                 -CAkey "$PKI_DIR/ca.key" -CAcreateserial -days 825 \
-                -copy_extensions copy -sha256 -out "$PKI_DIR/hub.crt"
+                -extfile <(printf 'subjectAltName=DNS:%s\n' "$hub_host") \
+                -sha256 -out "$PKI_DIR/hub.crt"
             rm -f "$PKI_DIR/hub.csr"
             info "hub certificate written ($PKI_DIR/hub.crt, $PKI_DIR/hub.key)"
         fi
@@ -240,7 +246,8 @@ setup_pki() {
                 -addext "subjectAltName=DNS:$host_id" -out "$PKI_DIR/node.csr"
             openssl x509 -req -in "$PKI_DIR/node.csr" -CA "$PKI_DIR/ca.pem" \
                 -CAkey "$PKI_DIR/ca.key" -CAcreateserial -days 825 \
-                -copy_extensions copy -sha256 -out "$PKI_DIR/node.crt"
+                -extfile <(printf 'subjectAltName=DNS:%s\n' "$host_id") \
+                -sha256 -out "$PKI_DIR/node.crt"
             rm -f "$PKI_DIR/node.csr"
             info "node certificate written ($PKI_DIR/node.crt, $PKI_DIR/node.key)"
         fi
@@ -326,9 +333,19 @@ setup_skills() {
     local proceed
     proceed="$(ask "Install the wrkspc skill into a harness now? (y/n)" "y")"
     [[ "$proceed" == "y" ]] || return 0
-    local harness
+    local harness skill_id
     harness="$(ask "Harness for the skill install" "codex")"
-    "$INSTALL_DIR/wrkspc" skill install --harness "$harness" || true
+    # The binding short names differ from the registry ids the skill
+    # installer resolves (registry.rs): map them before invoking.
+    case "$harness" in
+        claude) skill_id="claude-code" ;;
+        gemini) skill_id="gemini-cli" ;;
+        qwen) skill_id="qwen-code" ;;
+        kimi) skill_id="kimi-code-cli" ;;
+        mcode) skill_id="minimax-code" ;;
+        *) skill_id="$harness" ;;
+    esac
+    "$INSTALL_DIR/wrkspc" skill install --harness "$skill_id" || true
 }
 
 token_pointer() {
