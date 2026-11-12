@@ -28,7 +28,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: $/.github/actions/setup-rust
+      - uses: ./.github/actions/setup-rust
         with:
           install-cargo-deny: "true"
           install-cargo-audit: "true"
@@ -86,7 +86,7 @@ jobs:
       # No caches in the release pipeline: a release build must consume
       # only freshly fetched, pinned inputs — restored cache entries are a
       # poisoning path straight into the published binaries.
-      - uses: $/.github/actions/setup-rust
+      - uses: ./.github/actions/setup-rust
         with:
           # Each leg declares the rust-std targets it needs: Linux cross
           # legs install their target's std for the zigbuild link,
@@ -130,6 +130,11 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      # The consolidated SHA256SUMS is attested here after the checksum
+      # step merges the fragments (the docs verify that file; per-target
+      # fragments are attested on the package legs).
+      attestations: write
+      id-token: write
     # The publish waits on the operator's approval for the protected
     # environment: a GitHub Release is a write-only privileged action,
     # and approval is the human gate before it goes out. No key material
@@ -141,7 +146,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: $/.github/actions/setup-rust
+      - uses: ./.github/actions/setup-rust
       # v8.0.2
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -150,6 +155,13 @@ jobs:
           merge-multiple: true
       - name: checksums
         run: just release-checksum
+      # The consolidated checksum file is what the installation docs
+      # verify; attest it so `gh attestation verify dist/SHA256SUMS`
+      # holds for published releases. The per-target fragments are
+      # attested on the package legs over the same OIDC identity.
+      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45
+        with:
+          subject-path: dist/SHA256SUMS
       - name: publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -157,10 +169,7 @@ jobs:
           # github.sha anchors the release to the exact commit the
           # packaged binaries were built from (T11).
           RELEASE_SHA: ${{ github.sha }}
-        run: >-
-          just release-publish
-          "$RELEASE_VERSION"
-          "$RELEASE_SHA"
+        run: just release-publish
 
   container:
     name: container image (ghcr)
@@ -181,7 +190,7 @@ jobs:
           persist-credentials: false
       # just only — the image wraps the prebuilt tarball binaries, so
       # this job needs no Rust toolchain.
-      - uses: $/.github/actions/setup-rust
+      - uses: ./.github/actions/setup-rust
         with:
           install-rust: "false"
       # v8.0.2
@@ -195,5 +204,5 @@ jobs:
       - name: publish image to ghcr
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          IMAGE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }} # zizmor: ignore[unsound-ternary]
-        run: just release-image "$IMAGE_VERSION"
+          RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }} # zizmor: ignore[unsound-ternary]
+        run: just release-image

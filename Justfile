@@ -60,6 +60,12 @@ clippy-release:
 clippy-linux:
     #!/usr/bin/env bash
     set -euo pipefail
+    # The toolchain file declares no static targets (CI legs install
+    # their own via setup-rust), so a fresh checkout self-installs this
+    # one on demand before the cross-clippy runs.
+    if ! rustup +{{ toolchain }} target list --installed | grep -qx x86_64-unknown-linux-gnu; then
+        rustup +{{ toolchain }} target add x86_64-unknown-linux-gnu
+    fi
     host="$(rustc +{{ toolchain }} -vV | grep '^host' | cut -d' ' -f2)"
     if [[ "$host" == "x86_64-unknown-linux-gnu" ]]; then
         cargo +{{ toolchain }} clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
@@ -505,13 +511,16 @@ release-sign:
 # packaged binaries were built from — the release is anchored to IT,
 # never to the default branch's head (T11): a dispatch that raced new
 # commits must not tag them.
-release-publish version sha:
+release-publish:
     #!/usr/bin/env bash
     set -euo pipefail
-    # just interpolates declared parameters into the recipe text; it does
-    # not forward positionals to shebang scripts (verified on just 1.57).
-    VERSION="{{ version }}"
-    SHA="{{ sha }}"
+    # Parameters ride environment variables (RELEASE_VERSION,
+    # RELEASE_SHA) instead of declared parameters: just interpolates
+    # declared parameters into this script's text before it runs, so
+    # crafted input could execute here. Environment values are literal
+    # data — the validation below sees exactly what the caller passed.
+    VERSION="${RELEASE_VERSION:?release-publish: RELEASE_VERSION is required}"
+    SHA="${RELEASE_SHA:?release-publish: RELEASE_SHA is required}"
     [[ "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
         echo "release-publish: invalid version '$VERSION' (want X.Y.Z, optional v prefix)" >&2
         exit 1
@@ -545,14 +554,14 @@ release-publish version sha:
     fi
 
 # Publish the wrkspc-hub image to GHCR (the release pipeline's
-# container leg). VERSION is a maintainer-pushed tag or a
-# workflow_dispatch input, both write-access-only; the script
-# shape-checks it before touching any shell construct. Expects the
-# linux tarballs in dist/ and the Actions GITHUB_* env vars.
-release-image version:
+# container leg). The version rides the RELEASE_VERSION environment
+# variable — declared parameters are interpolated into the script text
+# before it runs, so environment variables keep caller input literal.
+# Expects the linux tarballs in dist/ and the Actions GITHUB_* env vars.
+release-image:
     #!/usr/bin/env bash
     set -euo pipefail
-    .github/scripts/publish-image.sh "{{ version }}"
+    .github/scripts/publish-image.sh "${RELEASE_VERSION:?release-image: RELEASE_VERSION is required}"
 
 # =============================================================================
 # OSV Scanner (pinned) — used by the `osv` gate
