@@ -27,6 +27,11 @@ $Root = (Get-Location).Path
 $DistDir = Join-Path $Root 'dist'
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 
+# Resolve Cargo's effective target directory instead of assuming
+# target\: CARGO_TARGET_DIR or [build] target-dir can redirect
+# builds, and packaging must follow the build, not guess.
+$TargetDir = (cargo +$Toolchain metadata --format-version 1 --no-deps | ConvertFrom-Json).target_directory
+
 # The +toolchain pin keeps ambient shims from winning; the toolchain
 # itself syncs from rust-toolchain.toml via rustup.
 & cargo +$Toolchain build --locked --release -p wrkspc-cli --bin wrkspc --target $RustTarget
@@ -37,7 +42,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $Stage = Join-Path ([System.IO.Path]::GetTempPath()) ('wrkspc-stage-' + [guid]::NewGuid().ToString('N'))
 try {
     New-Item -ItemType Directory -Path $Stage | Out-Null
-    Copy-Item (Join-Path $Root "target\$RustTarget\release\wrkspc.exe") (Join-Path $Stage 'wrkspc.exe')
+    Copy-Item (Join-Path $TargetDir "$RustTarget\release\wrkspc.exe") (Join-Path $Stage 'wrkspc.exe')
     Copy-Item (Join-Path $Root 'LICENSE') (Join-Path $Stage 'LICENSE')
 
     # Compress-Archive is the always-present native zip writer

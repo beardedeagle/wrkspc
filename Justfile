@@ -323,11 +323,13 @@ build-matrix level target="native":
         echo "Target: $RUST_TARGET (cargo-zigbuild)"
         just install-target "$RUST_TARGET"
         RUSTUP_TOOLCHAIN="{{ toolchain }}" cargo zigbuild --locked -p wrkspc-cli --bin wrkspc $CARGO_ARGS --target "$RUST_TARGET"
-        echo "Output: target/$RUST_TARGET/$([ "$LEVEL" = "debug" ] && echo "debug" || echo "release")/wrkspc"
+        target_dir="$(cargo +{{ toolchain }} metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)"
+        echo "Output: $target_dir/$RUST_TARGET/$([ "$LEVEL" = "debug" ] && echo "debug" || echo "release")/wrkspc"
     else
         echo "Target: native ($(rustc +{{ toolchain }} -vV | grep host | cut -d' ' -f2))"
         cargo +{{ toolchain }} build --locked $CARGO_ARGS -p wrkspc-cli --bin wrkspc
-        echo "Output: target/$([ "$LEVEL" = "debug" ] && echo "debug" || echo "release")/wrkspc"
+        target_dir="$(cargo +{{ toolchain }} metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)"
+        echo "Output: $target_dir/$([ "$LEVEL" = "debug" ] && echo "debug" || echo "release")/wrkspc"
     fi
 
 # =============================================================================
@@ -451,16 +453,21 @@ release-tarball target="native":
     set -euo pipefail
     TARGET="{{ target }}"
     mkdir -p dist
+    # Resolve Cargo's effective target directory instead of assuming
+    # target/: CARGO_TARGET_DIR or [build] target-dir can redirect
+    # builds, and packaging must follow the build, not guess — a
+    # stale default dir would otherwise package an old binary.
+    target_dir="$(cargo +{{ toolchain }} metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)"
     case "$TARGET" in
         native)
             cargo +{{ toolchain }} build --locked --release -p wrkspc-cli --bin wrkspc
-            bin="target/release/wrkspc"
+            bin="$target_dir/release/wrkspc"
             name="$(rustc +{{ toolchain }} -vV | grep host | cut -d' ' -f2)"
             ;;
         *linux*)
             just install-target "$TARGET"
             RUSTUP_TOOLCHAIN="{{ toolchain }}" cargo zigbuild --locked --release -p wrkspc-cli --bin wrkspc --target "$TARGET"
-            bin="target/$TARGET/release/wrkspc"
+            bin="$target_dir/$TARGET/release/wrkspc"
             name="$TARGET"
             ;;
         *)
