@@ -18,7 +18,7 @@ a session to it. The bindable cohort:
 | Harness | Adapter | Notes |
 |---|---|---|
 | `codex` | `codex-acp` (npm) | Spawned via `npx`; the binding pins the version |
-| `claude` | `claude --acp` | Claude Code's native ACP mode; the skill installer also writes the standing-instructions pointer into `~/.claude/CLAUDE.md` (the skill copy itself lives at `.claude/skills/wrkspc/SKILL.md`) |
+| `claude` | `claude-code-acp` (npm) | Spawned via `npx` (the package is `@agentclientprotocol/claude-agent-acp`); the skill installer also writes the standing-instructions pointer into `~/.claude/CLAUDE.md` (the skill copy itself lives at `.claude/skills/wrkspc/SKILL.md`) |
 | `antigravity` | `antigravity-acp` | Gemini's harness; per-session model pinning is configured through it |
 | `pi` | `pi-acp` | ACP adapter for the Pi coding agent |
 | `qwen` | `qwen --acp` | Qwen Code's native ACP mode (v0.27+) |
