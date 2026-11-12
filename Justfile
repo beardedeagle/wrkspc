@@ -465,7 +465,10 @@ release-tarball target="native":
     echo "dist/wrkspc-${name}.tar.gz"
 
 # Windows packaging (x86_64 and arm64 MSVC). PowerShell-native via the
-# windows-shell setting above: no shebang, no Git Bash, no MSYS.
+# windows-shell setting above: no shebang, no Git Bash, no MSYS. The
+# body is flat-indented because just 1.51 (the CI pin) parses
+# non-shebang recipes and rejects nested indentation; PowerShell treats
+# indentation as insignificant, so the layout costs nothing.
 [windows]
 release-tarball target:
     $ErrorActionPreference = 'Stop'
@@ -474,38 +477,33 @@ release-tarball target:
     $Root = (Get-Location).Path
     $DistDir = Join-Path $Root 'dist'
     New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
-
     $RustTarget = switch ($Target) {
-        'windows'     { 'x86_64-pc-windows-msvc' }
-        'windows-arm' { 'aarch64-pc-windows-msvc' }
-        default       { Write-Error "release-tarball: unsupported target '$Target' (windows, windows-arm)"; exit 1 }
+    'windows'     { 'x86_64-pc-windows-msvc' }
+    'windows-arm' { 'aarch64-pc-windows-msvc' }
+    default       { Write-Error "release-tarball: unsupported target '$Target' (windows, windows-arm)"; exit 1 }
     }
-
     # The +toolchain pin keeps ambient shims from winning; the toolchain
     # itself syncs from rust-toolchain.toml via rustup.
     & cargo +$Toolchain build --locked --release -p wrkspc-cli --bin wrkspc --target $RustTarget
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
     # LICENSE rides in every artifact (the project's own license
     # requires notice retention).
     $Stage = Join-Path ([System.IO.Path]::GetTempPath()) ('wrkspc-stage-' + [guid]::NewGuid().ToString('N'))
     try {
-        New-Item -ItemType Directory -Path $Stage | Out-Null
-        Copy-Item (Join-Path $Root "target\$RustTarget\release\wrkspc.exe") (Join-Path $Stage 'wrkspc.exe')
-        Copy-Item (Join-Path $Root 'LICENSE') (Join-Path $Stage 'LICENSE')
-
-        # Compress-Archive is the always-present native zip writer
-        # (Git Bash ships none; Microsoft's bsdtar cannot write zip).
-        $Zip = Join-Path $DistDir "wrkspc-$RustTarget.zip"
-        Compress-Archive -Force -Path (Join-Path $Stage '*') -DestinationPath $Zip
-
-        # Get-FileHash emits the same `hash  path` line the checksum
-        # fragments use on the unix legs.
-        $Hash = (Get-FileHash -Algorithm SHA256 -Path $Zip).Hash.ToLowerInvariant()
-        Add-Content -Path (Join-Path $DistDir "SHA256SUMS-$RustTarget") -Value "$Hash  wrkspc-$RustTarget.zip"
-        Write-Output "dist/wrkspc-$RustTarget.zip"
+    New-Item -ItemType Directory -Path $Stage | Out-Null
+    Copy-Item (Join-Path $Root "target\$RustTarget\release\wrkspc.exe") (Join-Path $Stage 'wrkspc.exe')
+    Copy-Item (Join-Path $Root 'LICENSE') (Join-Path $Stage 'LICENSE')
+    # Compress-Archive is the always-present native zip writer
+    # (Git Bash ships none; Microsoft's bsdtar cannot write zip).
+    $Zip = Join-Path $DistDir "wrkspc-$RustTarget.zip"
+    Compress-Archive -Force -Path (Join-Path $Stage '*') -DestinationPath $Zip
+    # Get-FileHash emits the same `hash  path` line the checksum
+    # fragments use on the unix legs.
+    $Hash = (Get-FileHash -Algorithm SHA256 -Path $Zip).Hash.ToLowerInvariant()
+    Add-Content -Path (Join-Path $DistDir "SHA256SUMS-$RustTarget") -Value "$Hash  wrkspc-$RustTarget.zip"
+    Write-Output "dist/wrkspc-$RustTarget.zip"
     } finally {
-        Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
     }
 
 # Consolidate the per-artifact checksums into the release SHA256SUMS.
