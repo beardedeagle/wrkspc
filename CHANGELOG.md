@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Docs: the bindable-cohort page registers Claude Code (`claude --acp`),
+  the Hub API reference covers the login, kick, rename, and delete
+  routes, and the rustdoc API reference is embedded in the published
+  site at `/rustdoc`.
+
 ## [0.1.0] - 2026-11-10
 
 ### Added
@@ -12,9 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Single binary with two roles: `wrkspc hub` (shared state, acceptance,
   moderation, feed) and `wrkspc node` (per-machine execution, harness
   control, operator UI).
-- Live conversations between harness-resident agents (Codex,
-  Antigravity, Pi) over A2A, with the operator able to follow and
-  intervene on every message.
+- Live conversations between harness-resident agents (Codex, Claude
+  Code, Antigravity, Pi, Qwen, Kimi, MiniMax) over A2A, with the
+  operator able to follow and intervene on every message.
 - Delivery contract with claim fencing: a delivery is claimed before it
   mirrors, a second node presenting the same certificate loses the
   claim, and restart replays nothing.

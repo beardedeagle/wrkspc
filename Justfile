@@ -153,25 +153,64 @@ lint-md:
 
 # Build the book. CHANGELOG.md and deploy/README.md are copied into
 # docs/src for the build (single source of truth stays at the repo root).
+# The rustdoc API reference is built from the same tree and embedded at
+# docs/book/rustdoc so the Pages site carries the type docs beside the
+# book (house pattern). The crates are product-internal, so the API
+# page frames them as a no-semver surface.
 docs:
     #!/usr/bin/env bash
     set -euo pipefail
-    # The copied pages are cleaned up on EVERY exit — a failed build
-    # must not leave untracked copies behind.
-    trap 'rm -f docs/src/changelog.md docs/src/hub-container-deployment.md' EXIT
+    # The copied pages and the staged rustdoc tree are cleaned up on
+    # EVERY exit — a failed build must not leave untracked copies
+    # behind. The committed placeholder at docs/src/rustdoc is
+    # restored verbatim so the tree ends exactly as it began.
+    trap 'rm -rf docs/src/rustdoc; mkdir -p docs/src/rustdoc/wrkspc_core; printf "# Rust API Reference\\n\\nGenerated API documentation is embedded here at build time.\\n" > docs/src/rustdoc/wrkspc_core/index.html; rm -f docs/src/changelog.md docs/src/hub-container-deployment.md' EXIT
     cp CHANGELOG.md docs/src/changelog.md
     cp deploy/README.md docs/src/hub-container-deployment.md
+    cargo doc --no-deps --workspace --locked
+    # mdbook parses the SUMMARY chapter as content: keep the tiny
+    # placeholder in src during the build (a full rustdoc index.html
+    # panics the mdbook HTML parser), then drop the real tree into the
+    # output afterward.
+    rm -rf docs/src/rustdoc docs/book
+    mkdir -p docs/src/rustdoc/wrkspc_core
+    printf "# Rust API Reference\\n\\nGenerated API documentation is embedded here at build time.\\n" > docs/src/rustdoc/wrkspc_core/index.html
     mdbook build docs
+    rm -rf docs/book/rustdoc
+    cp -R target/doc docs/book/rustdoc
     echo "Documentation built: docs/book/"
 
-# Serve the book locally with hot reload.
+# Serve the book locally with hot reload. The rustdoc tree lands in
+# the served output after mdbook's initial build (the same
+# placeholder-versus-real-tree order as `docs`).
 docs-serve:
     #!/usr/bin/env bash
     set -euo pipefail
     cp CHANGELOG.md docs/src/changelog.md
     cp deploy/README.md docs/src/hub-container-deployment.md
-    trap 'rm -f docs/src/changelog.md docs/src/hub-container-deployment.md' EXIT
-    (cd docs && mdbook serve --open)
+    cargo doc --no-deps --workspace --locked
+    rm -rf docs/src/rustdoc
+    mkdir -p docs/src/rustdoc/wrkspc_core
+    printf "# Rust API Reference\\n\\nGenerated API documentation is embedded here at build time.\\n" > docs/src/rustdoc/wrkspc_core/index.html
+    stamp="$(mktemp)"
+    trap 'rm -f "$stamp"; rm -rf docs/src/rustdoc; mkdir -p docs/src/rustdoc/wrkspc_core; printf "# Rust API Reference\\n\\nGenerated API documentation is embedded here at build time.\\n" > docs/src/rustdoc/wrkspc_core/index.html; rm -f docs/src/changelog.md docs/src/hub-container-deployment.md' EXIT
+    (cd docs && mdbook serve --open) &
+    server_pid=$!
+    # mdbook wipes the book dir on every rebuild; a small watchdog
+    # re-drops the rustdoc tree whenever it goes missing.
+    (while :; do
+        [[ -d docs/book/rustdoc/wrkspc_core ]] || { rm -rf docs/book/rustdoc; cp -R target/doc docs/book/rustdoc; }
+        sleep 2
+    done) &
+    watcher_pid=$!
+    for _ in $(seq 1 120); do
+        [[ -f docs/book/index.html && docs/book/index.html -nt "$stamp" ]] && break
+        sleep 0.5
+    done
+    rm -rf docs/book/rustdoc
+    cp -R target/doc docs/book/rustdoc
+    wait "$server_pid"
+    kill "$watcher_pid" 2>/dev/null || true
 
 # Shipping-artifact audit: the release binary must not contain builder
 # home paths (/Users/... or /home/...) from panic locations, error
