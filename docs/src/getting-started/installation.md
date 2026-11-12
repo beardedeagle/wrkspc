@@ -1,31 +1,32 @@
 # Installation
 
 wrkspc ships as a single binary per platform, plus a container image
-for the hub role. macOS and Linux are first-class
-today; Windows builds from a checkout the same way — there is no
-crates.io package in the pre-release tree, so `cargo install wrkspc`
-does not work anywhere yet.
+for the hub role. Release binaries are published for macOS (arm64 and
+x86_64), Linux (x86_64 glibc and musl, and arm64), and Windows (x86_64
+and arm64 — Windows artifacts ship as `.zip`). There is no crates.io
+package in the pre-release tree, so `cargo install wrkspc` does not
+work anywhere yet.
 
-## Release tarballs
+## Release artifacts
 
-Each release publishes per-platform tarballs with a `SHA256SUMS` file
-and minisign signatures. Verify before you run:
+Each release publishes per-platform archives (`.tar.gz`, `.zip` on
+Windows) with a `SHA256SUMS` file, and every archive carries a Sigstore
+attestation over its digest, issued to the release workflow's ambient
+OIDC identity — keyless: no long-lived signing key exists. Verify
+before you run:
 
 ```console
 $ curl -fsSLO https://github.com/<owner>/wrkspc/releases/download/vX.Y.Z/SHA256SUMS
 $ curl -fsSLO https://github.com/<owner>/wrkspc/releases/download/vX.Y.Z/wrkspc-<target>.tar.gz
+$ gh attestation verify wrkspc-<target>.tar.gz --repo <owner>/wrkspc
+$ gh attestation verify SHA256SUMS --repo <owner>/wrkspc
 $ shasum -a 256 -c SHA256SUMS          # compares, do not just print
-$ curl -fsSLO .../wrkspc-<target>.tar.gz.minisig
-$ minisign -V -P <fingerprint> -p wrkspc.pub -m wrkspc-<target>.tar.gz
 ```
 
-The release public key and its fingerprint are published WITH the
-first tagged release (in the release notes and the repository), and
-`-P` is the fingerprint from that announcement. Until that first
-release, artifacts ship WITHOUT signatures — the signing-key deferral
-is deliberate and documented — so verify the checksum against
-`SHA256SUMS` and treat the tarball as an unsigned pre-release
-artifact. The checksum alone proves integrity, not authorship.
+A successful attestation verification prints the workflow identity and
+the artifact digest; do not run an archive that fails any of these
+checks. The full instructions live in `DISTRIBUTION.md` at the repo
+root.
 
 macOS note: binaries fetched with `curl` or built locally carry no
 quarantine attribute, so Gatekeeper leaves them alone. A tarball

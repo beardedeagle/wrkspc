@@ -43,13 +43,25 @@ with `lefthook install`.
   `just osv` daily and on demand.
 - `docs.yml` builds the book (`just docs`) whenever `docs/**` or the
   changelog changes.
-- `release.yml` runs `just quality` as its gate, then packages and
-  signs release tarballs.
-- Every compiling job carries a hand-rolled cargo cache in two
+- `codeql.yml` scans the Rust workspace with CodeQL on push, PR, and
+  a weekly schedule.
+- `workflow-security.yml` audits the Actions definitions with pinned
+  zizmor whenever they change.
+- `release.yml` runs `just quality` as its gate, then packages the
+  seven-leg release matrix (macOS arm64/x86_64, Linux x86_64
+  glibc+musl and arm64, Windows x86_64/arm64 as `.zip`), emits
+  Sigstore attestations over every artifact, and only then — after
+  the operator's approval on the protected `release-signing`
+  environment — publishes the GitHub Release, followed by the GHCR
+  container image.
+- Compiling jobs in `ci.yml` carry a hand-rolled cargo cache in two
   entries: the registry (plus the cargo-installed tools) keyed on the
   lockfile, and a per-job target dir keyed on the manifests, Justfile,
-  toolchain pin, and workflow itself. `actions/cache` only — this repo
-  pins official actions, never third-party cache actions.
+  toolchain pin, and workflow itself. The release pipeline consumes
+  no caches at all — a release build uses only freshly fetched, pinned
+  inputs, so restored cache entries cannot poison the published
+  binaries. `actions/cache` only — this repo pins official actions,
+  never third-party cache actions.
 
 ## Docs
 

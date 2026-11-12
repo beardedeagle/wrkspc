@@ -32,22 +32,22 @@ default:
 
 # Formatting (writes)
 fmt:
-    cargo +{{toolchain}} fmt --all
+    cargo +{{ toolchain }} fmt --all
 
 fmt-check:
-    cargo +{{toolchain}} fmt --all --check
+    cargo +{{ toolchain }} fmt --all --check
 
 # Compile check across the workspace, including tests/benches
 check:
-    cargo +{{toolchain}} check --locked --workspace --all-targets
+    cargo +{{ toolchain }} check --locked --workspace --all-targets
 
 # Clippy with warnings denied (dev profile)
 clippy:
-    cargo +{{toolchain}} clippy --locked --workspace --all-targets -- -D warnings
+    cargo +{{ toolchain }} clippy --locked --workspace --all-targets -- -D warnings
 
 # Release-profile clippy (house battery gate)
 clippy-release:
-    cargo +{{toolchain}} clippy --locked --workspace --all-targets --release -- -D warnings
+    cargo +{{ toolchain }} clippy --locked --workspace --all-targets --release -- -D warnings
 
 # Linux-target clippy (house battery gate). The target's std comes from
 # the `targets` entry in rust-toolchain.toml; the bundled sqlite builds
@@ -57,22 +57,34 @@ clippy-release:
 # the zig shim and use the system cc. Zig-compiled C objects can carry
 # UBSan runtime references that the host's gcc dylib links (sqlx's proc
 # macros) cannot resolve, so the shim is for genuine cross-compiles only.
+# Install a rustup target's standard library when missing. The
+# toolchain file declares no static targets (CI legs install their own
+# via setup-rust), so fresh checkouts self-install on demand before any
+# cross build/clippy that needs the target's std.
+install-target target:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! rustup +{{ toolchain }} target list --installed | grep -qx "{{ target }}"; then
+        rustup +{{ toolchain }} target add "{{ target }}"
+    fi
+
 clippy-linux:
     #!/usr/bin/env bash
     set -euo pipefail
-    host="$(rustc +{{toolchain}} -vV | grep '^host' | cut -d' ' -f2)"
+    just install-target x86_64-unknown-linux-gnu
+    host="$(rustc +{{ toolchain }} -vV | grep '^host' | cut -d' ' -f2)"
     if [[ "$host" == "x86_64-unknown-linux-gnu" ]]; then
-        cargo +{{toolchain}} clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+        cargo +{{ toolchain }} clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
     else
-        CC_x86_64_unknown_linux_gnu="{{justfile_directory()}}/scripts/zig-cc-shim.sh" \
-            cargo +{{toolchain}} clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+        CC_x86_64_unknown_linux_gnu="{{ justfile_directory() }}/scripts/zig-cc-shim.sh" \
+            cargo +{{ toolchain }} clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
     fi
 
 build:
-    cargo +{{toolchain}} build --locked --workspace
+    cargo +{{ toolchain }} build --locked --workspace
 
 test:
-    cargo +{{toolchain}} test --locked --workspace --all-targets
+    cargo +{{ toolchain }} test --locked --workspace --all-targets
 
 # Dependency policy
 deny-check:
@@ -171,7 +183,7 @@ no-user-paths:
     # Build the release profile with the gate's own remapped RUSTFLAGS
     # (see the header export): the audit examines the artifact these
     # flags produce, never a stale binary left by an ad-hoc build.
-    cargo +{{toolchain}} build --locked --release -p wrkspc-cli --bin wrkspc
+    cargo +{{ toolchain }} build --locked --release -p wrkspc-cli --bin wrkspc
     # The binary's real artifact path: a user-supplied CARGO_TARGET_DIR
     # must not leave this recipe scanning a stale default location.
     profile_dir="release"
@@ -241,8 +253,8 @@ build-matrix level target="native":
     #!/usr/bin/env bash
     set -euo pipefail
 
-    LEVEL="{{level}}"
-    TARGET="{{target}}"
+    LEVEL="{{ level }}"
+    TARGET="{{ target }}"
 
     # Validate optimization level
     case "$LEVEL" in
@@ -309,12 +321,15 @@ build-matrix level target="native":
     # mise rust shim needs the explicit RUSTUP_TOOLCHAIN pin.
     if [[ -n "$RUST_TARGET" ]]; then
         echo "Target: $RUST_TARGET (cargo-zigbuild)"
-        RUSTUP_TOOLCHAIN="{{toolchain}}" cargo zigbuild --locked -p wrkspc-cli --bin wrkspc $CARGO_ARGS --target "$RUST_TARGET"
-        echo "Output: target/$RUST_TARGET/$([ "$LEVEL" = "debug" ] && echo "debug" || echo "release")/wrkspc"
+        just install-target "$RUST_TARGET"
+        RUSTUP_TOOLCHAIN="{{ toolchain }}" cargo zigbuild --locked -p wrkspc-cli --bin wrkspc $CARGO_ARGS --target "$RUST_TARGET"
+        target_dir="$(cargo +{{ toolchain }} metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)"
+        echo "Output: $target_dir/$RUST_TARGET/$([ "$LEVEL" = "debug" ] && echo "debug" || echo "release")/wrkspc"
     else
-        echo "Target: native ($(rustc +{{toolchain}} -vV | grep host | cut -d' ' -f2))"
-        cargo +{{toolchain}} build --locked $CARGO_ARGS -p wrkspc-cli --bin wrkspc
-        echo "Output: target/$([ "$LEVEL" = "debug" ] && echo "debug" || echo "release")/wrkspc"
+        echo "Target: native ($(rustc +{{ toolchain }} -vV | grep host | cut -d' ' -f2))"
+        cargo +{{ toolchain }} build --locked $CARGO_ARGS -p wrkspc-cli --bin wrkspc
+        target_dir="$(cargo +{{ toolchain }} metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)"
+        echo "Output: $target_dir/$([ "$LEVEL" = "debug" ] && echo "debug" || echo "release")/wrkspc"
     fi
 
 # =============================================================================
@@ -419,23 +434,40 @@ deploy-node $host="":
 # Release packaging — GitHub release tarballs (.github/workflows/release.yml)
 # =============================================================================
 
-# Package one platform's release binary as a tarball in dist/ with a
-# per-artifact sha256. Native targets build with plain cargo; Linux
-# cross-targets build via cargo-zigbuild, matching `build-matrix`.
+# On Windows, non-shebang recipes run through PowerShell — never Git
+# Bash — so the MSVC environment arrives intact and MSYS can neither
+# shadow link.exe with its coreutils `link` nor convert LIB/INCLUDE to
+# POSIX paths. (just 1.51 writes shebang scripts to extension-less
+# temp files, which pwsh -File refuses; windows-shell avoids that
+# entirely.) The [unix] release-tarball variant is a bash shebang
+# recipe and is unaffected.
+set windows-shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]
+
+# Package one platform's release binary in dist/ with a per-artifact
+# sha256. Two OS variants carry the same recipe name — just selects by
+# host. [unix] covers macOS (native) and Linux (cargo-zigbuild cross);
+# [windows] runs under PowerShell and ships .zip via Compress-Archive.
+[unix]
 release-tarball target="native":
     #!/usr/bin/env bash
     set -euo pipefail
-    TARGET="{{target}}"
+    TARGET="{{ target }}"
     mkdir -p dist
+    # Resolve Cargo's effective target directory instead of assuming
+    # target/: CARGO_TARGET_DIR or [build] target-dir can redirect
+    # builds, and packaging must follow the build, not guess — a
+    # stale default dir would otherwise package an old binary.
+    target_dir="$(cargo +{{ toolchain }} metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)"
     case "$TARGET" in
         native)
-            cargo +{{toolchain}} build --locked --release -p wrkspc-cli --bin wrkspc
-            bin="target/release/wrkspc"
-            name="$(rustc +{{toolchain}} -vV | grep host | cut -d' ' -f2)"
+            cargo +{{ toolchain }} build --locked --release -p wrkspc-cli --bin wrkspc
+            bin="$target_dir/release/wrkspc"
+            name="$(rustc +{{ toolchain }} -vV | grep host | cut -d' ' -f2)"
             ;;
         *linux*)
-            RUSTUP_TOOLCHAIN="{{toolchain}}" cargo zigbuild --locked --release -p wrkspc-cli --bin wrkspc --target "$TARGET"
-            bin="target/$TARGET/release/wrkspc"
+            just install-target "$TARGET"
+            RUSTUP_TOOLCHAIN="{{ toolchain }}" cargo zigbuild --locked --release -p wrkspc-cli --bin wrkspc --target "$TARGET"
+            bin="$target_dir/$TARGET/release/wrkspc"
             name="$TARGET"
             ;;
         *)
@@ -452,6 +484,15 @@ release-tarball target="native":
     tar -C "$stage" -czf "dist/wrkspc-${name}.tar.gz" wrkspc LICENSE
     (cd dist && shasum -a 256 "wrkspc-${name}.tar.gz" >> "SHA256SUMS-${name}")
     echo "dist/wrkspc-${name}.tar.gz"
+
+# Windows packaging (x86_64 and arm64 MSVC). The real script lives in
+# scripts/release-tarball.ps1 and runs as one pwsh process — just 1.51
+# (the CI pin) executes each non-shebang recipe line in a fresh shell,
+# so a multi-line body would lose state between lines. This one-line
+# invocation keeps everything intact: no shebang, no Git Bash, no MSYS.
+[windows]
+release-tarball target:
+    pwsh -NoLogo -NoProfile -File scripts/release-tarball.ps1 -Target '{{ target }}' -Toolchain '{{ toolchain }}'
 
 # Consolidate the per-artifact checksums into the release SHA256SUMS.
 release-checksum:
@@ -488,8 +529,13 @@ release-sign:
 release-publish:
     #!/usr/bin/env bash
     set -euo pipefail
-    VERSION="${1:-}"
-    SHA="${2:-}"
+    # Parameters ride environment variables (RELEASE_VERSION,
+    # RELEASE_SHA) instead of declared parameters: just interpolates
+    # declared parameters into this script's text before it runs, so
+    # crafted input could execute here. Environment values are literal
+    # data — the validation below sees exactly what the caller passed.
+    VERSION="${RELEASE_VERSION:?release-publish: RELEASE_VERSION is required}"
+    SHA="${RELEASE_SHA:?release-publish: RELEASE_SHA is required}"
     [[ "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
         echo "release-publish: invalid version '$VERSION' (want X.Y.Z, optional v prefix)" >&2
         exit 1
@@ -523,14 +569,14 @@ release-publish:
     fi
 
 # Publish the wrkspc-hub image to GHCR (the release pipeline's
-# container leg). VERSION is a maintainer-pushed tag or a
-# workflow_dispatch input, both write-access-only; the script
-# shape-checks it before touching any shell construct. Expects the
-# linux tarballs in dist/ and the Actions GITHUB_* env vars.
-release-image version:
+# container leg). The version rides the RELEASE_VERSION environment
+# variable — declared parameters are interpolated into the script text
+# before it runs, so environment variables keep caller input literal.
+# Expects the linux tarballs in dist/ and the Actions GITHUB_* env vars.
+release-image:
     #!/usr/bin/env bash
     set -euo pipefail
-    .github/scripts/publish-image.sh "{{version}}"
+    .github/scripts/publish-image.sh "${RELEASE_VERSION:?release-image: RELEASE_VERSION is required}"
 
 # =============================================================================
 # OSV Scanner (pinned) — used by the `osv` gate

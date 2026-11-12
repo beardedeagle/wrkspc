@@ -49,19 +49,35 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-26 is the current arm64 hosted label (macos-13 retired
-          # 2025-12-04, macos-14 retired 2026-11-02). Intel macOS is not
-          # a supported platform.
-          - {name: macos-arm64, os: macos-26, target: native}
+          # macos-26 (arm64) and macos-26-intel (x86_64) are the current
+          # hosted labels (macos-13 retired 2025-12-04, macos-14 retired
+          # 2026-11-02). Both macOS architectures are supported; each
+          # native leg derives its artifact name from the runner's host.
+          - {name: macos-arm64, os: macos-26, target: native, rust-targets: ""}
+          - {name: macos-x86_64, os: macos-26-intel, target: native, rust-targets: ""}
           - name: linux-x86_64
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            rust-targets: x86_64-unknown-linux-gnu
           - name: linux-x86_64-musl
             os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
+            rust-targets: x86_64-unknown-linux-musl
           - name: linux-arm64
             os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
+            rust-targets: aarch64-unknown-linux-gnu
+          # Windows legs build natively with the runner's MSVC toolchain
+          # (no zig, no cross tooling: install-zig stays false for them)
+          # and package as .zip.
+          - name: windows-x86_64
+            os: windows-2025
+            target: windows
+            rust-targets: x86_64-pc-windows-msvc
+          - name: windows-arm64
+            os: windows-11-arm
+            target: windows-arm
+            rust-targets: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -72,14 +88,18 @@ jobs:
       # poisoning path straight into the published binaries.
       - uses: $/.github/actions/setup-rust
         with:
-          # Linux legs cross-build: their target's std must be installed
-          # (the toolchain file only self-installs x86_64-unknown-linux-gnu),
-          # and the zig/cargo-zigbuild provisioning in the action covers the
-          # `just release-tarball` zigbuild call. The native leg passes an
-          # empty target list; the true arm here is never falsy.
-          targets: ${{ matrix.target != 'native' && matrix.target || '' }}
+          # Each leg declares the rust-std targets it needs: Linux cross
+          # legs install their target's std for the zigbuild link,
+          # Windows legs install the MSVC std for native builds, and the
+          # native legs install nothing extra.
+          targets: ${{ matrix.rust-targets }}
+          # Windows legs build natively with the runner's MSVC — the
+          # zig/cargo-zigbuild provisioning is for Linux cross legs only.
+          install-zig: ${{ !startsWith(matrix.os, 'windows') }}
 
       - name: build + tarball
+        # Default shell per OS: pwsh on the Windows legs (the recipe's
+        # [windows] variant is PowerShell-native), bash elsewhere.
         run: just release-tarball ${{ matrix.target }}
       # v7.0.2
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -91,6 +111,7 @@ jobs:
           # recipe fail (cat of missing files under pipefail).
           path: |
             dist/wrkspc-*.tar.gz
+            dist/wrkspc-*.zip
             dist/SHA256SUMS-*
           if-no-files-found: error
       # v2 — the release's integrity signature: Sigstore attestations
@@ -100,6 +121,7 @@ jobs:
         with:
           subject-path: |
             dist/wrkspc-*.tar.gz
+            dist/wrkspc-*.zip
             dist/SHA256SUMS-*
 
   release:
@@ -108,6 +130,11 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      # The consolidated SHA256SUMS is attested here after the checksum
+      # step merges the fragments (the docs verify that file; per-target
+      # fragments are attested on the package legs).
+      attestations: write
+      id-token: write
     # The publish waits on the operator's approval for the protected
     # environment: a GitHub Release is a write-only privileged action,
     # and approval is the human gate before it goes out. No key material
@@ -128,6 +155,13 @@ jobs:
           merge-multiple: true
       - name: checksums
         run: just release-checksum
+      # The consolidated checksum file is what the installation docs
+      # verify; attest it so `gh attestation verify dist/SHA256SUMS`
+      # holds for published releases. The per-target fragments are
+      # attested on the package legs over the same OIDC identity.
+      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45
+        with:
+          subject-path: dist/SHA256SUMS
       - name: publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -135,14 +169,15 @@ jobs:
           # github.sha anchors the release to the exact commit the
           # packaged binaries were built from (T11).
           RELEASE_SHA: ${{ github.sha }}
-        run: >-
-          just release-publish
-          "$RELEASE_VERSION"
-          "$RELEASE_SHA"
+        run: just release-publish
 
   container:
     name: container image (ghcr)
-    needs: package
+    # The image only publishes AFTER the release job completes — which
+    # itself waits on the operator's approval for the protected
+    # environment. No public artifact may appear from an un-approved
+    # run: the approval gates the entire publish phase.
+    needs: [package, release]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -169,5 +204,5 @@ jobs:
       - name: publish image to ghcr
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          IMAGE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }} # zizmor: ignore[unsound-ternary]
-        run: just release-image "$IMAGE_VERSION"
+          RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }} # zizmor: ignore[unsound-ternary]
+        run: just release-image

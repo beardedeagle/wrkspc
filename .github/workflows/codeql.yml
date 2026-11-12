@@ -1,0 +1,53 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Re-scan weekly so new query packs and new alerts surface without
+    # waiting for a push.
+    - cron: "17 9 * * 2"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (rust)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      # Job-level permissions replace the workflow-level map, so
+      # contents: read must be carried here for checkout (private-repo
+      # clones need it) alongside the code-scanning upload scope.
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      # Official action, pinned by SHA (house rule: no tag refs). The
+      # language matrix carries `rust`; the extractor hooks the Cargo
+      # build that autobuild runs for it.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9418214df1f2c4b8128c770156c409013b07d6b9 # v3
+        with:
+          languages: rust
+          queries: security-and-quality
+
+      # autobuild runs `cargo build` for Rust under the CodeQL extractor.
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@9418214df1f2c4b8128c770156c409013b07d6b9 # v3
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@9418214df1f2c4b8128c770156c409013b07d6b9 # v3
+        with:
+          category: "/language:rust"

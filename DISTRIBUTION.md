@@ -2,9 +2,10 @@
 
 Every stable release (`vX.Y.Z` tag) produces:
 
-- **Platform tarballs** — `wrkspc-<platform>.tar.gz` for macOS (arm64),
-  Linux x86_64 (gnu and musl), and Linux arm64, each holding the single
-  `wrkspc` binary.
+- **Platform binaries** — `wrkspc-<platform>.tar.gz` for macOS (arm64
+  and x86_64), Linux x86_64 (gnu and musl), and Linux arm64; Windows
+  x86_64 and arm64 ship as `wrkspc-<platform>.zip`. Every archive holds
+  the single `wrkspc` binary plus the project license.
 - **`SHA256SUMS`** — one file covering every tarball in the release.
 - **Sigstore attestations** — every tarball and the checksums file carry
   an attestation over their digest, issued to the release workflow's
@@ -15,13 +16,14 @@ Every stable release (`vX.Y.Z` tag) produces:
 
 ## Verifying a release
 
-Verify each tarball against its attestation before use:
+Verify each archive against its attestation before use (the commands are
+identical for `.tar.gz` and `.zip`):
 
 ```console
-# 1. The tarball's digest is attested by the release workflow.
-gh attestation verify wrkspc-<platform>.tar.gz --repo beardedeagle/wrkspc
+# 1. The archive's digest is attested by the release workflow.
+gh attestation verify wrkspc-<platform>.<ext> --repo beardedeagle/wrkspc
 
-# 2. The checksums file is attested too; verify it, then check the tarball.
+# 2. The checksums file is attested too; verify it, then check the archive.
 gh attestation verify SHA256SUMS --repo beardedeagle/wrkspc
 sha256sum -c --ignore-missing SHA256SUMS
 ```
@@ -40,4 +42,3 @@ cosign verify ghcr.io/beardedeagle/wrkspc-hub:<version> \
 The operator can additionally sign tarballs locally with a private
 minisign key (`just release-sign`); that key never enters GitHub and is
 documented separately in the vault.
-

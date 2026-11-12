@@ -31,7 +31,7 @@ docker pull ghcr.io/beardedeagle/wrkspc-hub:latest
 ```
 
 The published image is assembled by `.github/workflows/release.yml`
-from the same `just release-tarball` binaries the signed release
+from the same `just release-tarball` binaries the attested release
 ships — the registry image never recompiles the workspace in CI.
 `deploy/Dockerfile.publish` is that thin wrapper (binary + the
 digest-pinned distroless runtime); the root `Dockerfile` (from source)

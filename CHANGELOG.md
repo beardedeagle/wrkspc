@@ -5,31 +5,6 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Fixed
-
-- Roster moderation and presence writes (alias, status, forget, host
-  serial, presence upsert, roster replace, enrolment, host binding) open
-  `BEGIN IMMEDIATE` transactions instead of deferred ones, eliminating
-  the SQLITE_BUSY deadlock that could fail an operator ban racing a
-  concurrent presence write.
-- The release pipeline's macOS packaging leg no longer passes the
-  invalid `native` target to the toolchain installer (a pseudo-ternary
-  whose empty true arm fell through to the fallback).
-
-### Changed
-
-- Release builds consume only freshly fetched, pinned inputs — cache
-  restoration is removed from the pipeline — and run under minimal
-  job-scoped permissions instead of workflow-wide `contents: write`.
-- Release artifacts carry Sigstore attestations over their digests,
-  issued to the release workflow's OIDC identity — keyless, with no
-  long-lived signing key — and the GitHub Release publish waits on
-  operator approval through the protected `release-signing`
-  environment. Verification instructions live in `DISTRIBUTION.md`,
-  and a zizmor workflow-audit job guards the Actions definitions.
-
 ## [0.1.0] - 2026-11-10
 
 ### Added
@@ -56,29 +31,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   peer.
 - Operator UI with visible delivery and execution status and
   conversation-level moderation controls.
+- Operator UI refinements: work reports render as attributed blocks
+  (reporting agent, kind, commit time, relative age), chat blocks, work
+  reports, and system events each carry a copy control, agent names in
+  the transcript take stable per-room colours, gate menu rows show each
+  agent's host, the two side rails start at a shared width with
+  per-rail adjustments kept across reloads, and the hide-ejected
+  checkbox is a toggle button styled like New Room with explainer
+  lines under the cohort and conversations sections.
 - Distroless container image for the hub role, built from source.
 - Published container image on GHCR (`ghcr.io/<owner>/wrkspc-hub`):
   multi-arch `linux/amd64` + `linux/arm64`, cosign keyless-signed,
-  assembled from the same release binaries as the signed tarballs.
-- Release pipeline with an OSV security gate, checksums, and minisign
-  signatures across a five-leg package matrix.
-
-### Changed
-
-- Updated protocol SDKs and supporting dependencies, retaining ACP protocol
-  v1, stdio and HTTP MCP, and the existing SQLite schema.
-- The operator UI renders work reports as attributed blocks (reporting
-  agent, kind, commit time, relative age, and a copy control), shows each
-  agent's host on the gate menu rows, and matches the two side rails at a
-  shared starting width with per-rail adjustments kept across reloads.
-- Chat blocks, work reports, and system events each carry a copy control
-  that puts the block's text on the clipboard, and agent names in the
-  transcript take stable per-room colours.
-- The cohort's hide-ejected checkbox is a toggle button styled like New
-  Room, and the cohort and conversations sections carry explainer lines.
+  assembled from the same release binaries as the attested archives.
+- Release pipeline with an OSV security gate, checksums, and Sigstore
+  attestations over every artifact, publishing the GitHub Release and
+  the container image behind operator approval, across a seven-leg
+  package matrix (macOS arm64/x86_64, Linux x86_64 glibc+musl and
+  arm64, Windows x86_64/arm64 as `.zip` — Windows built natively with
+  the runner's MSVC toolchain).
+- Release binaries build with thin LTO.
+- Updated protocol SDKs and supporting dependencies, retaining ACP
+  protocol v1, stdio and HTTP MCP, and the existing SQLite schema.
 
 ### Security
 
+- Roster moderation and presence writes (alias, status, forget, host
+  serial, presence upsert, roster replace, enrolment, host binding) open
+  `BEGIN IMMEDIATE` transactions instead of deferred ones, eliminating
+  the SQLITE_BUSY deadlock that could fail an operator ban racing a
+  concurrent presence write.
+- Release builds consume only freshly fetched, pinned inputs — cache
+  restoration is removed from the pipeline — and run under minimal
+  job-scoped permissions instead of workflow-wide `contents: write`.
+- The GHCR container image publishes only after the operator's approval
+  and the GitHub Release land, so no public artifact can appear from an
+  un-approved run.
+- A pinned zizmor audit job guards the Actions definitions.
 - Updated rmcp to 3.9.0 for the OAuth SSRF and Streamable HTTP response-body
   fixes (RUSTSEC-2026-0457 and RUSTSEC-2026-0462).
 - Updated bundled SQLite to 3.54.1 for the WAL page-size memory disclosure
@@ -87,7 +75,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so the hub's listeners continue to accept the same credential.
 - Fence and cancel transactions wait for the SQLite writer before reading
   state, preventing stale-snapshot lock failures under concurrent writes.
-
 - mTLS with client certificates on the node↔hub coordination link. The
   hub's operator UI rides the same TLS listener with the browser's
   certificate optional (the A2A routes stay stamp-gated); the node's
