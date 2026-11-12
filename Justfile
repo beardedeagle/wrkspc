@@ -216,12 +216,20 @@ docs-serve:
     stamp="$(mktemp)"
     (cd docs && mdbook serve --open) &
     server_pid=$!
-    # mdbook wipes the book dir on every rebuild and restores the
-    # PLACEHOLDER chapter, so a directory-existence check would be
-    # fooled into thinking the API tree is present. Compare the served
-    # index against the generated one and re-drop the real tree
-    # whenever they diverge (a missing served index also diverges, so
-    # the first pass after the initial build self-heals).
+    for _ in $(seq 1 120); do
+        [[ -f docs/book/index.html && docs/book/index.html -nt "$stamp" ]] && break
+        sleep 0.5
+    done
+    rm -rf docs/book/rustdoc
+    cp -R "$target_dir/doc" docs/book/rustdoc
+    # The watchdog starts only after the initial build and the
+    # foreground copy finished: on a clean checkout docs/book does not
+    # exist yet, and a watchdog that starts earlier would either die
+    # on the missing directory under set -e or race the foreground
+    # remove-and-copy as a second writer. Startup keeps exactly one
+    # writer; later mdbook rebuilds restore the PLACEHOLDER chapter,
+    # so the watchdog compares the served index against the generated
+    # one and re-drops the real tree whenever they diverge.
     (
         while :; do
             if ! cmp -s "docs/book/rustdoc/wrkspc_core/index.html" "$target_dir/doc/wrkspc_core/index.html"; then
@@ -232,12 +240,6 @@ docs-serve:
         done
     ) &
     watcher_pid=$!
-    for _ in $(seq 1 120); do
-        [[ -f docs/book/index.html && docs/book/index.html -nt "$stamp" ]] && break
-        sleep 0.5
-    done
-    rm -rf docs/book/rustdoc
-    cp -R "$target_dir/doc" docs/book/rustdoc
     wait "$server_pid"
 
 # Shipping-artifact audit: the release binary must not contain builder
