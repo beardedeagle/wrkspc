@@ -50,10 +50,12 @@ detect_target() {
                 *) die "unsupported macOS architecture: $arch" ;;
             esac ;;
         Linux)
-            if ldd --version 2>&1 | grep -qi musl; then
-                local libc="musl"
-            else
-                local libc="gnu"
+            # musl's ldd can exit nonzero even when it prints the
+            # banner, and pipefail would then fail the whole probe.
+            # Capture the output first, then inspect it.
+            local libc="gnu"
+            if libc_probe="$(ldd --version 2>&1 || true)" && grep -qi musl <<<"$libc_probe"; then
+                libc="musl"
             fi
             case "$arch" in
                 x86_64) echo "wrkspc-x86_64-unknown-linux-$libc" ;;
@@ -70,7 +72,7 @@ die() {
     exit 1
 }
 
-info() { printf '==> %s\n' "$*"; }
+info() { printf '==> %s\n' "$*" >&2; }
 
 # Only letters, digits, dots, hyphens, and underscores: safe for
 # certificate subjects/SANs and host ids (never interpreted by a
@@ -88,12 +90,15 @@ toml_escape() {
 
 ask() {
     # ask <prompt> <default> — honors WRKSPC_YES (returns the default).
+    # The prompt goes to stderr; stdout carries ONLY the answer, since
+    # every caller captures ask with command substitution and a prompt
+    # in the capture would poison the equality checks.
     local prompt="$1" default="$2" answer
     if [[ "$YES" == "1" ]]; then
         echo "$default"
         return
     fi
-    printf '%s [%s] ' "$prompt" "$default"
+    printf '%s [%s] ' "$prompt" "$default" >&2
     read -r answer
     echo "${answer:-$default}"
 }
@@ -216,9 +221,12 @@ setup_pki() {
             openssl genrsa -out "$PKI_DIR/hub.key" 2048
             openssl req -new -key "$PKI_DIR/hub.key" -subj "/CN=$hub_host" \
                 -addext "subjectAltName=DNS:$hub_host" -out "$PKI_DIR/hub.csr"
+            # x509 -req drops CSR extensions by default: without
+            # -copy_extensions the issued certificate carries no SAN
+            # and hostname verification fails.
             openssl x509 -req -in "$PKI_DIR/hub.csr" -CA "$PKI_DIR/ca.pem" \
                 -CAkey "$PKI_DIR/ca.key" -CAcreateserial -days 825 \
-                -sha256 -out "$PKI_DIR/hub.crt"
+                -copy_extensions copy -sha256 -out "$PKI_DIR/hub.crt"
             rm -f "$PKI_DIR/hub.csr"
             info "hub certificate written ($PKI_DIR/hub.crt, $PKI_DIR/hub.key)"
         fi
@@ -232,7 +240,7 @@ setup_pki() {
                 -addext "subjectAltName=DNS:$host_id" -out "$PKI_DIR/node.csr"
             openssl x509 -req -in "$PKI_DIR/node.csr" -CA "$PKI_DIR/ca.pem" \
                 -CAkey "$PKI_DIR/ca.key" -CAcreateserial -days 825 \
-                -sha256 -out "$PKI_DIR/node.crt"
+                -copy_extensions copy -sha256 -out "$PKI_DIR/node.crt"
             rm -f "$PKI_DIR/node.csr"
             info "node certificate written ($PKI_DIR/node.crt, $PKI_DIR/node.key)"
         fi
@@ -281,13 +289,13 @@ EOF
     info "the node is started with (once the hub is reachable):"
     cat <<EOF
     wrkspc node run \\
-        --db $node_dir/node.db \\
-        --bindings $node_dir/bindings.toml \\
-        --hub $hub_url \\
-        --host-id $host_id \\
-        --tls-cert $PKI_DIR/node.crt \\
-        --tls-key $PKI_DIR/node.key \\
-        --tls-ca $PKI_DIR/ca.pem
+        --db $(printf '%q' "$node_dir/node.db") \\
+        --bindings $(printf '%q' "$node_dir/bindings.toml") \\
+        --hub $(printf '%q' "$hub_url") \\
+        --host-id $(printf '%q' "$host_id") \\
+        --tls-cert $(printf '%q' "$PKI_DIR/node.crt") \\
+        --tls-key $(printf '%q' "$PKI_DIR/node.key") \\
+        --tls-ca $(printf '%q' "$PKI_DIR/ca.pem")
 EOF
 }
 
@@ -305,12 +313,12 @@ setup_hub() {
     info "the hub is started with:"
     cat <<EOF
     wrkspc hub run \\
-        --db $db \\
-        --a2a $bind \\
-        --card-url $card_url \\
-        --tls-cert $PKI_DIR/hub.crt \\
-        --tls-key $PKI_DIR/hub.key \\
-        --tls-ca $PKI_DIR/ca.pem
+        --db $(printf '%q' "$db") \\
+        --a2a $(printf '%q' "$bind") \\
+        --card-url $(printf '%q' "$card_url") \\
+        --tls-cert $(printf '%q' "$PKI_DIR/hub.crt") \\
+        --tls-key $(printf '%q' "$PKI_DIR/hub.key") \\
+        --tls-ca $(printf '%q' "$PKI_DIR/ca.pem")
 EOF
 }
 

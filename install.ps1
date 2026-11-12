@@ -203,7 +203,7 @@ function Invoke-SetupPki {
             Test-HostName $hubHost
             Invoke-OpenSsl @("genrsa", "-out", "hub.key", "2048") "hub key"
             Invoke-OpenSsl @("req", "-new", "-key", "hub.key", "-subj", "/CN=$hubHost", "-addext", "subjectAltName=DNS:$hubHost", "-out", "hub.csr") "hub CSR"
-            Invoke-OpenSsl @("x509", "-req", "-in", "hub.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-days", "825", "-sha256", "-out", "hub.crt") "hub cert"
+            Invoke-OpenSsl @("x509", "-req", "-in", "hub.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-days", "825", "-copy_extensions", "copy", "-sha256", "-out", "hub.crt") "hub cert"
             Remove-Item hub.csr -ErrorAction SilentlyContinue
             Write-Step "hub certificate written ($PkiDir\hub.crt, hub.key)"
         }
@@ -213,7 +213,7 @@ function Invoke-SetupPki {
             Test-HostName $hostId
             Invoke-OpenSsl @("genrsa", "-out", "node.key", "2048") "node key"
             Invoke-OpenSsl @("req", "-new", "-key", "node.key", "-subj", "/CN=$hostId", "-addext", "subjectAltName=DNS:$hostId", "-out", "node.csr") "node CSR"
-            Invoke-OpenSsl @("x509", "-req", "-in", "node.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-days", "825", "-sha256", "-out", "node.crt") "node cert"
+            Invoke-OpenSsl @("x509", "-req", "-in", "node.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-days", "825", "-copy_extensions", "copy", "-sha256", "-out", "node.crt") "node cert"
             Remove-Item node.csr -ErrorAction SilentlyContinue
             Write-Step "node certificate written ($PkiDir\node.crt, node.key)"
         }
@@ -252,13 +252,13 @@ command = "$adapterEscaped"
     Write-Step "the node is started with (once the hub is reachable):"
     Write-Host @"
     wrkspc node run `
-        --db $nodeDir\node.db `
-        --bindings $bindings `
-        --hub $hubUrl `
-        --host-id $hostId `
-        --tls-cert $PkiDir\node.crt `
-        --tls-key $PkiDir\node.key `
-        --tls-ca $PkiDir\ca.pem
+        --db '$nodeDir\node.db' `
+        --bindings '$bindings' `
+        --hub '$hubUrl' `
+        --host-id '$hostId' `
+        --tls-cert '$PkiDir\node.crt' `
+        --tls-key '$PkiDir\node.key' `
+        --tls-ca '$PkiDir\ca.pem'
 "@
 }
 
@@ -270,12 +270,12 @@ function Invoke-SetupHub {
     Write-Step "the hub is started with:"
     Write-Host @"
     wrkspc hub run `
-        --db $db `
-        --a2a $bind `
-        --card-url $cardUrl `
-        --tls-cert $PkiDir\hub.crt `
-        --tls-key $PkiDir\hub.key `
-        --tls-ca $PkiDir\ca.pem
+        --db '$db' `
+        --a2a '$bind' `
+        --card-url '$cardUrl' `
+        --tls-cert '$PkiDir\hub.crt' `
+        --tls-key '$PkiDir\hub.key' `
+        --tls-ca '$PkiDir\ca.pem'
 "@
 }
 
