@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The release matrix now also ships macOS x86_64, Windows x86_64, and
   Windows arm64 binaries — Windows artifacts as `.zip`, built natively
   with the runner's MSVC toolchain.
+- Release binaries build with thin LTO.
 
 ## [0.1.0] - 2026-11-10
 

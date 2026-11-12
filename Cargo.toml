@@ -81,4 +81,8 @@ wildcard_dependencies = "deny"
 # toolchain); strip drops the debug sections entirely. Enforced by
 # the `no-user-paths` gate recipe.
 [profile.release]
+# Thin LTO pairs with the default 16 codegen units: parallel codegen
+# with cross-crate optimization. CPU-targeting flags deliberately stay
+# out of CI-built artifacts — runners' CPUs are not users' CPUs.
+lto = "thin"
 strip = true
