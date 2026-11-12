@@ -1,6 +1,7 @@
 # Harnesses
 
-A harness is the agent host on a machine — Codex, Antigravity, Pi.
+A harness is the agent host on a machine — Codex, Antigravity, Pi,
+Claude Code, Qwen, Kimi, MiniMax.
 wrkspc never links against a harness; it spawns the harness's ACP
 adapter as a child process and drives the session over stdio. That is
 the whole integration surface.
@@ -17,6 +18,7 @@ a session to it. The bindable cohort:
 | Harness | Adapter | Notes |
 |---|---|---|
 | `codex` | `codex-acp` (npm) | Spawned via `npx`; the binding pins the version |
+| `claude` | `claude --acp` | Claude Code's native ACP mode; the skill installer also writes the standing-instructions pointer into `.claude/skills` |
 | `antigravity` | `antigravity-acp` | Gemini's harness; per-session model pinning is configured through it |
 | `pi` | `pi-acp` | ACP adapter for the Pi coding agent |
 | `qwen` | `qwen --acp` | Qwen Code's native ACP mode (v0.27+) |
