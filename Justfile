@@ -32,22 +32,22 @@ default:
 
 # Formatting (writes)
 fmt:
-    cargo +{{toolchain}} fmt --all
+    cargo +{{ toolchain }} fmt --all
 
 fmt-check:
-    cargo +{{toolchain}} fmt --all --check
+    cargo +{{ toolchain }} fmt --all --check
 
 # Compile check across the workspace, including tests/benches
 check:
-    cargo +{{toolchain}} check --locked --workspace --all-targets
+    cargo +{{ toolchain }} check --locked --workspace --all-targets
 
 # Clippy with warnings denied (dev profile)
 clippy:
-    cargo +{{toolchain}} clippy --locked --workspace --all-targets -- -D warnings
+    cargo +{{ toolchain }} clippy --locked --workspace --all-targets -- -D warnings
 
 # Release-profile clippy (house battery gate)
 clippy-release:
-    cargo +{{toolchain}} clippy --locked --workspace --all-targets --release -- -D warnings
+    cargo +{{ toolchain }} clippy --locked --workspace --all-targets --release -- -D warnings
 
 # Linux-target clippy (house battery gate). The target's std comes from
 # the `targets` entry in rust-toolchain.toml; the bundled sqlite builds
@@ -60,19 +60,19 @@ clippy-release:
 clippy-linux:
     #!/usr/bin/env bash
     set -euo pipefail
-    host="$(rustc +{{toolchain}} -vV | grep '^host' | cut -d' ' -f2)"
+    host="$(rustc +{{ toolchain }} -vV | grep '^host' | cut -d' ' -f2)"
     if [[ "$host" == "x86_64-unknown-linux-gnu" ]]; then
-        cargo +{{toolchain}} clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+        cargo +{{ toolchain }} clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
     else
-        CC_x86_64_unknown_linux_gnu="{{justfile_directory()}}/scripts/zig-cc-shim.sh" \
-            cargo +{{toolchain}} clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+        CC_x86_64_unknown_linux_gnu="{{ justfile_directory() }}/scripts/zig-cc-shim.sh" \
+            cargo +{{ toolchain }} clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
     fi
 
 build:
-    cargo +{{toolchain}} build --locked --workspace
+    cargo +{{ toolchain }} build --locked --workspace
 
 test:
-    cargo +{{toolchain}} test --locked --workspace --all-targets
+    cargo +{{ toolchain }} test --locked --workspace --all-targets
 
 # Dependency policy
 deny-check:
@@ -171,7 +171,7 @@ no-user-paths:
     # Build the release profile with the gate's own remapped RUSTFLAGS
     # (see the header export): the audit examines the artifact these
     # flags produce, never a stale binary left by an ad-hoc build.
-    cargo +{{toolchain}} build --locked --release -p wrkspc-cli --bin wrkspc
+    cargo +{{ toolchain }} build --locked --release -p wrkspc-cli --bin wrkspc
     # The binary's real artifact path: a user-supplied CARGO_TARGET_DIR
     # must not leave this recipe scanning a stale default location.
     profile_dir="release"
@@ -241,8 +241,8 @@ build-matrix level target="native":
     #!/usr/bin/env bash
     set -euo pipefail
 
-    LEVEL="{{level}}"
-    TARGET="{{target}}"
+    LEVEL="{{ level }}"
+    TARGET="{{ target }}"
 
     # Validate optimization level
     case "$LEVEL" in
@@ -309,11 +309,11 @@ build-matrix level target="native":
     # mise rust shim needs the explicit RUSTUP_TOOLCHAIN pin.
     if [[ -n "$RUST_TARGET" ]]; then
         echo "Target: $RUST_TARGET (cargo-zigbuild)"
-        RUSTUP_TOOLCHAIN="{{toolchain}}" cargo zigbuild --locked -p wrkspc-cli --bin wrkspc $CARGO_ARGS --target "$RUST_TARGET"
+        RUSTUP_TOOLCHAIN="{{ toolchain }}" cargo zigbuild --locked -p wrkspc-cli --bin wrkspc $CARGO_ARGS --target "$RUST_TARGET"
         echo "Output: target/$RUST_TARGET/$([ "$LEVEL" = "debug" ] && echo "debug" || echo "release")/wrkspc"
     else
-        echo "Target: native ($(rustc +{{toolchain}} -vV | grep host | cut -d' ' -f2))"
-        cargo +{{toolchain}} build --locked $CARGO_ARGS -p wrkspc-cli --bin wrkspc
+        echo "Target: native ($(rustc +{{ toolchain }} -vV | grep host | cut -d' ' -f2))"
+        cargo +{{ toolchain }} build --locked $CARGO_ARGS -p wrkspc-cli --bin wrkspc
         echo "Output: target/$([ "$LEVEL" = "debug" ] && echo "debug" || echo "release")/wrkspc"
     fi
 
@@ -427,7 +427,7 @@ deploy-node $host="":
 release-tarball target="native":
     #!/usr/bin/env bash
     set -euo pipefail
-    TARGET="{{target}}"
+    TARGET="{{ target }}"
     mkdir -p dist
     dist_abs="$(pwd)/dist"
     # macOS ships `shasum`; Git Bash (Windows legs) ships `sha256sum`.
@@ -439,22 +439,22 @@ release-tarball target="native":
     fi
     case "$TARGET" in
         native)
-            cargo +{{toolchain}} build --locked --release -p wrkspc-cli --bin wrkspc
+            cargo +{{ toolchain }} build --locked --release -p wrkspc-cli --bin wrkspc
             bin="target/release/wrkspc"
-            name="$(rustc +{{toolchain}} -vV | grep host | cut -d' ' -f2)"
+            name="$(rustc +{{ toolchain }} -vV | grep host | cut -d' ' -f2)"
             ;;
         *linux*)
-            RUSTUP_TOOLCHAIN="{{toolchain}}" cargo zigbuild --locked --release -p wrkspc-cli --bin wrkspc --target "$TARGET"
+            RUSTUP_TOOLCHAIN="{{ toolchain }}" cargo zigbuild --locked --release -p wrkspc-cli --bin wrkspc --target "$TARGET"
             bin="target/$TARGET/release/wrkspc"
             name="$TARGET"
             ;;
         windows)
-            cargo +{{toolchain}} build --locked --release -p wrkspc-cli --bin wrkspc --target x86_64-pc-windows-msvc
+            cargo +{{ toolchain }} build --locked --release -p wrkspc-cli --bin wrkspc --target x86_64-pc-windows-msvc
             bin="target/x86_64-pc-windows-msvc/release/wrkspc.exe"
             name="x86_64-pc-windows-msvc"
             ;;
         windows-arm)
-            cargo +{{toolchain}} build --locked --release -p wrkspc-cli --bin wrkspc --target aarch64-pc-windows-msvc
+            cargo +{{ toolchain }} build --locked --release -p wrkspc-cli --bin wrkspc --target aarch64-pc-windows-msvc
             bin="target/aarch64-pc-windows-msvc/release/wrkspc.exe"
             name="aarch64-pc-windows-msvc"
             ;;
@@ -562,7 +562,7 @@ release-publish version sha:
 release-image version:
     #!/usr/bin/env bash
     set -euo pipefail
-    .github/scripts/publish-image.sh "{{version}}"
+    .github/scripts/publish-image.sh "{{ version }}"
 
 # =============================================================================
 # OSV Scanner (pinned) — used by the `osv` gate
