@@ -3,21 +3,7 @@ name: Docs
 on:
   push:
     branches: [main]
-    paths:
-      - "docs/**"
-      - "CHANGELOG.md"
-      # deploy/README.md is copied into the book by `just docs`, and
-      # the Justfile recipe + its inputs change the build itself.
-      - "deploy/README.md"
-      - "Justfile"
-      - ".github/workflows/docs.yml"
   pull_request:
-    paths:
-      - "docs/**"
-      - "CHANGELOG.md"
-      - "deploy/README.md"
-      - "Justfile"
-      - ".github/workflows/docs.yml"
   workflow_dispatch:
 
 concurrency:
