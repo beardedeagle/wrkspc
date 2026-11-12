@@ -17,6 +17,13 @@ struct AcceptText<'a> {
     content: &'a str,
 }
 
+/// The ceiling on directed-post recipients per message, enforced on the
+/// shared acceptance path so EVERY caller (operator UI route and MCP
+/// post-message tool) is fenced — a near-limit recipient list could
+/// otherwise fan out to thousands of per-target store resolves and
+/// deliveries (CodeQL `rust/uncontrolled-allocation-size`).
+pub const MAX_DIRECTED_RECIPIENTS: usize = 32;
+
 impl Store {
     /// Runs the readiness fence: commits a message, its recipients, and any
     /// requested execution intents in one transaction.
@@ -99,6 +106,16 @@ impl Store {
         recipients: &[RecipientRequest],
         create_intents: bool,
     ) -> Result<AcceptOutcome> {
+        // The ceiling holds on the SHARED path, not per caller: both the
+        // operator UI route and the MCP post-message tool funnel through
+        // here, and a harness can name as many peers as the protocol lets
+        // it (CodeQL rust/uncontrolled-allocation-size).
+        if recipients.len() > MAX_DIRECTED_RECIPIENTS {
+            return Err(StoreError::TooManyRecipients {
+                limit: MAX_DIRECTED_RECIPIENTS,
+                count: recipients.len(),
+            });
+        }
         let AcceptText {
             key: idempotency_key,
             content,

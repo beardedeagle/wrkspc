@@ -85,6 +85,7 @@ pub mod conversations;
 pub mod events;
 pub mod fences;
 pub mod messages;
+pub use messages::MAX_DIRECTED_RECIPIENTS;
 pub mod peers;
 pub mod reconcile;
 

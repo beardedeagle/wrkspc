@@ -7,14 +7,8 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use wrkspc_core::store::MAX_DIRECTED_RECIPIENTS;
 use wrkspc_core::{CancelOutcome, FenceKind};
-
-/// The ceiling on directed-post recipients per message. The request body
-/// itself is bounded by the server's extraction limits, but a near-limit
-/// array would still fan out to thousands of per-target store resolves
-/// and deliveries; the cap keeps one post from amplifying into unbounded
-/// work (CodeQL `rust/uncontrolled-allocation-size`).
-const MAX_DIRECTED_RECIPIENTS: usize = 32;
 
 /// Removes one member from a conversation (kick from the room). The peer
 /// stays enrolled in the hub and in other conversations; already-running

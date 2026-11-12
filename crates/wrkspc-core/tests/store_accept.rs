@@ -43,6 +43,38 @@ async fn accept_commits_message_and_intents() {
     assert!(!attempt.is_empty());
 }
 
+/// An oversized recipient list is refused on the shared acceptance path
+/// (the fence both the operator UI route and the MCP post-message tool
+/// funnel through): one post can never fan out into unbounded
+/// per-recipient work (CodeQL rust/uncontrolled-allocation-size).
+#[tokio::test]
+async fn accept_refuses_recipient_lists_over_the_cap() {
+    let store = Store::open_in_memory("test").await.unwrap();
+    let (operator, _agent, conversation) = seeded(&store).await;
+    let flood: Vec<RecipientRequest> = (0..33)
+        .map(|index| RecipientRequest {
+            peer_id: format!("peer{index}"),
+            execution_requested: false,
+        })
+        .collect();
+
+    let error = store
+        .accept_message(&conversation, &operator, &key(), "flood", false, &flood)
+        .await
+        .expect_err("oversized lists must be refused before any store work");
+    assert!(matches!(
+        error,
+        StoreError::TooManyRecipients {
+            limit: 32,
+            count: 33
+        }
+    ));
+
+    // Nothing committed: the conversation has no messages.
+    let messages = store.list_messages(&conversation).await.unwrap();
+    assert!(messages.is_empty(), "a refused post must not commit");
+}
+
 /// Re-accepting the same key returns Replay with the original message id (no duplicate commit).
 #[tokio::test]
 async fn idempotent_replay_returns_same_message() {

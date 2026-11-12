@@ -39,9 +39,12 @@ param(
     [string]$Version = $(if ($env:WRKSPC_VERSION) { $env:WRKSPC_VERSION } else { "latest" }),
     [string]$BaseUrl = $(if ($env:WRKSPC_BASE_URL) { $env:WRKSPC_BASE_URL } else { "https://github.com/beardedeagle/wrkspc/releases/download" }),
     [string]$InstallDir = $(if ($env:WRKSPC_INSTALL_DIR) { $env:WRKSPC_INSTALL_DIR } else { "$env:LOCALAPPDATA\wrkspc\bin" }),
-    [switch]$NoSetup = [bool]$env:WRKSPC_NO_SETUP,
-    [switch]$Yes = [bool]$env:WRKSPC_YES,
-    [switch]$NoAttestation = [bool]$env:WRKSPC_NO_ATTESTATION
+    # String compare, not a [bool] cast: PowerShell casts ANY non-empty
+    # string ("0", "false") to $true, so [bool]$env:X would invert off
+    # values. Only the literal "1" enables, matching install.sh.
+    [switch]$NoSetup = ($env:WRKSPC_NO_SETUP -eq "1"),
+    [switch]$Yes = ($env:WRKSPC_YES -eq "1"),
+    [switch]$NoAttestation = ($env:WRKSPC_NO_ATTESTATION -eq "1")
 )
 
 $ErrorActionPreference = "Stop"
@@ -100,7 +103,15 @@ function Install-Binary {
         $actual = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $temp $archive)).Hash.ToLowerInvariant()
         if ($expected -ne $actual) { throw "checksum mismatch for $archive" }
 
-        if (-not $NoAttestation -and (Get-Command gh -ErrorAction SilentlyContinue) -and (gh auth status 2>$null)) {
+        # gh writes its status to stderr, so redirect it away and key the
+        # decision off the exit code alone, the same shape as install.sh.
+        if (-not $NoAttestation -and (Get-Command gh -ErrorAction SilentlyContinue)) {
+            gh auth status *> $null
+            $ghAuthed = ($LASTEXITCODE -eq 0)
+        } else {
+            $ghAuthed = $false
+        }
+        if ($ghAuthed) {
             Write-Step "verifying Sigstore attestation"
             Push-Location $temp
             try {
