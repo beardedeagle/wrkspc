@@ -184,6 +184,29 @@ runs:
         CARGO_INSTALL_TARGET_DIR: ${{ inputs.install-target-dir }}
       run: | # zizmor: ignore[github-env]
         set -euo pipefail
+        # Git Bash's MSYS runtime resolves /usr/bin/link.exe (coreutils'
+        # hardlink tool) ahead of the MSVC linker, and converts LIB and
+        # INCLUDE to POSIX forms; cargo install then fails to link its
+        # build scripts. Pin the newest MSVC linker for the host target
+        # when VS Build Tools is present (Windows only; a no-op on
+        # macOS/Linux, where the guard never matches).
+        if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
+            msvc_root="/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC"
+            if [ -d "$msvc_root" ]; then
+                newest="$(ls -d "$msvc_root"/*/ 2>/dev/null | sort -V | tail -1)"
+                host="$(rustc -vV 2>/dev/null | grep '^host:' | cut -d' ' -f2)"
+                if [[ "$host" == aarch64-pc-windows-msvc ]]; then
+                    msvc_link="${newest}bin/HostARM64/arm64/link.exe"
+                    [ -f "$msvc_link" ] || msvc_link="${newest}bin/Hostx64/arm64/link.exe"
+                else
+                    msvc_link="${newest}bin/Hostx64/x64/link.exe"
+                    [ -f "$msvc_link" ] || msvc_link="${newest}bin/HostARM64/x64/link.exe"
+                fi
+                if [ -f "$msvc_link" ]; then
+                    export "CARGO_TARGET_${host//-/_}_LINKER=$(cygpath -w "$msvc_link")"
+                fi
+            fi
+        fi
         # Probe by actually running `just`, not `command -v just`: a mise/asdf
         # shim on PATH satisfies `command -v` but fails at call time with
         # "No version is set for shim: just" when no version is pinned. If it

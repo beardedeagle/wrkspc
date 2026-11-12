@@ -420,23 +420,17 @@ deploy-node $host="":
 # =============================================================================
 
 # Package one platform's release binary in dist/ with a per-artifact
-# sha256. Native targets build with plain cargo; Linux cross-targets
-# build via cargo-zigbuild; Windows targets build natively with the
-# runner's MSVC toolchain (windows = x86_64, windows-arm = arm64) and
-# ship as .zip via PowerShell Compress-Archive — the only zip writer
-# guaranteed present on Windows.
+# sha256. Two OS variants carry the same recipe name — just selects by
+# host. [unix] covers macOS (native) and Linux (cargo-zigbuild cross);
+# [windows] runs under PowerShell — never Git Bash — so the MSVC
+# environment arrives intact (no MSYS link.exe shadowing, no LIB/INCLUDE
+# path conversion) and Compress-Archive is the native zip writer.
+[unix]
 release-tarball target="native":
     #!/usr/bin/env bash
     set -euo pipefail
     TARGET="{{ target }}"
     mkdir -p dist
-    # macOS ships `shasum`; Git Bash (Windows legs) ships `sha256sum`.
-    # Both print the same `hash␣␣filename` line the checksum file needs.
-    if command -v shasum >/dev/null 2>&1; then
-        hash_file() { shasum -a 256 "$1"; }
-    else
-        hash_file() { sha256sum "$1"; }
-    fi
     case "$TARGET" in
         native)
             cargo +{{ toolchain }} build --locked --release -p wrkspc-cli --bin wrkspc
@@ -448,39 +442,8 @@ release-tarball target="native":
             bin="target/$TARGET/release/wrkspc"
             name="$TARGET"
             ;;
-        windows)
-            # MSYS /usr/bin shadows link.exe on Git-Bash-for-Windows:
-            # its coreutils `link` (hardlink) wins PATH resolution over
-            # the MSVC linker and rustc then fails with "extra operand".
-            # Pin the real linker when VS Build Tools is installed.
-            msvc_root="/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC"
-            if [ -d "$msvc_root" ]; then
-                newest="$(ls -d "$msvc_root"/*/ 2>/dev/null | sort -V | tail -1)"
-                msvc_link="${newest}bin/Hostx64/x64/link.exe"
-                if [ -f "$msvc_link" ]; then
-                    export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="$(cygpath -w "$msvc_link")"
-                fi
-            fi
-            cargo +{{ toolchain }} build --locked --release -p wrkspc-cli --bin wrkspc --target x86_64-pc-windows-msvc
-            bin="target/x86_64-pc-windows-msvc/release/wrkspc.exe"
-            name="x86_64-pc-windows-msvc"
-            ;;
-        windows-arm)
-            msvc_root="/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC"
-            if [ -d "$msvc_root" ]; then
-                newest="$(ls -d "$msvc_root"/*/ 2>/dev/null | sort -V | tail -1)"
-                msvc_link="${newest}bin/HostARM64/arm64/link.exe"
-                [ -f "$msvc_link" ] || msvc_link="${newest}bin/Hostx64/arm64/link.exe"
-                if [ -f "$msvc_link" ]; then
-                    export CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER="$(cygpath -w "$msvc_link")"
-                fi
-            fi
-            cargo +{{ toolchain }} build --locked --release -p wrkspc-cli --bin wrkspc --target aarch64-pc-windows-msvc
-            bin="target/aarch64-pc-windows-msvc/release/wrkspc.exe"
-            name="aarch64-pc-windows-msvc"
-            ;;
         *)
-            echo "release-tarball: unsupported target '$TARGET' (use 'native', a linux triple, 'windows', or 'windows-arm')" >&2
+            echo "release-tarball: unsupported target '$TARGET' (use 'native' or a linux triple)" >&2
             exit 1
             ;;
     esac
@@ -488,28 +451,59 @@ release-tarball target="native":
     # requires notice retention).
     stage="$(mktemp -d)"
     trap 'rm -rf "$stage"' EXIT
-    if [[ "$bin" == *.exe ]]; then
-        # Windows artifacts ship as zip — this branch is unreachable on
-        # macOS/Linux. PowerShell Compress-Archive is the ONLY zip
-        # writer guaranteed present on Windows: Git Bash ships no `zip`
-        # binary, and Microsoft's bsdtar cannot WRITE the zip format
-        # (`tar -a -cf x.zip` silently emits a tar file under a .zip
-        # name — caught on the Windows test box). cygpath converts the
-        # MSYS paths to Windows form for the PowerShell call.
-        cp "$bin" "$stage/wrkspc.exe"
-        cp LICENSE "$stage/LICENSE"
-        win_stage="$(cygpath -w "$stage")"
-        win_zip="$(cygpath -w "$(pwd)/dist/wrkspc-${name}.zip")"
-        powershell.exe -NoProfile -Command "Compress-Archive -Force -Path \"${win_stage}\\*\" -DestinationPath \"${win_zip}\""
-        (cd dist && hash_file "wrkspc-${name}.zip" >> "SHA256SUMS-${name}")
-        echo "dist/wrkspc-${name}.zip"
-    else
-        cp "$bin" "$stage/wrkspc"
-        cp LICENSE "$stage/LICENSE"
-        (cd dist && tar -czf "wrkspc-${name}.tar.gz" -C "$stage" wrkspc LICENSE)
-        (cd dist && hash_file "wrkspc-${name}.tar.gz" >> "SHA256SUMS-${name}")
-        echo "dist/wrkspc-${name}.tar.gz"
-    fi
+    cp "$bin" "$stage/wrkspc"
+    cp LICENSE "$stage/LICENSE"
+    (cd dist && tar -czf "wrkspc-${name}.tar.gz" -C "$stage" wrkspc LICENSE)
+    (cd dist && shasum -a 256 "wrkspc-${name}.tar.gz" >> "SHA256SUMS-${name}")
+    echo "dist/wrkspc-${name}.tar.gz"
+
+# Windows packaging (x86_64 and arm64 MSVC). PowerShell-native: the
+# recipe runs in the runner's pwsh, not Git Bash, so MSYS can neither
+# shadow link.exe with its coreutils `link` nor convert LIB/INCLUDE to
+# POSIX paths. The workflow's Windows steps stay on their default pwsh
+# shell for the same reason.
+[windows]
+release-tarball target:
+    #!/usr/bin/env pwsh
+    $ErrorActionPreference = 'Stop'
+    $Target = '{{ target }}'
+    $Toolchain = '{{ toolchain }}'
+    $Root = (Get-Location).Path
+    $DistDir = Join-Path $Root 'dist'
+    New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
+
+    $RustTarget = switch ($Target) {
+        'windows'     { 'x86_64-pc-windows-msvc' }
+        'windows-arm' { 'aarch64-pc-windows-msvc' }
+        default       { Write-Error "release-tarball: unsupported target '$Target' (windows, windows-arm)"; exit 1 }
+    }
+
+    # The +toolchain pin keeps ambient shims from winning; the toolchain
+    # itself syncs from rust-toolchain.toml via rustup.
+    & cargo +$Toolchain build --locked --release -p wrkspc-cli --bin wrkspc --target $RustTarget
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    # LICENSE rides in every artifact (the project's own license
+    # requires notice retention).
+    $Stage = Join-Path ([System.IO.Path]::GetTempPath()) ('wrkspc-stage-' + [guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $Stage | Out-Null
+        Copy-Item (Join-Path $Root "target\$RustTarget\release\wrkspc.exe") (Join-Path $Stage 'wrkspc.exe')
+        Copy-Item (Join-Path $Root 'LICENSE') (Join-Path $Stage 'LICENSE')
+
+        # Compress-Archive is the always-present native zip writer
+        # (Git Bash ships none; Microsoft's bsdtar cannot write zip).
+        $Zip = Join-Path $DistDir "wrkspc-$RustTarget.zip"
+        Compress-Archive -Force -Path (Join-Path $Stage '*') -DestinationPath $Zip
+
+        # Get-FileHash emits the same `hash  path` line the checksum
+        # fragments use on the unix legs.
+        $Hash = (Get-FileHash -Algorithm SHA256 -Path $Zip).Hash.ToLowerInvariant()
+        Add-Content -Path (Join-Path $DistDir "SHA256SUMS-$RustTarget") -Value "$Hash  wrkspc-$RustTarget.zip"
+        Write-Output "dist/wrkspc-$RustTarget.zip"
+    } finally {
+        Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
+    }
 
 # Consolidate the per-artifact checksums into the release SHA256SUMS.
 release-checksum:
