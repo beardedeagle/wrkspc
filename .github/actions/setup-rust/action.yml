@@ -38,6 +38,10 @@ inputs:
     description: Cargo target directory for tool installation builds.
     required: false
     default: target/cargo-install
+  install-zig:
+    description: Whether to install zig + cargo-zigbuild (only Linux cross legs need them; native and Windows MSVC builds do not).
+    required: false
+    default: "true"
   zig-version:
     description: Zig release to install for cross compilation (the clippy-linux cc shim and cargo zigbuild execute `zig`).
     required: false
@@ -80,7 +84,7 @@ runs:
     # execute `zig`; the pinned platform tarball is sha256-verified
     # before it lands on PATH.
     - name: Install pinned Zig (cross-build linker)
-      if: ${{ inputs.install-rust == 'true' }}
+      if: ${{ inputs.install-rust == 'true' && inputs.install-zig == 'true' }}
       shell: bash
       env:
         ZIG_VERSION: ${{ inputs.zig-version }}
@@ -141,7 +145,7 @@ runs:
 
     # Linux release legs cross-build through cargo-zigbuild.
     - name: Install cargo-zigbuild
-      if: ${{ inputs.install-rust == 'true' }}
+      if: ${{ inputs.install-rust == 'true' && inputs.install-zig == 'true' }}
       shell: bash
       env:
         CARGO_ZIGBUILD_VERSION: ${{ inputs.cargo-zigbuild-version }}

@@ -419,14 +419,17 @@ deploy-node $host="":
 # Release packaging — GitHub release tarballs (.github/workflows/release.yml)
 # =============================================================================
 
-# Package one platform's release binary as a tarball in dist/ with a
-# per-artifact sha256. Native targets build with plain cargo; Linux
-# cross-targets build via cargo-zigbuild, matching `build-matrix`.
+# Package one platform's release binary in dist/ with a per-artifact
+# sha256. Native targets build with plain cargo; Linux cross-targets
+# build via cargo-zigbuild; Windows targets build natively with the
+# runner's MSVC toolchain (windows = x86_64, windows-arm = arm64) and
+# ship as .zip.
 release-tarball target="native":
     #!/usr/bin/env bash
     set -euo pipefail
     TARGET="{{target}}"
     mkdir -p dist
+    dist_abs="$(pwd)/dist"
     case "$TARGET" in
         native)
             cargo +{{toolchain}} build --locked --release -p wrkspc-cli --bin wrkspc
@@ -438,8 +441,18 @@ release-tarball target="native":
             bin="target/$TARGET/release/wrkspc"
             name="$TARGET"
             ;;
+        windows)
+            cargo +{{toolchain}} build --locked --release -p wrkspc-cli --bin wrkspc --target x86_64-pc-windows-msvc
+            bin="target/x86_64-pc-windows-msvc/release/wrkspc.exe"
+            name="x86_64-pc-windows-msvc"
+            ;;
+        windows-arm)
+            cargo +{{toolchain}} build --locked --release -p wrkspc-cli --bin wrkspc --target aarch64-pc-windows-msvc
+            bin="target/aarch64-pc-windows-msvc/release/wrkspc.exe"
+            name="aarch64-pc-windows-msvc"
+            ;;
         *)
-            echo "release-tarball: unsupported target '$TARGET' (use 'native' or a linux triple)" >&2
+            echo "release-tarball: unsupported target '$TARGET' (use 'native', a linux triple, 'windows', or 'windows-arm')" >&2
             exit 1
             ;;
     esac
@@ -447,11 +460,21 @@ release-tarball target="native":
     # requires notice retention).
     stage="$(mktemp -d)"
     trap 'rm -rf "$stage"' EXIT
-    cp "$bin" "$stage/wrkspc"
-    cp LICENSE "$stage/LICENSE"
-    tar -C "$stage" -czf "dist/wrkspc-${name}.tar.gz" wrkspc LICENSE
-    (cd dist && shasum -a 256 "wrkspc-${name}.tar.gz" >> "SHA256SUMS-${name}")
-    echo "dist/wrkspc-${name}.tar.gz"
+    if [[ "$bin" == *.exe ]]; then
+        # Windows artifacts ship as zip. `tar -a` (bsdtar) writes zip
+        # from the extension on every platform, avoiding a zip dep.
+        cp "$bin" "$stage/wrkspc.exe"
+        cp LICENSE "$stage/LICENSE"
+        tar -C "$stage" -a -cf "$dist_abs/wrkspc-${name}.zip" wrkspc.exe LICENSE
+        (cd dist && shasum -a 256 "wrkspc-${name}.zip" >> "SHA256SUMS-${name}")
+        echo "dist/wrkspc-${name}.zip"
+    else
+        cp "$bin" "$stage/wrkspc"
+        cp LICENSE "$stage/LICENSE"
+        tar -C "$stage" -czf "$dist_abs/wrkspc-${name}.tar.gz" wrkspc LICENSE
+        (cd dist && shasum -a 256 "wrkspc-${name}.tar.gz" >> "SHA256SUMS-${name}")
+        echo "dist/wrkspc-${name}.tar.gz"
+    fi
 
 # Consolidate the per-artifact checksums into the release SHA256SUMS.
 release-checksum:

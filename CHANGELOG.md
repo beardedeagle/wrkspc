@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator approval through the protected `release-signing`
   environment. Verification instructions live in `DISTRIBUTION.md`,
   and a zizmor workflow-audit job guards the Actions definitions.
+- The release matrix now also ships macOS x86_64, Windows x86_64, and
+  Windows arm64 binaries — Windows artifacts as `.zip`, built natively
+  with the runner's MSVC toolchain.
 
 ## [0.1.0] - 2026-11-10
 
