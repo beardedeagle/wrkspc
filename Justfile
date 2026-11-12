@@ -57,15 +57,21 @@ clippy-release:
 # the zig shim and use the system cc. Zig-compiled C objects can carry
 # UBSan runtime references that the host's gcc dylib links (sqlx's proc
 # macros) cannot resolve, so the shim is for genuine cross-compiles only.
+# Install a rustup target's standard library when missing. The
+# toolchain file declares no static targets (CI legs install their own
+# via setup-rust), so fresh checkouts self-install on demand before any
+# cross build/clippy that needs the target's std.
+install-target target:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! rustup +{{ toolchain }} target list --installed | grep -qx "{{ target }}"; then
+        rustup +{{ toolchain }} target add "{{ target }}"
+    fi
+
 clippy-linux:
     #!/usr/bin/env bash
     set -euo pipefail
-    # The toolchain file declares no static targets (CI legs install
-    # their own via setup-rust), so a fresh checkout self-installs this
-    # one on demand before the cross-clippy runs.
-    if ! rustup +{{ toolchain }} target list --installed | grep -qx x86_64-unknown-linux-gnu; then
-        rustup +{{ toolchain }} target add x86_64-unknown-linux-gnu
-    fi
+    just install-target x86_64-unknown-linux-gnu
     host="$(rustc +{{ toolchain }} -vV | grep '^host' | cut -d' ' -f2)"
     if [[ "$host" == "x86_64-unknown-linux-gnu" ]]; then
         cargo +{{ toolchain }} clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
@@ -315,6 +321,7 @@ build-matrix level target="native":
     # mise rust shim needs the explicit RUSTUP_TOOLCHAIN pin.
     if [[ -n "$RUST_TARGET" ]]; then
         echo "Target: $RUST_TARGET (cargo-zigbuild)"
+        just install-target "$RUST_TARGET"
         RUSTUP_TOOLCHAIN="{{ toolchain }}" cargo zigbuild --locked -p wrkspc-cli --bin wrkspc $CARGO_ARGS --target "$RUST_TARGET"
         echo "Output: target/$RUST_TARGET/$([ "$LEVEL" = "debug" ] && echo "debug" || echo "release")/wrkspc"
     else
@@ -451,6 +458,7 @@ release-tarball target="native":
             name="$(rustc +{{ toolchain }} -vV | grep host | cut -d' ' -f2)"
             ;;
         *linux*)
+            just install-target "$TARGET"
             RUSTUP_TOOLCHAIN="{{ toolchain }}" cargo zigbuild --locked --release -p wrkspc-cli --bin wrkspc --target "$TARGET"
             bin="target/$TARGET/release/wrkspc"
             name="$TARGET"
