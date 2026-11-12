@@ -53,9 +53,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated protocol SDKs and supporting dependencies, retaining ACP
   protocol v1, stdio and HTTP MCP, and the existing SQLite schema.
 - Docs: the bindable-cohort page registers Claude Code
-  (`claude --acp`), the Hub API reference covers the login, kick,
+  (`claude-agent-acp`), the Hub API reference covers the login, kick,
   rename, and delete routes, and the rustdoc API reference is embedded
   in the published site at `/rustdoc`.
+- Installer scripts (`install.sh` / `install.ps1`): fetch the
+  platform-matched release, verify the checksum and Sigstore
+  attestation, install the binary, and walk through first-run setup —
+  PKI via `openssl`, a `bindings.toml` template, and the assembled hub
+  and node run commands. Idempotent, with a `--yes`/env-override
+  non-interactive mode; never writes shell dotfiles or handles secrets
+  itself.
 
 ### Security
 
