@@ -449,11 +449,32 @@ release-tarball target="native":
             name="$TARGET"
             ;;
         windows)
+            # MSYS /usr/bin shadows link.exe on Git-Bash-for-Windows:
+            # its coreutils `link` (hardlink) wins PATH resolution over
+            # the MSVC linker and rustc then fails with "extra operand".
+            # Pin the real linker when VS Build Tools is installed.
+            msvc_root="/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC"
+            if [ -d "$msvc_root" ]; then
+                newest="$(ls -d "$msvc_root"/*/ 2>/dev/null | sort -V | tail -1)"
+                msvc_link="${newest}bin/Hostx64/x64/link.exe"
+                if [ -f "$msvc_link" ]; then
+                    export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="$(cygpath -w "$msvc_link")"
+                fi
+            fi
             cargo +{{ toolchain }} build --locked --release -p wrkspc-cli --bin wrkspc --target x86_64-pc-windows-msvc
             bin="target/x86_64-pc-windows-msvc/release/wrkspc.exe"
             name="x86_64-pc-windows-msvc"
             ;;
         windows-arm)
+            msvc_root="/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC"
+            if [ -d "$msvc_root" ]; then
+                newest="$(ls -d "$msvc_root"/*/ 2>/dev/null | sort -V | tail -1)"
+                msvc_link="${newest}bin/HostARM64/arm64/link.exe"
+                [ -f "$msvc_link" ] || msvc_link="${newest}bin/Hostx64/arm64/link.exe"
+                if [ -f "$msvc_link" ]; then
+                    export CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER="$(cygpath -w "$msvc_link")"
+                fi
+            fi
             cargo +{{ toolchain }} build --locked --release -p wrkspc-cli --bin wrkspc --target aarch64-pc-windows-msvc
             bin="target/aarch64-pc-windows-msvc/release/wrkspc.exe"
             name="aarch64-pc-windows-msvc"
