@@ -429,7 +429,6 @@ release-tarball target="native":
     set -euo pipefail
     TARGET="{{ target }}"
     mkdir -p dist
-    dist_abs="$(pwd)/dist"
     # macOS ships `shasum`; Git Bash (Windows legs) ships `sha256sum`.
     # Both print the same `hash␣␣filename` line the checksum file needs.
     if command -v shasum >/dev/null 2>&1; then
@@ -470,15 +469,19 @@ release-tarball target="native":
     if [[ "$bin" == *.exe ]]; then
         # Windows artifacts ship as zip. `tar -a` (bsdtar) writes zip
         # from the extension on every platform, avoiding a zip dep.
+        # The archive name is RELATIVE and written from inside dist/:
+        # an absolute C:\ path handed to the native Windows bsdtar is
+        # misparsed as the remote-archive `host:path` form
+        # ("Cannot connect to C: resolve failed").
         cp "$bin" "$stage/wrkspc.exe"
         cp LICENSE "$stage/LICENSE"
-        tar -C "$stage" -a -cf "$dist_abs/wrkspc-${name}.zip" wrkspc.exe LICENSE
+        (cd dist && tar -a -cf "wrkspc-${name}.zip" -C "$stage" wrkspc.exe LICENSE)
         (cd dist && hash_file "wrkspc-${name}.zip" >> "SHA256SUMS-${name}")
         echo "dist/wrkspc-${name}.zip"
     else
         cp "$bin" "$stage/wrkspc"
         cp LICENSE "$stage/LICENSE"
-        tar -C "$stage" -czf "$dist_abs/wrkspc-${name}.tar.gz" wrkspc LICENSE
+        (cd dist && tar -czf "wrkspc-${name}.tar.gz" -C "$stage" wrkspc LICENSE)
         (cd dist && hash_file "wrkspc-${name}.tar.gz" >> "SHA256SUMS-${name}")
         echo "dist/wrkspc-${name}.tar.gz"
     fi
