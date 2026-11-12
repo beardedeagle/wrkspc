@@ -275,6 +275,57 @@ async fn unknown_attempts_surface_and_reconcile() {
     );
     let _ = ui.shutdown.send(());
 }
+/// A directed post whose recipient list exceeds the cap is refused
+/// outright: no partial resolution, no fan-out, no committed message
+/// (CodeQL `rust/uncontrolled-allocation-size`).
+#[tokio::test]
+async fn directed_post_rejects_recipient_lists_over_the_cap() {
+    let ui = spawn_ui().await;
+    let conversation = ui.conversation_id().await;
+
+    let recipients: Vec<String> = (0..33).map(|index| format!("peer{index}")).collect();
+    let res = ui
+        .client()
+        .post(format!(
+            "{}/api/conversations/{conversation}/messages",
+            ui.base
+        ))
+        .bearer_auth(TOKEN)
+        .json(&serde_json::json!({
+            "content": "directed at everyone",
+            "recipients": recipients,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("too many recipients") && error.contains("32")),
+        "the refusal names the cap: {body}"
+    );
+
+    // Nothing was committed and nothing was queued for execution.
+    assert_eq!(ui.store.due_intents().await.unwrap().len(), 0);
+    let messages: Vec<serde_json::Value> = ui
+        .client()
+        .get(format!(
+            "{}/api/conversations/{conversation}/messages",
+            ui.base
+        ))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 0, "no message lands on a refused post");
+    let _ = ui.shutdown.send(());
+}
+
 /// Hub-mode operator posts queue a pollable delivery task for remote-host recipients.
 #[tokio::test]
 async fn hub_mode_operator_post_queues_remote_deliveries() {

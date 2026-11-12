@@ -9,6 +9,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use wrkspc_core::{CancelOutcome, FenceKind};
 
+/// The ceiling on directed-post recipients per message. The request body
+/// itself is bounded by the server's extraction limits, but a near-limit
+/// array would still fan out to thousands of per-target store resolves
+/// and deliveries; the cap keeps one post from amplifying into unbounded
+/// work (CodeQL `rust/uncontrolled-allocation-size`).
+const MAX_DIRECTED_RECIPIENTS: usize = 32;
+
 /// Removes one member from a conversation (kick from the room). The peer
 /// stays enrolled in the hub and in other conversations; already-running
 /// deliveries finish. The `operator` member is never removable.
@@ -54,6 +61,15 @@ pub(crate) async fn post_message(
     // that is not a member rather than silently dropping it.
     let directed: Option<Vec<String>> = match body.recipients {
         Some(requested) => {
+            if requested.len() > MAX_DIRECTED_RECIPIENTS {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!(
+                        "too many recipients: {} (max {MAX_DIRECTED_RECIPIENTS})",
+                        requested.len()
+                    ) })),
+                ));
+            }
             let mut resolved = Vec::with_capacity(requested.len());
             for target in requested {
                 let peer_id = state

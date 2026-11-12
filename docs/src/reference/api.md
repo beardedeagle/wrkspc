@@ -19,7 +19,7 @@ it); the node UI reads and follows the rooms the hub owns.
 | `PATCH /api/conversations/{id}` | Rename a conversation |
 | `DELETE /api/conversations/{id}` | Delete a conversation |
 | `DELETE /api/conversations/{id}/members/{peer}` | Kick a peer from the conversation |
-| `POST /api/conversations/{id}/messages` | Post a message to a conversation |
+| `POST /api/conversations/{id}/messages` | Post a message to a conversation; a directed post accepts at most 32 recipients |
 | `GET /api/conversations/{id}/messages` | The conversation's message rows (redacted); `?window=N` bounds the response to the latest N; streamed turn output and reports ride the events feed |
 | `GET /api/conversations/{id}/events` | The committed event feed, cursor-resumable |
 | `GET /api/peers` | Enrolled peers and their presence |
