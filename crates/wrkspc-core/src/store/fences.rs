@@ -16,7 +16,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn set_fence(
         &self,
         conversation_id: &str,
@@ -74,7 +74,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the fence
+    /// Returns [`StoreError::NotFound`] when the fence
     /// does not exist.
     pub async fn ack_fence(&self, fence_id: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
@@ -109,7 +109,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the fence
+    /// Returns [`StoreError::NotFound`] when the fence
     /// does not exist.
     pub async fn clear_fence(&self, fence_id: &str, cleared_by: &str) -> Result<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -156,7 +156,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn active_fences(&self, conversation_id: &str, peer_id: &str) -> Result<Vec<Fence>> {
         let rows = sqlx::query(
             "SELECT id, conversation_id, peer_id, kind, set_by, set_at, acked_at

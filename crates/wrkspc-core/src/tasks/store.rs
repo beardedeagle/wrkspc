@@ -1,4 +1,4 @@
-//! The task-persistence half of the [`Store`](crate::store::Store):
+//! The task-persistence half of the [`Store`]:
 //! task CRUD with keyset pagination, delivery-task queueing, and the
 //! delivery claim lifecycle.
 
@@ -11,8 +11,6 @@ use sqlx::Row;
 impl Store {
     /// Creates a task row. The initial version is 1.
     ///
-    /// # Arguments
-    ///
     /// * `task_id` — unique task identifier.
     /// * `context_id` — logical grouping identifier.
     /// * `state` — the caller's state literal (opaque to core).
@@ -21,8 +19,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::AlreadyExists`](StoreError::AlreadyExists) when
-    /// the task id exists, [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::AlreadyExists`] when
+    /// the task id exists, [`StoreError::Db`] on failure.
     pub async fn task_create(
         &self,
         task_id: &str,
@@ -75,8 +73,6 @@ impl Store {
     /// keeps the version (idempotent re-emission); a different state over a
     /// terminal row is rejected.
     ///
-    /// # Arguments
-    ///
     /// * `task_id` — the task to update.
     /// * `state` — the new state literal.
     /// * `terminal` — whether the new state is terminal.
@@ -88,9 +84,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the task
-    /// does not exist, [`StoreError::TaskTerminal`](StoreError::TaskTerminal)
-    /// on an illegal transition, [`StoreError::Db`](StoreError::Db) on
+    /// Returns [`StoreError::NotFound`] when the task
+    /// does not exist, [`StoreError::TaskTerminal`]
+    /// on an illegal transition, [`StoreError::Db`] on
     /// failure.
     pub async fn task_update(
         &self,
@@ -152,13 +148,11 @@ impl Store {
 
     /// Fetches a task row.
     ///
-    /// # Arguments
-    ///
     /// * `task_id` — the task to fetch.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn task_get(&self, task_id: &str) -> Result<Option<TaskRow>> {
         let row = sqlx::query("SELECT * FROM a2a_tasks WHERE task_id = ?")
             .bind(task_id)
@@ -168,8 +162,6 @@ impl Store {
     }
 
     /// Lists task rows, newest first, with keyset pagination.
-    ///
-    /// # Arguments
     ///
     /// * `context_id` — optional context filter.
     /// * `state` — optional state-literal filter.
@@ -184,7 +176,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn task_list(
         &self,
         context_id: Option<&str>,
@@ -266,8 +258,6 @@ impl Store {
     /// re-queueing is idempotent and a partially completed fan-out is
     /// repairable without duplicates.
     ///
-    /// # Arguments
-    ///
     /// * `request` — the delivery to queue.
     ///
     /// # Returns
@@ -276,7 +266,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn task_create_delivery(&self, request: DeliveryTaskRequest<'_>) -> Result<String> {
         let task_id = crate::tasks::delivery_task_id(request.message_id, request.recipient_peer);
         let now = Utc::now().to_rfc3339();
@@ -346,8 +336,6 @@ impl Store {
     /// instance; a second instance presenting the same cert gets the
     /// foreign-claim outcome. Terminal tasks cannot be claimed.
     ///
-    /// # Arguments
-    ///
     /// * `task_id` — the delivery task to claim.
     /// * `host_id` — the claiming host (its certificate SAN).
     /// * `instance_id` — the node's stable local identity (distinguishes
@@ -359,10 +347,11 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) for an
-    /// unknown task, [`StoreError::TaskTerminal`](StoreError::TaskTerminal)
-    /// for a terminal task, and
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::NotFound`] for an
+    /// unknown task, [`StoreError::TaskTerminal`] for a terminal task,
+    /// [`StoreError::BlockedByFence`] when a moderation gate or a
+    /// malformed delivery payload blocks the claim, and
+    /// [`StoreError::Db`] on failure.
     pub async fn claim_delivery(
         &self,
         task_id: &str,
@@ -455,8 +444,6 @@ impl Store {
     /// no TTL by design). Idempotent: releasing an unclaimed task is a
     /// no-op.
     ///
-    /// # Arguments
-    ///
     /// * `task_id` — the delivery task to release.
     ///
     /// # Returns
@@ -465,7 +452,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn release_delivery_claim(&self, task_id: &str) -> Result<bool> {
         let result = sqlx::query("DELETE FROM delivery_claims WHERE task_id = ?")
             .bind(task_id)
@@ -476,8 +463,6 @@ impl Store {
 
     /// Reads a delivery claim, if one exists.
     ///
-    /// # Arguments
-    ///
     /// * `task_id` — the delivery task to query.
     ///
     /// # Returns
@@ -487,7 +472,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn delivery_claim(&self, task_id: &str) -> Result<Option<(String, String, String)>> {
         let row = sqlx::query(
             "SELECT host_id, instance_id, claimed_at FROM delivery_claims WHERE task_id = ?",
@@ -503,8 +488,6 @@ impl Store {
     ///
     /// The check and the transition run in one transaction.
     ///
-    /// # Arguments
-    ///
     /// * `task_id` — the task to cancel.
     /// * `canceled_state` — the caller's canceled-state literal.
     /// * `canceled_json` — the caller's serialized canceled-task blob.
@@ -515,9 +498,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the task
-    /// does not exist, [`StoreError::TaskTerminal`](StoreError::TaskTerminal)
-    /// when it is already terminal, [`StoreError::Db`](StoreError::Db) on
+    /// Returns [`StoreError::NotFound`] when the task
+    /// does not exist, [`StoreError::TaskTerminal`]
+    /// when it is already terminal, [`StoreError::Db`] on
     /// failure.
     pub async fn task_begin_cancel(
         &self,
@@ -577,8 +560,6 @@ impl Store {
     /// to the terminal canceled state with its record preserved (the
     /// delivery envelope survives — H-13).
     ///
-    /// # Arguments
-    ///
     /// * `task_id` — the delivery task to cancel.
     ///
     /// # Returns
@@ -588,7 +569,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn task_mark_canceled(&self, task_id: &str) -> Result<Option<TaskRow>> {
         let Some(current) = self.task_get(task_id).await? else {
             return Ok(None);
@@ -626,15 +607,13 @@ impl Store {
 /// The delivery identity needed to evaluate a hub-side moderation gate:
 /// the committed message id and the recipient peer, parsed from the
 /// task payload's `metadata.delivery` envelope (written by
-/// [`Store::task_create_delivery`](Store::task_create_delivery)).
+/// [`Store::task_create_delivery`]).
 struct DeliveryGateKeys {
     message_id: String,
     recipient_peer: String,
 }
 
 /// Parses the gate-relevant keys out of a delivery task's payload blob.
-///
-/// # Arguments
 ///
 /// * `task_json` — the stored `a2a_tasks.task_json` blob.
 ///

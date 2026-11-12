@@ -18,8 +18,6 @@ use wrkspc_core::{DueIntent, Store};
 /// the agent sends none) so a reader can tell where one agent message
 /// ends and the next begins within a turn.
 ///
-/// # Arguments
-///
 /// * `store` — the transactional store.
 /// * `conversation_id` — the owning conversation.
 /// * `attempt_id` — the in-flight attempt.
@@ -91,8 +89,6 @@ pub(crate) struct DriveContext {
 }
 
 /// Drives one claimed intent to its terminal state.
-///
-/// # Arguments
 ///
 /// * `ctx` — the shared drive context.
 /// * `intent` — the claimed intent.

@@ -63,9 +63,7 @@ pub struct HubRunArgs {
 
 /// Runs the hub until ctrl-c.
 ///
-/// # Arguments
-///
-/// * `args` — the parsed hub arguments.
+/// Takes `args`, the parsed hub arguments.
 ///
 /// # Errors
 ///
@@ -397,10 +395,8 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
 /// required — the browser UI joins the same listener; the A2A routes
 /// enforce the client-certificate stamp themselves.
 ///
-/// # Arguments
-///
-/// * `cert`/`key` — server material in PEM.
-/// * `ca` — trusted CA roots in PEM.
+/// `cert`/`key` are the server material in PEM; `ca` holds the trusted
+/// CA roots in PEM.
 ///
 /// # Returns
 ///
@@ -454,10 +450,8 @@ fn build_acceptor(
 /// deploy wrapper's tmpfs handoff), then `WRKSPC_UI_TOKEN`, then the
 /// stable token derived from the hub database.
 ///
-/// # Arguments
-///
-/// * `db` — the hub database path.
-/// * `file` — the optional explicit token file.
+/// `db` is the hub database path; `file` is the optional explicit
+/// token file.
 ///
 /// # Returns
 ///
@@ -501,9 +495,7 @@ async fn require_peer_stamp(
 
 /// Loads the serial deny-list file (one lowercase hex serial per line).
 ///
-/// # Arguments
-///
-/// * `path` — optional file path.
+/// `path` is the optional file path.
 ///
 /// # Returns
 ///

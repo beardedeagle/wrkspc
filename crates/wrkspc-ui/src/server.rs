@@ -127,15 +127,12 @@ impl std::fmt::Debug for UiServer {
 impl UiServer {
     /// Builds a UI server.
     ///
-    /// # Arguments
-    ///
-    /// * `store` — the transactional store.
-    /// * `cancel` — the cancel seam (the dispatcher handle in production).
-    /// * `config` — bind address and bearer token.
-    /// * `deny` — the hub's live certificate-serial deny set, when this
-    ///   server is embedded on the mTLS surface; operator bans update
-    ///   it so revocations take effect on the next handshake without a
-    ///   hub restart.
+    /// `store` is the transactional store; `cancel` is the cancel seam
+    /// (the dispatcher handle in production); `config` carries the bind
+    /// address and bearer token; `deny` is the hub's live
+    /// certificate-serial deny set, when this server is embedded on the
+    /// mTLS surface — operator bans update it so revocations take
+    /// effect on the next handshake without a hub restart.
     pub fn new(
         store: Store,
         cancel: Arc<dyn crate::api::CancelRequester>,
@@ -165,11 +162,8 @@ impl UiServer {
         }
     }
 
-    /// Binds the configured address and serves until `shutdown` resolves.
-    ///
-    /// # Arguments
-    ///
-    /// * `shutdown` — a future that ends serving when it resolves.
+    /// Binds the configured address and serves until `shutdown`
+    /// resolves (a future that ends serving when it completes).
     ///
     /// # Errors
     ///
@@ -187,9 +181,8 @@ impl UiServer {
     /// listener (e.g. the hub's TLS surface, which routes by path).
     /// [`UiServer::serve_on`] serves exactly this router.
     ///
-    /// # Arguments
-    ///
-    /// * `token` — the resolved bearer token (see [`UiServer::resolve_token`]).
+    /// `token` is the resolved bearer token (see
+    /// [`UiServer::resolve_token`]).
     ///
     /// # Returns
     ///
@@ -286,11 +279,9 @@ impl UiServer {
 
     /// Serves on an already-bound `listener` until `shutdown` resolves.
     ///
-    /// # Arguments
-    ///
-    /// * `listener` — a bound TCP listener (tests bind port 0 themselves
-    ///   to discover the address).
-    /// * `shutdown` — a future that ends serving when it resolves.
+    /// `listener` is a bound TCP listener (tests bind port 0 themselves
+    /// to discover the address); `shutdown` is a future that ends
+    /// serving when it resolves.
     ///
     /// # Errors
     ///

@@ -25,9 +25,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::IdempotencyConflict`](StoreError::IdempotencyConflict)
+    /// Returns [`StoreError::IdempotencyConflict`]
     /// when the key is reused with different content, and
-    /// [`StoreError::NotFound`](StoreError::NotFound) for non-members.
+    /// [`StoreError::NotFound`] for non-members.
     pub async fn accept_message(
         &self,
         conversation_id: &str,
@@ -304,8 +304,6 @@ impl Store {
     /// into a broadcast storm.
     ///
     /// Human peers never take a delivery.
-    ///
-    /// # Arguments
     ///
     /// * `tx` — the acceptance transaction.
     /// * `conversation_id` — the room the post lands in.

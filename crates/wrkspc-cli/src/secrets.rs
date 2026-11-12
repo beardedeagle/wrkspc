@@ -30,10 +30,6 @@ pub trait TokenStore: Send + Sync {
 
     /// Removes the token for `account`; a missing entry is not an error.
     ///
-    /// # Arguments
-    ///
-    /// * `account` — the account whose token is removed.
-    ///
     /// # Errors
     ///
     /// Returns the store failure.
@@ -57,10 +53,8 @@ pub fn platform_store() -> Box<dyn TokenStore> {
 /// indefinitely; that must surface as a fast, loud failure — never a
 /// silently hung node startup or CLI.
 ///
-/// # Arguments
-///
-/// * `label` — what was being attempted (for the timeout message).
-/// * `operation` — the blocking store call to bound.
+/// `label` is what was being attempted (for the timeout message);
+/// `operation` is the blocking store call to bound.
 ///
 /// # Errors
 ///
@@ -158,9 +152,7 @@ async fn cleanup_legacy_token_file(path: &std::path::Path, stored: &str) {
 /// token generation, so a restart cannot invent a credential the
 /// wrapper did not supply.
 ///
-/// # Arguments
-///
-/// * `path` — the explicit token file.
+/// `path` is the explicit token file.
 ///
 /// # Errors
 ///
@@ -196,10 +188,8 @@ pub async fn resolve_ui_token_from_file(path: &Path) -> Result<String, String> {
 /// test/emergency pin, same role as the UI-token override) wins on
 /// every platform.
 ///
-/// # Arguments
-///
-/// * `db` — the node database (legacy sidecar location).
-/// * `peer` — the binding's peer id.
+/// `db` is the node database (legacy sidecar location); `peer` is the
+/// binding's peer id.
 ///
 /// # Errors
 ///
@@ -281,11 +271,9 @@ pub fn mcp_platform_store() -> Box<dyn TokenStore> {
 /// database-path-keyed Keychain entry into it, otherwise a freshly
 /// generated token.
 ///
-/// # Arguments
-///
-/// * `identity` — the node's stable name (its host id, or `default`).
-/// * `db` — the canonical database path (legacy-file migration key).
-/// * `file` — the optional explicit token file (`--ui-token-file`).
+/// `identity` is the node's stable name (its host id, or `default`);
+/// `db` is the canonical database path (legacy-file migration key);
+/// `file` is the optional explicit token file (`--ui-token-file`).
 ///
 /// # Errors
 ///
@@ -392,10 +380,8 @@ pub async fn resolve_ui_token(
 /// node side by another string (the node identity) split the two, and
 /// `wrkspc ui-token` reported no token for a node that just stored one.
 ///
-/// # Arguments
-///
-/// * `identity` — the node's stable name (macOS account).
-/// * `db` — the canonical database path (non-macOS file key).
+/// `identity` is the node's stable name (macOS account); `db` is the
+/// canonical database path (non-macOS file key).
 fn token_account(identity: &str, db: &Path) -> String {
     #[cfg(target_os = "macos")]
     {
@@ -437,11 +423,9 @@ pub fn ui_token_account(identity: &str) -> String {
 /// token file path (selectable with `--db`), and names the deploy
 /// wrapper's retrieval path when no store file exists.
 ///
-/// # Arguments
-///
-/// * `node` — the optional node name (macOS Keychain selector).
-/// * `db` — the optional database path (non-macOS file selector).
-/// * `file` — the optional explicit token file.
+/// `node` is the optional node name (macOS Keychain selector); `db` is
+/// the optional database path (non-macOS file selector); `file` is the
+/// optional explicit token file.
 ///
 /// # Errors
 ///
@@ -612,10 +596,8 @@ fn copy_to_clipboard(token: &str) -> Result<bool, Box<dyn std::error::Error>> {
 /// one, the keychain is enumerated: a single stored token is used
 /// directly; none or several produce a clear error naming `--node`.
 ///
-/// # Arguments
-///
-/// * `node` — the optional `--node` name.
-/// * `db` — ignored on macOS (kept for signature symmetry).
+/// `node` is the optional `--node` name; `db` is ignored on macOS (kept
+/// for signature symmetry).
 ///
 /// # Errors
 ///

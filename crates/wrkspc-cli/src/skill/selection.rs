@@ -50,14 +50,10 @@ pub fn parse_selection(
 /// gets the numbered list and a selection line, and a non-terminal
 /// input errors with a usage hint instead of guessing.
 ///
-/// # Arguments
-///
-/// * `home` — the home directory to detect under.
-/// * `harness` — the explicit `--harness` values, when given.
-/// * `all` — whether `--all` was passed.
-/// * `interactive` — whether stdin is a terminal.
-/// * `input` — the selection reader.
-/// * `output` — the prompt writer.
+/// `home` is the home directory to detect under; `harness` is the
+/// explicit `--harness` values, when given; `all` is whether `--all`
+/// was passed; `interactive` is whether stdin is a terminal; `input` is
+/// the selection reader; `output` is the prompt writer.
 ///
 /// # Returns
 ///

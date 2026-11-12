@@ -113,7 +113,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn open_attempts(&self) -> Result<Vec<OpenAttempt>> {
         let rows = sqlx::query(
             "SELECT a.id AS attempt_id, a.intent_id, a.state,
@@ -141,14 +141,12 @@ impl Store {
 
     /// Whether a cancel request is recorded on an attempt.
     ///
-    /// # Arguments
-    ///
     /// * `attempt_id` — the attempt to inspect.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
-    /// attempt does not exist, [`StoreError::Db`](StoreError::Db) on
+    /// Returns [`StoreError::NotFound`] when the
+    /// attempt does not exist, [`StoreError::Db`] on
     /// failure.
     pub async fn attempt_cancel_requested(&self, attempt_id: &str) -> Result<bool> {
         let flag: i64 = sqlx::query_scalar("SELECT cancel_requested FROM attempts WHERE id = ?")

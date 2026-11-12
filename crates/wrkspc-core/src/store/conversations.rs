@@ -11,7 +11,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn create_conversation(&self, members: &[&str]) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -47,8 +47,6 @@ impl Store {
     /// authoritative mirror ([`Store::mirror_conversations`]) and local
     /// creation add members.
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation id to ensure (the hub id
     ///   when mirroring).
     /// * `members` — the peers to enrol (on creation only).
@@ -60,7 +58,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn ensure_conversation(
         &self,
         conversation_id: &str,
@@ -96,13 +94,11 @@ impl Store {
     }
     /// Lists the peer ids currently enrolled in a conversation.
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation to query.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn conversation_members(&self, conversation_id: &str) -> Result<Vec<String>> {
         let rows = sqlx::query(
             "SELECT peer_id FROM conversation_members WHERE conversation_id = ? ORDER BY joined_at",
@@ -122,15 +118,13 @@ impl Store {
     /// interrupted mid-flight. The `operator` member can never be removed
     /// (a conversation without its moderator has no one to arbitrate).
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation to modify.
     /// * `peer_id` — the member to remove.
     /// * `actor` — who performed the removal (moderation provenance).
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`crate::error::StoreError::NotFound`] when the
     /// peer is not a member of that conversation.
     pub async fn remove_conversation_member(
         &self,
@@ -186,8 +180,6 @@ impl Store {
     /// wipe an unrelated host's queue, and deleting a room must not
     /// leave its remote tasks live).
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation to delete.
     ///
     /// # Returns
@@ -197,7 +189,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn delete_conversation(&self, conversation_id: &str) -> Result<bool> {
         // Existence FIRST: a nonexistent id deletes nothing, so a host
         // id string can never be mistaken for a room and wipe that
@@ -333,8 +325,6 @@ impl Store {
     /// The name is display metadata: nullable, not unique, and never a key. An
     /// empty or whitespace-only name clears it.
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the room.
     /// * `name` — the new name, or `None` to clear it.
     ///
@@ -370,8 +360,6 @@ impl Store {
     /// the hub omits stay as the node last knew them: a node that
     /// missed one poll must not lose a transcript, and node-local rooms
     /// are never touched.
-    ///
-    /// # Arguments
     ///
     /// * `conversations` — the hub's conversations, as the hub serves them.
     ///

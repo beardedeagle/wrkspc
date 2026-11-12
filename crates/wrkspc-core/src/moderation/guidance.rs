@@ -45,13 +45,11 @@ impl Store {
     /// Read-only view: the UI's pending list reads through here, so the
     /// dispatcher's claim state is deliberately NOT filtered out.
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn undelivered_guidance(&self, conversation_id: &str) -> Result<Vec<Guidance>> {
         let rows = sqlx::query(
             "SELECT id, conversation_id, author_id, text, created_at
@@ -80,14 +78,12 @@ impl Store {
     /// same guidance. The claim is released (not marked delivered) when
     /// the attempt does not resolve successfully.
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation.
     /// * `attempt_id` — the claiming attempt.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn claim_guidance(
         &self,
         conversation_id: &str,
@@ -125,13 +121,11 @@ impl Store {
     /// pending queue and re-ride the next turn (the attempt did not
     /// resolve successfully).
     ///
-    /// # Arguments
-    ///
     /// * `attempt_id` — the attempt whose claim is released.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn release_guidance_claim(&self, attempt_id: &str) -> Result<()> {
         sqlx::query("UPDATE guidance SET claimed_attempt = NULL WHERE claimed_attempt = ?")
             .bind(attempt_id)
@@ -145,14 +139,12 @@ impl Store {
     /// the consumption ack can address the authoritative rows.
     /// Idempotent — a re-delivered envelope does not duplicate rows.
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation.
     /// * `entries` — `(id, author_id, text)` triples from the envelope.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn ingest_guidance(
         &self,
         conversation_id: &str,
@@ -183,13 +175,11 @@ impl Store {
     /// Lists the ids of delivered guidance for a conversation — the
     /// consumption ack set the node reports back to the hub.
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn delivered_guidance_ids(&self, conversation_id: &str) -> Result<Vec<String>> {
         let ids = sqlx::query_scalar(
             "SELECT id FROM guidance WHERE conversation_id = ? AND delivered = 1",
@@ -202,13 +192,11 @@ impl Store {
 
     /// Marks guidance entries delivered (after they rode a prompt).
     ///
-    /// # Arguments
-    ///
     /// * `ids` — the guidance ids.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn mark_guidance_delivered(&self, ids: &[&str]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());

@@ -178,8 +178,6 @@ impl FenceKind {
 
     /// Parses a DB literal back into a fence kind.
     ///
-    /// # Arguments
-    ///
     /// * `literal` — the kind literal (`pause`/`hold`/`block`).
     ///
     /// # Returns

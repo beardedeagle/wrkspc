@@ -40,11 +40,9 @@ pub struct PresenceBody {
 impl PresenceState {
     /// Builds the state.
     ///
-    /// # Arguments
-    ///
-    /// * `store` — the hub's transactional store.
-    /// * `base_url` — the hub's card base URL (for per-peer cards).
-    /// * `mtls` — whether the hub's TLS surface serves the cards.
+    /// `store` is the hub's transactional store; `base_url` is the hub's
+    /// card base URL (for per-peer cards); `mtls` is whether the hub's
+    /// TLS surface serves the cards.
     pub fn new(store: Store, base_url: String, mtls: bool) -> Self {
         Self {
             store,
@@ -128,11 +126,9 @@ pub async fn roster_get(
 /// the rest, so the room set, its members, and the operator's names agree across
 /// machines instead of each store knowing only what it happened to see.
 ///
-/// # Arguments
-///
-/// * `state` — the discovery state holding the hub's store.
-/// * `headers` — the stamped identity headers; a request without a peer stamp
-///   is refused.
+/// `state` is the discovery state holding the hub's store; `headers`
+/// carries the stamped identity — a request without a peer stamp is
+/// refused.
 ///
 /// # Returns
 ///

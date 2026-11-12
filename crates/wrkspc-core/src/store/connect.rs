@@ -15,8 +15,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::AlreadyLocked`](StoreError::AlreadyLocked) when
-    /// another owner holds the lock, and [`StoreError::Db`](StoreError::Db)
+    /// Returns [`StoreError::AlreadyLocked`] when
+    /// another owner holds the lock, and [`StoreError::Db`]
     /// for any sqlite failure.
     pub async fn open(path: &Path, owner: &str) -> Result<Self> {
         Self::open_with(path, owner, true).await
@@ -35,14 +35,12 @@ impl Store {
     /// wedged a turn). A shared opener against an unmigrated database
     /// fails loudly on first use instead.
     ///
-    /// # Arguments
-    ///
     /// * `path` — the database file.
     /// * `owner` — the component's name (bookkeeping only).
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on open failure.
+    /// Returns [`StoreError::Db`] on open failure.
     pub async fn open_shared(path: &Path, owner: &str) -> Result<Self> {
         Self::open_with(path, owner, false).await
     }
@@ -91,7 +89,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn open_in_memory(owner: &str) -> Result<Self> {
         let opts = SqliteConnectOptions::new()
             .in_memory(true)
@@ -183,7 +181,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn release_lock(&self) -> Result<()> {
         // `unlock` is the standard-library file-lock API.
         let mut guard = self

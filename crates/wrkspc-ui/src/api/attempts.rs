@@ -1,4 +1,5 @@
-//! Unknown-attempt reconciliation and the stuck-claim release op.
+//! Unknown-attempt reconciliation: the merged local-plus-hub unknown
+//! view and the operator's retry/close decision.
 
 use super::{AppState, store_error};
 use crate::redact::redact;

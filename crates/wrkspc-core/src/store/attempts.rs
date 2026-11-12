@@ -12,16 +12,16 @@ impl Store {
     /// Claims an execution intent for dispatch, creating an attempt row
     /// BEFORE any harness write.
     ///
-    /// Idempotent: claiming an intent that already has an open (claimed,
-    /// dispatched, or unknown) attempt returns that attempt instead of
-    /// creating a second one.
+    /// Idempotent: claiming an intent that already has an open claimed
+    /// or dispatched attempt returns that attempt instead of creating
+    /// a second one; an unknown attempt blocks until reconciliation.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::BlockedByUnknown`](StoreError::BlockedByUnknown)
+    /// Returns [`StoreError::BlockedByUnknown`]
     /// when a prior attempt on this intent is unknown (operator
     /// reconciliation required first), and
-    /// [`StoreError::IntentTerminal`](StoreError::IntentTerminal) when the
+    /// [`StoreError::IntentTerminal`] when the
     /// intent already reached a terminal state.
     pub async fn claim_intent(&self, message_id: &str, recipient_id: &str) -> Result<String> {
         Store::retry_on_busy(
@@ -192,16 +192,16 @@ impl Store {
     /// the delivery task to terminal). Idempotent: a delivery already
     /// marked `delivered` acks again without error.
     ///
-    /// # Arguments
-    ///
     /// * `message_id` — the hub-committed message.
     /// * `peer_id` — the recipient whose delivery is acked.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
-    /// recipient row does not exist, and
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::NotFound`] when the
+    /// recipient row does not exist,
+    /// [`StoreError::TerminalState`] when the delivery is already
+    /// in a state that cannot be marked delivered, and
+    /// [`StoreError::Db`] on failure.
     pub async fn mark_delivered(&self, message_id: &str, peer_id: &str) -> Result<()> {
         Store::retry_on_busy(
             || self.mark_delivered_inner(message_id, peer_id),
@@ -256,9 +256,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// attempt does not exist, and
-    /// [`StoreError::TerminalState`](StoreError::TerminalState) when it is
+    /// [`StoreError::TerminalState`] when it is
     /// already terminal.
     pub async fn mark_dispatched(&self, attempt_id: &str) -> Result<()> {
         Store::retry_on_busy(|| self.mark_dispatched_inner(attempt_id), "mark_dispatched").await
@@ -326,9 +326,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// attempt does not exist, and
-    /// [`StoreError::TerminalState`](StoreError::TerminalState) when it is
+    /// [`StoreError::TerminalState`] when it is
     /// already terminal (unknown can't supersede a terminal state).
     pub async fn mark_unknown(&self, attempt_id: &str, reason: &str) -> Result<()> {
         Store::retry_on_busy(
@@ -378,9 +378,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// attempt does not exist, and
-    /// [`StoreError::TerminalState`](StoreError::TerminalState) on a state
+    /// [`StoreError::TerminalState`] on a state
     /// conflict.
     pub async fn mark_terminal(
         &self,
@@ -472,22 +472,20 @@ impl Store {
     /// ran), and its intent returns to the queue so the delivery stays
     /// deliverable once the gate clears.
     ///
-    /// Unlike [`Store::mark_terminal`](Store::mark_terminal) with
+    /// Unlike [`Store::mark_terminal`] with
     /// `Canceled`, the intent is NOT terminal — a gate is not an
     /// operator cancellation, and the delivery must not be lost.
-    ///
-    /// # Arguments
     ///
     /// * `attempt_id` — the gated attempt.
     /// * `reason` — the recorded gate description.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// attempt does not exist,
-    /// [`StoreError::TerminalState`](StoreError::TerminalState) when it
+    /// [`StoreError::TerminalState`] when it
     /// already left the pre-dispatch states, and
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// [`StoreError::Db`] on failure.
     pub async fn gate_attempt(&self, attempt_id: &str, reason: &str) -> Result<()> {
         Store::retry_on_busy(
             || self.gate_attempt_inner(attempt_id, reason),

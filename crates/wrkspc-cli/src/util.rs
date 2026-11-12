@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 /// same canonical path, so sidecar token keys and the node instance
 /// id do not change across restarts that spell the path differently.
 ///
-/// # Arguments
-///
-/// * `path` — the database path as given.
+/// `path` is the database path as given.
 ///
 /// # Returns
 ///
@@ -75,9 +73,7 @@ pub fn canonical_db_path(path: &Path) -> Result<PathBuf, std::io::Error> {
 /// returned, and every read error other than a missing file is
 /// REPORTED — never treated as permission to rotate identity.
 ///
-/// # Arguments
-///
-/// * `path` — the sidecar path.
+/// `path` is the sidecar path.
 ///
 /// # Returns
 ///
@@ -162,10 +158,8 @@ fn validate_token_ownership(meta: &std::fs::Metadata, path: &Path) -> Result<(),
 /// foreign owner, or a read failure is an ERROR — the credential is
 /// never silently rotated (CU-02).
 ///
-/// # Arguments
-///
-/// * `db` — the database path (token file derives from it).
-/// * `tag` — the suffix after the database path.
+/// `db` is the database path (the token file derives from it); `tag` is
+/// the suffix after the database path.
 ///
 /// # Returns
 ///

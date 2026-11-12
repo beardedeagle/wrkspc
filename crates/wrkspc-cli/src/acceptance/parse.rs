@@ -15,9 +15,7 @@ pub(crate) struct ParsedSend {
 /// wire-key guessing) and extracts the wrkspc fields from the message
 /// metadata.
 ///
-/// # Arguments
-///
-/// * `parsed` — the JSON-RPC request value.
+/// `parsed` is the JSON-RPC request value.
 ///
 /// # Returns
 ///
@@ -100,9 +98,7 @@ pub(crate) fn parse_send(parsed: &serde_json::Value) -> Result<Option<ParsedSend
 /// already the authenticated host; this function only validates that it
 /// is non-empty.
 ///
-/// # Arguments
-///
-/// * `identity` — the stamped identity header value.
+/// `identity` is the stamped identity header value.
 ///
 /// # Returns
 ///

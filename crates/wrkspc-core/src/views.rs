@@ -76,7 +76,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn list_conversations(&self) -> Result<Vec<ConversationView>> {
         let rows = sqlx::query(
             "SELECT c.id AS id, c.name AS name, c.created_at AS created_at,
@@ -108,13 +108,11 @@ impl Store {
     /// Lists a conversation's transcript, oldest first, with per-recipient
     /// delivery states.
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn list_messages(&self, conversation_id: &str) -> Result<Vec<MessageView>> {
         let messages = sqlx::query(
             "SELECT id, sender_id, content, created_at, execution_requested
@@ -134,8 +132,6 @@ impl Store {
     /// load (UI-19). A client that would otherwise page an entire
     /// room into memory at startup only ever sees this window, and
     /// can request the full list on demand.
-    ///
-    /// # Arguments
     ///
     /// * `conversation_id` — the room.
     /// * `window` — the maximum number of most recent messages.
@@ -216,13 +212,11 @@ impl Store {
 
     /// Lists a conversation's active moderation fences.
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn conversation_fences(&self, conversation_id: &str) -> Result<Vec<crate::Fence>> {
         let rows = sqlx::query(
             "SELECT id, conversation_id, peer_id, kind, set_by, set_at, acked_at
@@ -251,7 +245,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn unknown_attempts(&self) -> Result<Vec<UnknownAttemptView>> {
         let rows = sqlx::query(
             "SELECT a.id AS attempt_id, a.intent_id, a.state, a.stop_reason,

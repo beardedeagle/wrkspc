@@ -88,10 +88,7 @@ pub fn install(
 
 /// Removes the skill from one harness's directories.
 ///
-/// # Arguments
-///
-/// * `home` — the home directory.
-/// * `entry` — the target harness.
+/// `home` is the home directory; `entry` is the target harness.
 ///
 /// # Returns
 ///
@@ -152,10 +149,8 @@ pub fn uninstall(
 /// must live under the resolved home root, closing every path escape
 /// (symlinked intermediate directories included).
 ///
-/// # Arguments
-///
-/// * `home` — the (already validated) home root.
-/// * `target` — the leaf being written or deleted.
+/// `home` is the (already validated) home root; `target` is the leaf
+/// being written or deleted.
 ///
 /// # Errors
 ///
@@ -211,10 +206,7 @@ fn read_or_default(path: &Path) -> std::io::Result<String> {
 /// symlinked leaf each report their own problem, so remediation is
 /// distinguishable from "not installed yet".
 ///
-/// # Arguments
-///
-/// * `home` — the home directory.
-/// * `entry` — the target harness.
+/// `home` is the home directory; `entry` is the target harness.
 ///
 /// # Returns
 ///
@@ -246,14 +238,14 @@ pub fn status(home: &Path, entry: &HarnessEntry) -> Result<SkillStatus, String> 
 }
 
 /// The standing-instructions pointer component, reported separately
-/// from copy freshness (CU-09): `absent`, `current`, or `stale` — a
-/// harness whose pointer file is missing or drifted is NOT a fully
-/// healthy install even when its skill copy matches.
+/// from copy freshness (CU-09): `n/a` for harnesses without a pointer
+/// file, `current` when the section matches, `stale or missing` when
+/// it drifted or is absent, and `unreadable: …`/`malformed: …` when
+/// the file cannot be used — a harness whose pointer file is missing
+/// or drifted is NOT a fully healthy install even when its skill copy
+/// matches.
 ///
-/// # Arguments
-///
-/// * `home` — the home directory.
-/// * `entry` — the target harness.
+/// `home` is the home directory; `entry` is the target harness.
 pub fn pointer_state(home: &Path, entry: &HarnessEntry) -> String {
     let Some(instructions) = entry.pointer.then(|| pointer_file(home, entry)).flatten() else {
         return "n/a".to_string();

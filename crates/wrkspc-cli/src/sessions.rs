@@ -117,16 +117,13 @@ impl crate::poll::PresenceSource for SessionRegistry {
 impl SessionRegistry {
     /// Builds the registry from the node's binding configs.
     ///
-    /// # Arguments
-    ///
-    /// * `configs` — one entry per binding peer.
-    /// * `store` — the node's store (the MCP server surface needs it).
-    /// * `db` — the database path (token files + bridge injection).
-    /// * `shutdown` — the node's shutdown signal, cloned into any HTTP
-    ///   listener task spawned on demand.
-    /// * `hub_connected` — whether the node runs against a hub; the
-    ///   MCP surfaces mirror it so harness posts never create local
-    ///   execution intents in team mode.
+    /// `configs` has one entry per binding peer; `store` is the node's
+    /// store (the MCP server surface needs it); `db` is the database
+    /// path (token files + bridge injection); `shutdown` is the node's
+    /// shutdown signal, cloned into any HTTP listener task spawned on
+    /// demand; `hub_connected` is whether the node runs against a hub —
+    /// the MCP surfaces mirror it so harness posts never create local
+    /// execution intents in team mode.
     pub fn new(
         configs: Vec<SessionConfig>,
         store: Store,
@@ -252,12 +249,9 @@ impl SessionProvider for SessionRegistry {
 /// Spawns one peer's session: ACP spawn + MCP wiring (bridge injection
 /// or the harness-native HTTP registration) + model pin.
 ///
-/// # Arguments
-///
-/// * `config` — the binding's spawn material.
-/// * `store` — the node store.
-/// * `db` — the database path.
-/// * `shutdown` — the node shutdown signal (cloned into the HTTP task).
+/// `config` is the binding's spawn material; `store` is the node store;
+/// `db` is the database path; `shutdown` is the node shutdown signal
+/// (cloned into the HTTP task).
 ///
 /// # Returns
 ///

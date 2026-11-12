@@ -41,8 +41,6 @@ impl Store {
     /// hub-mirrored deliveries carry a remote sender host and are
     /// never re-sent.
     ///
-    /// # Arguments
-    ///
     /// * `host_id` — this node's own host id (its certificate SAN).
     ///
     /// # Returns
@@ -51,7 +49,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn hub_pending_outbound(&self, host_id: &str) -> Result<Vec<OutboundMessage>> {
         let rows = sqlx::query(
             "SELECT m.id, m.conversation_id, m.sender_id, m.content, m.execution_requested
@@ -95,13 +93,11 @@ impl Store {
     /// Records a message as delivered to the hub. Idempotent: a second
     /// call for the same message is a no-op.
     ///
-    /// # Arguments
-    ///
     /// * `message_id` — the message that was sent to the hub.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn mark_hub_sent(&self, message_id: &str) -> Result<()> {
         sqlx::query("INSERT OR IGNORE INTO hub_outbound (message_id, sent_at) VALUES (?, ?)")
             .bind(message_id)
@@ -120,8 +116,6 @@ impl Store {
     /// recipients are skipped (acceptance already asserted membership,
     /// so this is a defensive no-op).
     ///
-    /// # Arguments
-    ///
     /// * `request` — the committed message and the recipients.
     ///
     /// # Returns
@@ -130,9 +124,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// sender is not enrolled, and
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// [`StoreError::Db`] on failure.
     pub async fn queue_remote_deliveries(&self, request: RemoteFanoutRequest<'_>) -> Result<usize> {
         let (sender_name, sender_class, sender_host) = self
             .peer_details(request.sender_peer)
@@ -190,8 +184,6 @@ impl Store {
     /// never touched, and no duplicate can form because the task id is
     /// a function of (message, recipient).
     ///
-    /// # Arguments
-    ///
     /// * `local_host` — the hub's own host id; recipients on it are
     ///   local and never get a delivery task.
     ///
@@ -201,7 +193,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn repair_remote_fanout(&self, local_host: &str) -> Result<usize> {
         let rows = sqlx::query(
             "SELECT m.id AS message_id, m.conversation_id, m.sender_id, m.content,
@@ -272,14 +264,12 @@ impl Store {
     /// (message, recipient) pair. A missing intent (a mail-only
     /// message) means "not canceled" — it still delivers.
     ///
-    /// # Arguments
-    ///
     /// * `message_id` — the message.
     /// * `recipient_peer` — the recipient.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn recipient_intent_canceled(
         &self,
         message_id: &str,
@@ -296,8 +286,9 @@ impl Store {
         Ok(state.as_deref() == Some("canceled"))
     }
 
-    /// Lists terminal attempt outcomes that a hub-originated delivery
-    /// has not yet reported back to the hub (the H-10 outcome leg).
+    /// Lists attempt outcomes — terminal states and unknowns — that a
+    /// hub-originated delivery has not yet reported back to the hub
+    /// (the H-10 outcome leg).
     ///
     /// Only attempts whose (message, recipient) pair has a mirrored
     /// delivery-task row qualify — those are hub-originated deliveries;
@@ -309,7 +300,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn hub_pending_outcomes(&self) -> Result<Vec<AttemptOutcomeReport>> {
         let rows = sqlx::query(
             "SELECT a.id AS attempt_id, a.state,
@@ -352,14 +343,12 @@ impl Store {
 
     /// Records an attempt outcome as reported to the hub. Idempotent.
     ///
-    /// # Arguments
-    ///
     /// * `attempt_id` — the attempt whose outcome was reported.
     /// * `task_id` — the delivery task the report addressed.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn mark_outcome_reported(&self, attempt_id: &str, task_id: &str) -> Result<()> {
         sqlx::query(
             "INSERT OR IGNORE INTO hub_outcome_reports (attempt_id, task_id, reported_at)
@@ -379,7 +368,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn record_hub_unknown(
         &self,
         attempt_id: &str,
@@ -416,7 +405,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn hub_unknowns(&self) -> Result<Vec<HubUnknownView>> {
         let rows = sqlx::query(
             "SELECT attempt_id, task_id, host_id, recipient_id, conversation_id,
@@ -445,7 +434,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn hub_pending_reconciliations(&self, host_id: &str) -> Result<Vec<HubUnknownView>> {
         let rows = sqlx::query(
             "SELECT attempt_id, task_id, host_id, recipient_id, conversation_id,
@@ -477,7 +466,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn set_hub_unknown_decision(&self, attempt_id: &str, decision: &str) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE hub_unknown_attempts
@@ -497,7 +486,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn consume_hub_unknown(&self, attempt_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM hub_unknown_attempts WHERE attempt_id = ?")
             .bind(attempt_id)
@@ -538,7 +527,7 @@ pub struct RemoteFanoutRequest<'a> {
     /// The committed message id.
     pub message_id: &'a str,
     /// The sender's own wire message id (the origin) — see
-    /// [`DeliveryTaskRequest::origin_message_id`](DeliveryTaskRequest::origin_message_id).
+    /// [`DeliveryTaskRequest::origin_message_id`].
     pub origin_message_id: Option<&'a str>,
     /// The enrolled sender.
     pub sender_peer: &'a str,

@@ -3,7 +3,7 @@
 //! Proves, over a real loopback socket with rcgen-issued material:
 //!
 //! 1. a client presenting a CA-issued certificate completes the handshake
-//!    and drives the surface (`SendMessage` → `submitted`);
+//!    and drives the surface (`send_message` → `submitted`);
 //! 2. a client without a certificate is rejected at the handshake;
 //! 3. the `allow_peer` policy gate drops a denied identity before any
 //!    HTTP, while healthy peers pass;

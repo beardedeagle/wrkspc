@@ -1,9 +1,11 @@
 //! The pilot executor: accepts inbound A2A work without claiming success.
 //!
-//! The executor records acceptance as a `submitted` status update and ends
-//! its event stream WITHOUT a terminal event, so the task persists in
-//! `submitted` state. Execution state is driven by the dispatcher (unit 5):
-//! a completed turn is never claimed as task success (D-3 predicate).
+//! The executor records acceptance as a `submitted` status update (a
+//! continuation keeps its existing non-terminal state) and ends its event
+//! stream WITHOUT a terminal event, so the task persists in its
+//! non-terminal state. Execution state is driven by the dispatcher
+//! (unit 5): a completed turn is never claimed as task success (D-3
+//! predicate).
 
 use a2a::event::StreamResponse;
 use a2a::{A2AError, Message, Part, Role, Task, TaskState, TaskStatus, TaskStatusUpdateEvent};
@@ -21,8 +23,6 @@ pub struct WrkspcExecutor {
 impl WrkspcExecutor {
     /// Builds the executor over the shared store.
     ///
-    /// # Arguments
-    ///
     /// * `store` — the transactional store (shared with the fan-out and
     ///   moderation paths).
     pub fn new(store: Store) -> Self {
@@ -33,8 +33,6 @@ impl WrkspcExecutor {
 /// Cancels the wrkspc-side work a task's delivery envelope describes:
 /// the A2A task row is not the execution — the cancel must reach the
 /// queued intent or the in-flight attempt (H-cancel propagation).
-///
-/// # Arguments
 ///
 /// * `store` — the store the delivery lives in.
 /// * `task_id` — the A2A task being canceled.

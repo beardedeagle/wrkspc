@@ -94,11 +94,8 @@ fn section_span(content: &str) -> Result<Option<(usize, usize)>, String> {
 /// (inserting it when absent) and returns the new content plus whether
 /// anything changed.
 ///
-/// # Arguments
-///
-/// * `content` — the current file content (or empty when the file does
-///   not exist).
-/// * `body` — the section body (without the markers).
+/// `content` is the current file content (or empty when the file does
+/// not exist); `body` is the section body (without the markers).
 ///
 /// # Returns
 ///
@@ -133,9 +130,7 @@ pub(crate) fn with_section(content: &str, body: &str) -> Result<(String, bool), 
 /// Removes the wrkspc-marked section from a file's content and returns
 /// the new content plus whether a section was found.
 ///
-/// # Arguments
-///
-/// * `content` — the current file content.
+/// `content` is the current file content.
 ///
 /// # Returns
 ///

@@ -18,8 +18,6 @@ use wrkspc_core::Store;
 
 /// Builds the pilot's v1.0 agent card.
 ///
-/// # Arguments
-///
 /// * `base_url` — the externally reachable base URL (scheme + host + port),
 ///   e.g. `https://hub.example:8443`. Interface URLs derive from it.
 /// * `mtls` — whether the served transport is the certificate-stamped TLS
@@ -101,8 +99,6 @@ pub fn build_agent_card(base_url: &str, mtls: bool) -> AgentCard {
 /// declaration follows the hub card's `mtls` flag). Read-only
 /// discovery; capability claims stay minimal.
 ///
-/// # Arguments
-///
 /// * `base_url` — the hub's base URL (the card's interface target).
 /// * `entry` — the roster row for the peer.
 /// * `mtls` — whether the hub's TLS surface serves the card.
@@ -182,8 +178,6 @@ pub struct A2aSurface {
 impl A2aSurface {
     /// Builds the surface over a wrkspc store.
     ///
-    /// # Arguments
-    ///
     /// * `store` — the transactional store (shared with the dispatcher).
     pub fn new(store: Store) -> Self {
         Self { store, mtls: false }
@@ -199,8 +193,6 @@ impl A2aSurface {
     }
 
     /// Serves on `listener` until `shutdown` resolves.
-    ///
-    /// # Arguments
     ///
     /// * `listener` — a bound TCP listener (tests bind port 0 to discover
     ///   the address; production binds the configured addr).
@@ -245,12 +237,10 @@ impl A2aSurface {
     /// bind the header back to enrolment records, never trusting
     /// client-asserted identity.
     ///
-    /// # Arguments
-    ///
     /// * `listener` — a bound TCP listener.
     /// * `acceptor` — a configured [`tokio_rustls::TlsAcceptor`]; require
     ///   client certificates via rustls `WebPkiClientVerifier` for mTLS,
-    ///   or use [`OptionalClientVerifier`] to request them without
+    ///   or use [`crate::OptionalClientVerifier`] to request them without
     ///   requiring them.
     /// * `base_url` — the externally reachable base URL with scheme
     ///   (e.g. `https://hub.example:8443`); the agent card derives from
@@ -406,8 +396,6 @@ impl A2aSurface {
     /// serve the same routers over their own transport (e.g. a TLS
     /// accept loop); consumes the surface.
     ///
-    /// # Arguments
-    ///
     /// * `base_url` — the externally reachable base URL with scheme; the
     ///   agent card derives its interface URLs from it.
     ///
@@ -436,8 +424,6 @@ impl A2aSurface {
 /// or authorization decisions — the CN is free text chosen by the CA
 /// issuer and can carry `SAN=` markers; the stamped identity is
 /// [`host_identity`], built from the parsed SAN extension alone.
-///
-/// # Arguments
 ///
 /// * `cert` — a leaf certificate in DER form.
 ///
@@ -485,8 +471,6 @@ pub fn peer_identity(cert: &rustls_pki_types::CertificateDer<'_>) -> Option<Stri
 /// served unstamped and the stamp gate keeps it off the A2A routes
 /// (fail-closed: the CN alone is never an identity).
 ///
-/// # Arguments
-///
 /// * `cert` — a leaf certificate in DER form.
 ///
 /// # Returns
@@ -513,8 +497,6 @@ pub fn host_identity(cert: &rustls_pki_types::CertificateDer<'_>) -> Option<Stri
 /// Reads the leaf serial as lowercase hex, normalized to match revoke
 /// records: DER INTEGER serials with the high bit set carry a leading
 /// `0x00` that `step`/`openssl` omit, so leading zeros are stripped.
-///
-/// # Arguments
 ///
 /// * `cert` — a leaf certificate in DER form.
 ///

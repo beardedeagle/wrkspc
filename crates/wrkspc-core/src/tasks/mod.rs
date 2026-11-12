@@ -41,7 +41,7 @@ pub struct DeliveryTaskRequest<'a> {
     pub recipient_peer: &'a str,
     /// The recipient's display name (for the node-side mirror).
     pub recipient_name: &'a str,
-    /// The recipient's [`PeerClass`] string (for the node-side mirror).
+    /// The recipient's [`crate::model::PeerClass`] string (for the node-side mirror).
     pub recipient_class: &'a str,
     /// The hub-committed message this delivery belongs to.
     pub message_id: &'a str,
@@ -57,7 +57,7 @@ pub struct DeliveryTaskRequest<'a> {
     pub sender_peer: &'a str,
     /// The sender's display name (for the node-side mirror).
     pub sender_name: &'a str,
-    /// The sender's [`PeerClass`] string (for the node-side mirror).
+    /// The sender's [`crate::model::PeerClass`] string (for the node-side mirror).
     pub sender_class: &'a str,
     /// The sender's `host_id` (for the node-side mirror).
     pub sender_host: &'a str,
@@ -67,7 +67,7 @@ pub struct DeliveryTaskRequest<'a> {
     pub execution_requested: bool,
 }
 
-/// Outcome of [`Store::claim_delivery`](Store::claim_delivery).
+/// Outcome of [`crate::store::Store::claim_delivery`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryClaimOutcome {
     /// This node instance now holds the exclusive claim.

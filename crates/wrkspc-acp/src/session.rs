@@ -78,8 +78,6 @@ impl Clone for SessionHandle {
 impl SessionHandle {
     /// Spawns the session task on `transport`.
     ///
-    /// # Arguments
-    ///
     /// * `transport` — the ACP transport (stdio today, HTTP later).
     ///
     /// # Returns
@@ -142,8 +140,8 @@ impl SessionHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`AcpError::Protocol`](AcpError::Protocol) when the adapter
-    /// rejects the request and [`AcpError::NotRunning`](AcpError::NotRunning)
+    /// Returns [`AcpError::Protocol`] when the adapter
+    /// rejects the request and [`AcpError::NotRunning`]
     /// when the session task is gone.
     pub async fn new_session(&self, cwd: PathBuf) -> Result<String> {
         self.new_session_with_mcp(cwd, Vec::new()).await
@@ -153,16 +151,14 @@ impl SessionHandle {
     /// server injection (ACP `session/new` `mcpServers` — the harness
     /// sees the wrkspc tools from its first turn).
     ///
-    /// # Arguments
-    ///
     /// * `cwd` — the session's working directory.
     /// * `mcp_servers` — the MCP servers to inject (stdio today; HTTP when
     ///   the harness advertises `mcp_capabilities.http`).
     ///
     /// # Errors
     ///
-    /// Returns [`AcpError::Protocol`](AcpError::Protocol) when the adapter
-    /// rejects the request and [`AcpError::NotRunning`](AcpError::NotRunning)
+    /// Returns [`AcpError::Protocol`] when the adapter
+    /// rejects the request and [`AcpError::NotRunning`]
     /// when the session task is gone.
     pub async fn new_session_with_mcp(
         &self,
@@ -183,16 +179,15 @@ impl SessionHandle {
 
     /// Sends a prompt and waits for the turn's stop reason.
     ///
-    /// # Arguments
-    ///
     /// * `session_id` — the target session.
     /// * `blocks` — the prompt content blocks.
     ///
     /// # Errors
     ///
-    /// Returns [`AcpError::Protocol`](AcpError::Protocol) on adapter error
-    /// and [`AcpError::NotRunning`](AcpError::NotRunning) when the session
-    /// task is gone.
+    /// Returns [`AcpError::Protocol`] on adapter error,
+    /// [`AcpError::NotRunning`] when the session task is gone, and
+    /// [`AcpError::QueueFull`] when the serialized prompt queue is at its
+    /// admission bound and the prompt was definitely not sent.
     pub async fn prompt(
         &self,
         session_id: impl Into<String>,
@@ -215,16 +210,14 @@ impl SessionHandle {
     /// The antigravity binding uses `config_id = "model"` for D-4b's
     /// mandatory per-session model pinning.
     ///
-    /// # Arguments
-    ///
     /// * `session_id` — the target session.
     /// * `config_id` — the option's config id (e.g. `"model"`).
     /// * `value` — the option value.
     ///
     /// # Errors
     ///
-    /// Returns [`AcpError::Protocol`](AcpError::Protocol) when the adapter
-    /// rejects the request and [`AcpError::NotRunning`](AcpError::NotRunning)
+    /// Returns [`AcpError::Protocol`] when the adapter
+    /// rejects the request and [`AcpError::NotRunning`]
     /// when the session task is gone.
     pub async fn set_config_option(
         &self,
@@ -254,7 +247,7 @@ impl SessionHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`AcpError::NotRunning`](AcpError::NotRunning) when the
+    /// Returns [`AcpError::NotRunning`] when the
     /// session task is gone.
     pub async fn cancel(&self, session_id: impl Into<String>) -> Result<()> {
         self.cmd_tx
@@ -269,7 +262,7 @@ impl SessionHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`AcpError::NotRunning`](AcpError::NotRunning) when the
+    /// Returns [`AcpError::NotRunning`] when the
     /// session task is already gone.
     pub async fn shutdown(self) -> Result<()> {
         self.cmd_tx

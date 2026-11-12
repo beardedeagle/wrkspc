@@ -85,7 +85,7 @@ struct InFlight {
 /// conversation, and the drive result.
 type DriveOutput = (String, String, Result<(), String>);
 
-/// A joined task: the output, or a JoinError when the task was aborted
+/// A joined task: the output, or a `JoinError` when the task was aborted
 /// (shutdown) or panicked outside the drive's own catch.
 type JoinedDrive = Result<DriveOutput, tokio::task::JoinError>;
 
@@ -133,8 +133,6 @@ impl DispatcherHandle {
     /// interrupted via the bound session and confirmed by the turn's
     /// `Cancelled` stop reason.
     ///
-    /// # Arguments
-    ///
     /// * `message_id` — the message whose execution to cancel.
     /// * `recipient_id` — the recipient whose intent to cancel.
     /// * `set_by` — the operator/peer requesting cancellation.
@@ -145,7 +143,9 @@ impl DispatcherHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] on store failure or a dead dispatcher.
+    /// Returns [`DispatcherError::Gone`] when the dispatcher is gone, or
+    /// [`DispatcherError::Store`] (wrapping [`StoreError`]) when the
+    /// store rejects the operation.
     pub async fn request_cancel(
         &self,
         message_id: &str,
@@ -203,8 +203,6 @@ impl std::fmt::Debug for Dispatcher {
 impl Dispatcher {
     /// Builds a dispatcher over a store and session provider.
     ///
-    /// # Arguments
-    ///
     /// * `store` — the transactional store (the dispatcher owns the
     ///   exclusive lock for the pilot).
     /// * `provider` — resolves peers to bound sessions.
@@ -240,8 +238,6 @@ impl Dispatcher {
     /// per finished turn, never one per historical turn — E07) and a
     /// panicked drive is attributed to its attempt and reconciled as
     /// unknown instead of silently freeing the session.
-    ///
-    /// # Arguments
     ///
     /// * `shutdown` — a future that ends the loop when it resolves.
     ///

@@ -54,13 +54,7 @@ pub(crate) struct RenameConversationBody {
 ///
 /// The name is never a key and never has to be unique — two rooms may share one,
 /// and the id is what everything else joins on. The hub owns the value and
-/// mirrors it to nodes.
-///
-/// # Arguments
-///
-/// * `state` — the API state holding the store.
-/// * `id` — the conversation to rename.
-/// * `body` — the new name, or null to clear it.
+/// mirrors it to nodes. `body.name` carries the new name, or null to clear it.
 ///
 /// # Returns
 ///

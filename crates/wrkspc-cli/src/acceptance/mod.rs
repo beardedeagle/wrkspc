@@ -40,10 +40,8 @@ pub(crate) struct AcceptanceState {
 impl AcceptanceState {
     /// Builds the middleware state.
     ///
-    /// # Arguments
-    ///
-    /// * `store` — the hub's shared store.
-    /// * `local_host` — the hub's own `host_id`.
+    /// `store` is the hub's shared store; `local_host` is the hub's own
+    /// `host_id`.
     pub(crate) fn new(store: Store, local_host: String) -> Self {
         Self { store, local_host }
     }
@@ -298,12 +296,10 @@ async fn accept_rest(
 /// and must not be ejected (booted/banned) — only the operator's
 /// restore action re-admits it.
 ///
-/// # Arguments
-///
-/// * `state` — the acceptance middleware state.
-/// * `identity` — the stamped identity (for the refusal log).
-/// * `parsed_send` — the parsed send payload.
-/// * `host` — the presenting host (the stamped certificate SAN).
+/// `state` is the acceptance middleware state; `identity` is the
+/// stamped identity (for the refusal log); `parsed_send` is the parsed
+/// send payload; `host` is the presenting host (the stamped certificate
+/// SAN).
 ///
 /// # Returns
 ///

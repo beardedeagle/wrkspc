@@ -23,6 +23,11 @@ project's [Apache-2.0 license](../LICENSE) (inbound = outbound).
   code it describes: check `reference/api.md` against the router,
   `reference/cli.md` against the clap structs, and the harnesses page
   against the skill registry before claiming a docs sweep is done.
+- **Docstrings are rustdoc, not Google style.** `# Errors` /
+  `# Panics` / `# Safety` (mandatory on `unsafe fn`) / `# Examples`
+  sections, intra-doc links in backticks, and a `cargo doc --no-deps
+  --workspace` run with zero warnings before a docstring change is
+  done.
 
 ## Getting set up
 

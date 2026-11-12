@@ -42,10 +42,8 @@ impl std::fmt::Debug for PollLoopConfig {
 /// Runs the node's poll loop: delivery claim/mirror/ack, node → hub
 /// message propagation, presence upload, and roster mirroring.
 ///
-/// # Arguments
-///
-/// * `config` — the loop's wiring.
-/// * `shutdown` — the watch channel that ends the loop.
+/// `config` is the loop's wiring; `shutdown` is the watch channel that
+/// ends the loop.
 pub async fn run_poll_loop(
     config: PollLoopConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
