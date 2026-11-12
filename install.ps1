@@ -150,12 +150,30 @@ function Find-OpenSsl {
     return $null
 }
 
-function Invoke-OpenSsl([string]$Arguments, [string]$Step) {
-    # cmd /c with 2>NUL: PowerShell 5.1 raises a terminating
-    # NativeCommandError for native stderr under ErrorActionPreference
-    # Stop, and openssl writes progress and status notes to stderr.
-    # cmd eats the stream; the exit code still propagates.
-    $null = cmd /c "`"$script:OpenSslExe`" $Arguments 2>NUL"
+function Test-HostName([string]$Value) {
+    # Letters, digits, dots, hyphens, underscores: safe for certificate
+    # subjects/SANs and host ids, and the ONLY values that may reach
+    # the cmd /c openssl string (see Invoke-OpenSsl).
+    if ($Value -notmatch '^[A-Za-z0-9._-]+$') {
+        throw "invalid name (letters, digits, dots, hyphens, underscores only): $Value"
+    }
+}
+
+function ConvertTo-TomlString([string]$Value) {
+    $Value -replace '\\', '\\\\' -replace '"', '\"'
+}
+
+function Invoke-OpenSsl([string[]]$ArgumentList, [string]$Step) {
+    # cmd /c: PowerShell 5.1 raises a terminating NativeCommandError
+    # for native stderr even when merged through a pipeline (observed
+    # live with openssl x509 on the box; genrsa/req happen to pass).
+    # SAFE because every user-provided value reaches this string only
+    # after Test-HostName -- letters, digits, dots, hyphens,
+    # underscores -- none of which cmd re-parses. Keep that invariant:
+    # an unvalidated interpolation added here is a command-injection
+    # regression.
+    $joined = ($ArgumentList -join " ")
+    $null = cmd /c "`"$script:OpenSslExe`" $joined 2>NUL"
     if ($LASTEXITCODE -ne 0) { throw "openssl failed ($Step)" }
 }
 
@@ -172,8 +190,9 @@ function Invoke-SetupPki {
     try {
         if (-not (Test-Path "ca.pem")) {
             $caCn = Invoke-Ask "CA common name" "wrkspc-ca"
-            Invoke-OpenSsl "genrsa -out ca.key 4096" "CA key"
-            Invoke-OpenSsl "req -x509 -new -nodes -key ca.key -sha256 -days 3650 -subj `"/CN=$caCn`" -out ca.pem" "CA cert"
+            Test-HostName $caCn
+            Invoke-OpenSsl @("genrsa", "-out", "ca.key", "4096") "CA key"
+            Invoke-OpenSsl @("req", "-x509", "-new", "-nodes", "-key", "ca.key", "-sha256", "-days", "3650", "-subj", "/CN=$caCn", "-out", "ca.pem") "CA cert"
             Write-Step "CA written to $PkiDir (ca.pem, ca.key)"
         } elseif ((Invoke-Ask "CA already exists at $PkiDir\ca.pem -- reuse it? (y/n)" "y") -ne "y") {
             return
@@ -181,18 +200,20 @@ function Invoke-SetupPki {
 
         if (-not (Test-Path "hub.crt")) {
             $hubHost = Invoke-Ask "Hub hostname (the --card-url name; certificate SAN)" "hub.example.com"
-            Invoke-OpenSsl "genrsa -out hub.key 2048" "hub key"
-            Invoke-OpenSsl "req -new -key hub.key -subj `"/CN=$hubHost`" -addext `"subjectAltName=DNS:$hubHost`" -out hub.csr" "hub CSR"
-            Invoke-OpenSsl "x509 -req -in hub.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 825 -sha256 -out hub.crt" "hub cert"
+            Test-HostName $hubHost
+            Invoke-OpenSsl @("genrsa", "-out", "hub.key", "2048") "hub key"
+            Invoke-OpenSsl @("req", "-new", "-key", "hub.key", "-subj", "/CN=$hubHost", "-addext", "subjectAltName=DNS:$hubHost", "-out", "hub.csr") "hub CSR"
+            Invoke-OpenSsl @("x509", "-req", "-in", "hub.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-days", "825", "-sha256", "-out", "hub.crt") "hub cert"
             Remove-Item hub.csr -ErrorAction SilentlyContinue
             Write-Step "hub certificate written ($PkiDir\hub.crt, hub.key)"
         }
 
         if (-not (Test-Path "node.crt")) {
             $hostId = Invoke-Ask "Node host id (the client certificate SAN)" "this-machine.example"
-            Invoke-OpenSsl "genrsa -out node.key 2048" "node key"
-            Invoke-OpenSsl "req -new -key node.key -subj `"/CN=$hostId`" -addext `"subjectAltName=DNS:$hostId`" -out node.csr" "node CSR"
-            Invoke-OpenSsl "x509 -req -in node.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 825 -sha256 -out node.crt" "node cert"
+            Test-HostName $hostId
+            Invoke-OpenSsl @("genrsa", "-out", "node.key", "2048") "node key"
+            Invoke-OpenSsl @("req", "-new", "-key", "node.key", "-subj", "/CN=$hostId", "-addext", "subjectAltName=DNS:$hostId", "-out", "node.csr") "node CSR"
+            Invoke-OpenSsl @("x509", "-req", "-in", "node.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-days", "825", "-sha256", "-out", "node.crt") "node cert"
             Remove-Item node.csr -ErrorAction SilentlyContinue
             Write-Step "node certificate written ($PkiDir\node.crt, node.key)"
         }
@@ -213,13 +234,15 @@ function Invoke-SetupNode {
             "claude" { $adapter = "npx -y @agentclientprotocol/claude-agent-acp" }
             default { $adapter = Invoke-Ask "Adapter command for $harness" "" }
         }
-        $cwdEscaped = $cwd -replace '\\', '/'
+        $cwdEscaped = ConvertTo-TomlString ($cwd -replace '\\', '/')
+        $harnessEscaped = ConvertTo-TomlString $harness
+        $adapterEscaped = ConvertTo-TomlString $adapter
         @"
 [[binding]]
-peer_id = "$harness"
-harness = "$harness"
+peer_id = "$harnessEscaped"
+harness = "$harnessEscaped"
 cwd = "$cwdEscaped"
-command = "$adapter"
+command = "$adapterEscaped"
 "@ | Out-File -FilePath $bindings -Encoding utf8
         Write-Step "bindings.toml written to $bindings"
     }

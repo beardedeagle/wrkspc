@@ -20,7 +20,9 @@
 # existing state.
 #
 # Overrides: WRKSPC_VERSION, WRKSPC_BASE_URL, WRKSPC_INSTALL_DIR,
-# WRKSPC_YES (answer yes to every prompt), WRKSPC_NO_ATTESTATION.
+# WRKSPC_SHARE, WRKSPC_YES, WRKSPC_NO_SETUP, WRKSPC_NO_SKILLS,
+# WRKSPC_NO_ATTESTATION — or flags: --yes --no-setup --no-skills
+# --no-attestation.
 set -euo pipefail
 
 REPO="beardedeagle/wrkspc"
@@ -28,6 +30,9 @@ BASE_URL="${WRKSPC_BASE_URL:-https://github.com/beardedeagle/wrkspc/releases/dow
 VERSION="${WRKSPC_VERSION:-latest}"
 INSTALL_DIR="${WRKSPC_INSTALL_DIR:-$HOME/.local/bin}"
 YES="${WRKSPC_YES:-0}"
+NO_SETUP="${WRKSPC_NO_SETUP:-0}"
+NO_SKILLS="${WRKSPC_NO_SKILLS:-0}"
+NO_ATTESTATION="${WRKSPC_NO_ATTESTATION:-0}"
 tmpdir=""
 
 # ---------------------------------------------------------------------------
@@ -66,6 +71,20 @@ die() {
 }
 
 info() { printf '==> %s\n' "$*"; }
+
+# Only letters, digits, dots, hyphens, and underscores: safe for
+# certificate subjects/SANs and host ids (never interpreted by a
+# shell or parsed as extra openssl extensions).
+valid_name() {
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+# Escape a value for a TOML basic string (" and \ only; the values
+# never contain control characters because ask() strips nothing but
+# they come from a single read line).
+toml_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
 
 ask() {
     # ask <prompt> <default> — honors WRKSPC_YES (returns the default).
@@ -130,12 +149,12 @@ install_binary() {
     actual="$(sha256_of "$tmpdir/$archive")"
     [[ "$expected" == "$actual" ]] || die "checksum mismatch for $archive"
 
-    if [[ "${WRKSPC_NO_ATTESTATION:-0}" != "1" ]] && command -v gh >/dev/null 2>&1 \
+    if [[ "$NO_ATTESTATION" != "1" ]] && command -v gh >/dev/null 2>&1 \
         && gh auth status >/dev/null 2>&1; then
         info "verifying Sigstore attestation"
         (cd "$tmpdir" && gh attestation verify "$archive" --repo "$REPO") \
             || die "attestation verification failed — refusing to install"
-    elif [[ "${WRKSPC_NO_ATTESTATION:-0}" != "1" ]]; then
+    elif [[ "$NO_ATTESTATION" != "1" ]]; then
         info "gh not authenticated — attestation skipped (checksum still verified)"
     fi
 
@@ -180,7 +199,9 @@ setup_pki() {
         else
             local ca_cn ca_days
             ca_cn="$(ask "CA common name" "wrkspc-ca")"
+            valid_name "$ca_cn" || die "invalid common name: $ca_cn"
             ca_days="$(ask "CA validity in days" "3650")"
+            [[ "$ca_days" =~ ^[0-9]+$ ]] || die "invalid validity period: $ca_days"
             openssl genrsa -out "$PKI_DIR/ca.key" 4096
             openssl req -x509 -new -nodes \
                 -key "$PKI_DIR/ca.key" -sha256 -days "$ca_days" \
@@ -191,6 +212,7 @@ setup_pki() {
         if [[ ! -f "$PKI_DIR/hub.crt" ]]; then
             local hub_host
             hub_host="$(ask "Hub hostname (the --card-url name; certificate SAN)" "hub.example.com")"
+            valid_name "$hub_host" || die "invalid hub hostname: $hub_host"
             openssl genrsa -out "$PKI_DIR/hub.key" 2048
             openssl req -new -key "$PKI_DIR/hub.key" -subj "/CN=$hub_host" \
                 -addext "subjectAltName=DNS:$hub_host" -out "$PKI_DIR/hub.csr"
@@ -204,6 +226,7 @@ setup_pki() {
         if [[ ! -f "$PKI_DIR/node.crt" ]]; then
             local host_id
             host_id="$(ask "Node host id (the client certificate SAN)" "this-machine.example")"
+            valid_name "$host_id" || die "invalid node host id: $host_id"
             openssl genrsa -out "$PKI_DIR/node.key" 2048
             openssl req -new -key "$PKI_DIR/node.key" -subj "/CN=$host_id" \
                 -addext "subjectAltName=DNS:$host_id" -out "$PKI_DIR/node.csr"
@@ -243,10 +266,10 @@ setup_node() {
         esac
         cat > "$node_dir/bindings.toml" <<EOF
 [[binding]]
-peer_id = "$harness"
-harness = "$harness"
-cwd = "$cwd"
-command = "$adapter"
+peer_id = "$(toml_escape "$harness")"
+harness = "$(toml_escape "$harness")"
+cwd = "$(toml_escape "$cwd")"
+command = "$(toml_escape "$adapter")"
 EOF
     }
     info "bindings.toml written to $node_dir/bindings.toml"
@@ -313,13 +336,28 @@ EOF
 
 # ---------------------------------------------------------------------------
 main() {
+    for arg in "$@"; do
+        case "$arg" in
+            --yes) YES=1 ;;
+            --no-setup) NO_SETUP=1 ;;
+            --no-skills) NO_SKILLS=1 ;;
+            --no-attestation) NO_ATTESTATION=1 ;;
+            *) die "unknown argument: $arg" ;;
+        esac
+    done
+    # The wizard needs a terminal: piping curl|sh gives `read` an EOF
+    # that dies under set -e at the first prompt. Refuse the pipe form
+    # unless it is explicitly non-interactive.
+    if [[ "$NO_SETUP" != "1" && "$YES" != "1" && ! -t 0 ]]; then
+        die "interactive prompts need a terminal — download and run the script, or pipe it with --yes"
+    fi
     info "wrkspc installer — $REPO"
     install_binary
-    if [[ "${WRKSPC_NO_SETUP:-0}" != "1" ]]; then
+    if [[ "$NO_SETUP" != "1" ]]; then
         setup_pki
         setup_hub
         setup_node
-        if [[ "${WRKSPC_NO_SKILLS:-0}" != "1" ]]; then
+        if [[ "$NO_SKILLS" != "1" ]]; then
             setup_skills
         fi
         token_pointer
