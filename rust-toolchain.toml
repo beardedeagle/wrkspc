@@ -1,4 +1,6 @@
 [toolchain]
 channel = "1.99.1"
 components = ["rustfmt", "clippy"]
-targets = ["x86_64-unknown-linux-gnu"]
+# No static `targets` here: rustup installs each host's own std with the
+# toolchain, and the release matrix declares the cross/std targets it
+# needs per leg through the setup-rust action.
