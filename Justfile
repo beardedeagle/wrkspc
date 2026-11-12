@@ -168,6 +168,10 @@ docs:
     cp CHANGELOG.md docs/src/changelog.md
     cp deploy/README.md docs/src/hub-container-deployment.md
     cargo doc --no-deps --workspace --locked
+    # Resolve Cargo's effective target directory instead of assuming
+    # target/: CARGO_TARGET_DIR or [build] target-dir redirects the
+    # doc output too, and the embedded API reference must follow it.
+    target_dir="$(cargo metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)"
     # mdbook parses the SUMMARY chapter as content: keep the tiny
     # placeholder in src during the build (a full rustdoc index.html
     # panics the mdbook HTML parser), then drop the real tree into the
@@ -177,7 +181,7 @@ docs:
     printf "# Rust API Reference\\n\\nGenerated API documentation is embedded here at build time.\\n" > docs/src/rustdoc/wrkspc_core/index.html
     mdbook build docs
     rm -rf docs/book/rustdoc
-    cp -R target/doc docs/book/rustdoc
+    cp -R "$target_dir/doc" docs/book/rustdoc
     echo "Documentation built: docs/book/"
 
 # Serve the book locally with hot reload. The rustdoc tree lands in
@@ -186,31 +190,55 @@ docs:
 docs-serve:
     #!/usr/bin/env bash
     set -euo pipefail
+    server_pid=""
+    watcher_pid=""
+    stamp=""
+    cleanup() {
+        # Reap the serve process and the rustdoc watchdog so neither
+        # outlives the recipe: a failed `wait` under set -e must not
+        # leave the watchdog rewriting docs/book indefinitely.
+        if [[ -n "$server_pid" ]]; then kill "$server_pid" 2>/dev/null || true; fi
+        if [[ -n "$watcher_pid" ]]; then kill "$watcher_pid" 2>/dev/null || true; fi
+        if [[ -n "$stamp" ]]; then rm -f "$stamp"; fi
+        rm -rf docs/src/rustdoc
+        mkdir -p docs/src/rustdoc/wrkspc_core
+        printf "# Rust API Reference\\n\\nGenerated API documentation is embedded here at build time.\\n" > docs/src/rustdoc/wrkspc_core/index.html
+        rm -f docs/src/changelog.md docs/src/hub-container-deployment.md
+    }
+    trap cleanup EXIT
     cp CHANGELOG.md docs/src/changelog.md
     cp deploy/README.md docs/src/hub-container-deployment.md
     cargo doc --no-deps --workspace --locked
+    target_dir="$(cargo metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)"
     rm -rf docs/src/rustdoc
     mkdir -p docs/src/rustdoc/wrkspc_core
     printf "# Rust API Reference\\n\\nGenerated API documentation is embedded here at build time.\\n" > docs/src/rustdoc/wrkspc_core/index.html
     stamp="$(mktemp)"
-    trap 'rm -f "$stamp"; rm -rf docs/src/rustdoc; mkdir -p docs/src/rustdoc/wrkspc_core; printf "# Rust API Reference\\n\\nGenerated API documentation is embedded here at build time.\\n" > docs/src/rustdoc/wrkspc_core/index.html; rm -f docs/src/changelog.md docs/src/hub-container-deployment.md' EXIT
     (cd docs && mdbook serve --open) &
     server_pid=$!
-    # mdbook wipes the book dir on every rebuild; a small watchdog
-    # re-drops the rustdoc tree whenever it goes missing.
-    (while :; do
-        [[ -d docs/book/rustdoc/wrkspc_core ]] || { rm -rf docs/book/rustdoc; cp -R target/doc docs/book/rustdoc; }
-        sleep 2
-    done) &
+    # mdbook wipes the book dir on every rebuild and restores the
+    # PLACEHOLDER chapter, so a directory-existence check would be
+    # fooled into thinking the API tree is present. Compare the served
+    # index against the generated one and re-drop the real tree
+    # whenever they diverge (a missing served index also diverges, so
+    # the first pass after the initial build self-heals).
+    (
+        while :; do
+            if ! cmp -s "docs/book/rustdoc/wrkspc_core/index.html" "$target_dir/doc/wrkspc_core/index.html"; then
+                rm -rf docs/book/rustdoc
+                cp -R "$target_dir/doc" docs/book/rustdoc
+            fi
+            sleep 2
+        done
+    ) &
     watcher_pid=$!
     for _ in $(seq 1 120); do
         [[ -f docs/book/index.html && docs/book/index.html -nt "$stamp" ]] && break
         sleep 0.5
     done
     rm -rf docs/book/rustdoc
-    cp -R target/doc docs/book/rustdoc
+    cp -R "$target_dir/doc" docs/book/rustdoc
     wait "$server_pid"
-    kill "$watcher_pid" 2>/dev/null || true
 
 # Shipping-artifact audit: the release binary must not contain builder
 # home paths (/Users/... or /home/...) from panic locations, error
