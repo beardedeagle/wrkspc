@@ -28,7 +28,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
         with:
           install-cargo-deny: "true"
           install-cargo-audit: "true"
@@ -86,7 +86,7 @@ jobs:
       # No caches in the release pipeline: a release build must consume
       # only freshly fetched, pinned inputs — restored cache entries are a
       # poisoning path straight into the published binaries.
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
         with:
           # Each leg declares the rust-std targets it needs: Linux cross
           # legs install their target's std for the zigbuild link,
@@ -146,7 +146,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
       # v8.0.2
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -190,7 +190,7 @@ jobs:
           persist-credentials: false
       # just only — the image wraps the prebuilt tarball binaries, so
       # this job needs no Rust toolchain.
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
         with:
           install-rust: "false"
       # v8.0.2
