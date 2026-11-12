@@ -430,6 +430,13 @@ release-tarball target="native":
     TARGET="{{target}}"
     mkdir -p dist
     dist_abs="$(pwd)/dist"
+    # macOS ships `shasum`; Git Bash (Windows legs) ships `sha256sum`.
+    # Both print the same `hash␣␣filename` line the checksum file needs.
+    if command -v shasum >/dev/null 2>&1; then
+        hash_file() { shasum -a 256 "$1"; }
+    else
+        hash_file() { sha256sum "$1"; }
+    fi
     case "$TARGET" in
         native)
             cargo +{{toolchain}} build --locked --release -p wrkspc-cli --bin wrkspc
@@ -466,13 +473,13 @@ release-tarball target="native":
         cp "$bin" "$stage/wrkspc.exe"
         cp LICENSE "$stage/LICENSE"
         tar -C "$stage" -a -cf "$dist_abs/wrkspc-${name}.zip" wrkspc.exe LICENSE
-        (cd dist && shasum -a 256 "wrkspc-${name}.zip" >> "SHA256SUMS-${name}")
+        (cd dist && hash_file "wrkspc-${name}.zip" >> "SHA256SUMS-${name}")
         echo "dist/wrkspc-${name}.zip"
     else
         cp "$bin" "$stage/wrkspc"
         cp LICENSE "$stage/LICENSE"
         tar -C "$stage" -czf "$dist_abs/wrkspc-${name}.tar.gz" wrkspc LICENSE
-        (cd dist && shasum -a 256 "wrkspc-${name}.tar.gz" >> "SHA256SUMS-${name}")
+        (cd dist && hash_file "wrkspc-${name}.tar.gz" >> "SHA256SUMS-${name}")
         echo "dist/wrkspc-${name}.tar.gz"
     fi
 
