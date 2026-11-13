@@ -75,6 +75,45 @@ async fn accept_refuses_recipient_lists_over_the_cap() {
     assert!(messages.is_empty(), "a refused post must not commit");
 }
 
+/// An oversized mention-derived fan-out is refused too: a mention-only
+/// post arrives with an empty requested list, so the early guard passes,
+/// but the resolved @mentions are the list that actually fans out.
+#[tokio::test]
+async fn accept_refuses_mention_fanout_over_the_cap() {
+    let store = Store::open_in_memory("test").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    let mut member_ids: Vec<String> = vec!["operator".to_string()];
+    for index in 0..33 {
+        let peer_id = format!("peer{index}");
+        store
+            .ensure_peer(&peer_id, &peer_id, "harness")
+            .await
+            .unwrap();
+        member_ids.push(peer_id);
+    }
+    let member_refs: Vec<&str> = member_ids.iter().map(String::as_str).collect();
+    let conversation = store.create_conversation(&member_refs).await.unwrap();
+    let content = (0..33)
+        .map(|index| format!("@peer{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let error = store
+        .accept_message(&conversation, "operator", &key(), &content, false, &[])
+        .await
+        .expect_err("mention-only fan-out over the cap must be refused");
+    assert!(matches!(
+        error,
+        StoreError::TooManyRecipients {
+            limit: 32,
+            count: 33
+        }
+    ));
+}
+
 /// Re-accepting the same key returns Replay with the original message id (no duplicate commit).
 #[tokio::test]
 async fn idempotent_replay_returns_same_message() {

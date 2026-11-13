@@ -238,6 +238,16 @@ impl Store {
             )
             .await?;
         let recipients = recipients.as_slice();
+        // The ceiling also fences the RESOLVED list: a mention-only post
+        // arrives with an empty requested list (the early guard above
+        // passes), and @mentions can still resolve to dozens of members —
+        // the resolved set is what actually fans out.
+        if recipients.len() > MAX_DIRECTED_RECIPIENTS {
+            return Err(StoreError::TooManyRecipients {
+                limit: MAX_DIRECTED_RECIPIENTS,
+                count: recipients.len(),
+            });
+        }
 
         self.assert_member(&mut tx, conversation_id, sender_id)
             .await?;
