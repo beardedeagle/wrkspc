@@ -186,21 +186,32 @@ impl Store {
             // delivery loop call lands here with its own small list, but a
             // caller rotating lists under one idempotency key could
             // otherwise accumulate unbounded recipients on one message.
-            // Count only peers not already committed, so the legitimate
-            // per-recipient acks of a 32-recipient message stay green.
+            // Two guards on the count: the incoming list may name the same
+            // peer twice (INSERT OR IGNORE would dedupe), and a legacy
+            // message committed before the cap may already exceed it — a
+            // pure re-ack that adds NOBODY must always pass, or an upgrade
+            // strands outstanding deliveries in process_deliveries' replay
+            // acks. The refusal fires only when the replay GROWS the set
+            // past the ceiling.
             let committed_ids: Vec<String> =
                 sqlx::query_scalar("SELECT peer_id FROM message_recipients WHERE message_id = ?")
                     .bind(&existing_id)
                     .fetch_all(&mut *tx)
                     .await?;
-            let new_unique = recipients
-                .iter()
-                .filter(|recipient| !committed_ids.contains(&recipient.peer_id))
-                .count();
-            if committed_ids.len() + new_unique > MAX_DIRECTED_RECIPIENTS {
+            let mut new_unique_ids: Vec<&str> = Vec::new();
+            for recipient in recipients {
+                if !committed_ids.iter().any(|id| id == &recipient.peer_id)
+                    && !new_unique_ids.contains(&recipient.peer_id.as_str())
+                {
+                    new_unique_ids.push(&recipient.peer_id);
+                }
+            }
+            if !new_unique_ids.is_empty()
+                && committed_ids.len() + new_unique_ids.len() > MAX_DIRECTED_RECIPIENTS
+            {
                 return Err(StoreError::TooManyRecipients {
                     limit: MAX_DIRECTED_RECIPIENTS,
-                    count: committed_ids.len() + new_unique,
+                    count: committed_ids.len() + new_unique_ids.len(),
                 });
             }
             for recipient in recipients {

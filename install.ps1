@@ -148,6 +148,10 @@ function Install-Binary {
 }
 
 $WrkspcShare = if ($env:WRKSPC_SHARE) { $env:WRKSPC_SHARE } else { "$env:LOCALAPPDATA\wrkspc" }
+# Resolve to an ABSOLUTE path before deriving anything: Invoke-SetupPki
+# Push-Locations into the pki dir, and a relative share would make
+# Join-Path double the prefix (and Get-Acl abort) once the CWD moved.
+$WrkspcShare = [System.IO.Path]::GetFullPath($WrkspcShare)
 $PkiDir = Join-Path $WrkspcShare "pki"
 
 function Find-OpenSsl {

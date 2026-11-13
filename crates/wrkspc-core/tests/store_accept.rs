@@ -961,3 +961,52 @@ async fn replay_cannot_accumulate_recipients_past_the_cap() {
         StoreError::TooManyRecipients { limit: 32, .. }
     ));
 }
+
+/// Duplicates INSIDE one replay list count once: with 31 committed,
+/// replaying ["peer31", "peer31"] lands at exactly 32 unique recipients
+/// (INSERT OR IGNORE would dedupe) and must pass, not be miscounted 33.
+#[tokio::test]
+async fn replay_deduplicates_repeated_peer_ids_in_the_count() {
+    let store = Store::open_in_memory("test").await.unwrap();
+    let (operator, _agent, _seeded_conversation) = seeded(&store).await;
+    let mut member_ids: Vec<String> = vec![operator.clone()];
+    for index in 0..32 {
+        let peer_id = format!("peer{index}");
+        store
+            .ensure_peer(&peer_id, &peer_id, "harness")
+            .await
+            .unwrap();
+        member_ids.push(peer_id);
+    }
+    let member_refs: Vec<&str> = member_ids.iter().map(String::as_str).collect();
+    let conversation = store.create_conversation(&member_refs).await.unwrap();
+    let idem = key();
+
+    let first: Vec<RecipientRequest> = (0..31)
+        .map(|index| RecipientRequest {
+            peer_id: format!("peer{index}"),
+            execution_requested: false,
+        })
+        .collect();
+    store
+        .accept_message(&conversation, &operator, &idem, "rotate", false, &first)
+        .await
+        .unwrap();
+
+    // The same NEW peer twice in one replay: deduped to one, total 32.
+    let replay = vec![
+        RecipientRequest {
+            peer_id: "peer31".to_string(),
+            execution_requested: false,
+        },
+        RecipientRequest {
+            peer_id: "peer31".to_string(),
+            execution_requested: false,
+        },
+    ];
+    let outcome = store
+        .accept_message(&conversation, &operator, &idem, "rotate", false, &replay)
+        .await
+        .expect("a deduplicated replay at exactly the cap must pass");
+    assert!(matches!(outcome, AcceptOutcome::Replay { .. }));
+}
