@@ -461,3 +461,45 @@ async fn node_mode_operator_post_queues_nothing() {
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }
+
+/// An operator post with no recipient list fans out to every eligible
+/// member: in a room with more than the directed-post ceiling of
+/// members, the shared store fence refuses the post with a 400 (not a
+/// 500) so a big room never amplifies into unbounded per-peer work.
+#[tokio::test]
+async fn oversized_fanout_room_post_is_refused_with_400() {
+    let ui = spawn_ui().await;
+    let mut members: Vec<String> = Vec::new();
+    for index in 0..33 {
+        let peer_id = format!("peer{index}");
+        ui.store
+            .ensure_peer(&peer_id, &peer_id, "harness")
+            .await
+            .unwrap();
+        members.push(peer_id);
+    }
+    members.insert(0, "operator".to_string());
+    let member_refs: Vec<&str> = members.iter().map(String::as_str).collect();
+    let conversation = ui.store.create_conversation(&member_refs).await.unwrap();
+
+    let res = ui
+        .client()
+        .post(format!(
+            "{}/api/conversations/{conversation}/messages",
+            ui.base
+        ))
+        .bearer_auth(TOKEN)
+        .json(&serde_json::json!({ "content": "everyone listens" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("too many recipients") && error.contains("33")),
+        "the refusal names the fan-out size: {body}"
+    );
+    let _ = ui.shutdown.send(());
+}

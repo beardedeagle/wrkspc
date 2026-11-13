@@ -465,6 +465,10 @@ async fn commit_send(state: &AcceptanceState, parsed_send: &ParsedSend) -> Optio
             StatusCode::NOT_FOUND,
             &format!("{entity} `{id}` not found"),
         )),
+        Err(StoreError::TooManyRecipients { limit, count }) => Some(rpc_error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("too many recipients: {count} (max {limit})"),
+        )),
         Err(error) => {
             // Visible, conservative: the A2A task stands as the client's
             // acceptance record; the operator sees the translation gap in

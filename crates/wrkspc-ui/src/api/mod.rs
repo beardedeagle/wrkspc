@@ -135,6 +135,7 @@ fn store_error(error: StoreError) -> (StatusCode, Json<Value>) {
     use StoreError::*;
     let status = match error {
         NotFound { .. } => StatusCode::NOT_FOUND,
+        TooManyRecipients { .. } => StatusCode::BAD_REQUEST,
         TerminalState { .. }
         | IntentTerminal { .. }
         | BlockedByFence { .. }
