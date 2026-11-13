@@ -894,3 +894,70 @@ async fn hub_unknown_mirror_round_trip() {
         "a consumed mirror row has no decision to set"
     );
 }
+
+/// The ceiling is cumulative across replays: rotating recipient lists
+/// under one idempotency key must not accumulate unbounded recipients
+/// on a single message. Re-acking an already-committed peer stays fine
+/// (the per-recipient delivery loop relies on it).
+#[tokio::test]
+async fn replay_cannot_accumulate_recipients_past_the_cap() {
+    let store = Store::open_in_memory("test").await.unwrap();
+    let (operator, _agent, _seeded_conversation) = seeded(&store).await;
+    let mut member_ids: Vec<String> = vec![operator.clone()];
+    for index in 0..32 {
+        let peer_id = format!("peer{index}");
+        store
+            .ensure_peer(&peer_id, &peer_id, "harness")
+            .await
+            .unwrap();
+        member_ids.push(peer_id);
+    }
+    let member_refs: Vec<&str> = member_ids.iter().map(String::as_str).collect();
+    let conversation = store.create_conversation(&member_refs).await.unwrap();
+    let idem = key();
+
+    // First accept: 20 recipients, all committed.
+    let first: Vec<RecipientRequest> = (0..20)
+        .map(|index| RecipientRequest {
+            peer_id: format!("peer{index}"),
+            execution_requested: false,
+        })
+        .collect();
+    store
+        .accept_message(&conversation, &operator, &idem, "rotate", false, &first)
+        .await
+        .unwrap();
+
+    // A replay re-acking an already-committed peer stays green.
+    store
+        .accept_message(
+            &conversation,
+            &operator,
+            &idem,
+            "rotate",
+            false,
+            &[RecipientRequest {
+                peer_id: "peer0".to_string(),
+                execution_requested: false,
+            }],
+        )
+        .await
+        .unwrap();
+
+    // A replay rotating in peers that would push the total past 32 is
+    // refused with the cumulative count.
+    let overflow: Vec<RecipientRequest> = (20..33)
+        .map(|index| RecipientRequest {
+            peer_id: format!("peer{index}"),
+            execution_requested: false,
+        })
+        .collect();
+    let error = store
+        .accept_message(&conversation, &operator, &idem, "rotate", false, &overflow)
+        .await
+        .expect_err("replay rotation past the cumulative cap must be refused");
+    assert!(matches!(
+        error,
+        StoreError::TooManyRecipients { limit: 32, .. }
+    ));
+}

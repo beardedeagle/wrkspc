@@ -182,6 +182,27 @@ impl Store {
                     message_id: existing_id,
                 });
             }
+            // The ceiling is CUMULATIVE across replays: each per-recipient
+            // delivery loop call lands here with its own small list, but a
+            // caller rotating lists under one idempotency key could
+            // otherwise accumulate unbounded recipients on one message.
+            // Count only peers not already committed, so the legitimate
+            // per-recipient acks of a 32-recipient message stay green.
+            let committed_ids: Vec<String> =
+                sqlx::query_scalar("SELECT peer_id FROM message_recipients WHERE message_id = ?")
+                    .bind(&existing_id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            let new_unique = recipients
+                .iter()
+                .filter(|recipient| !committed_ids.contains(&recipient.peer_id))
+                .count();
+            if committed_ids.len() + new_unique > MAX_DIRECTED_RECIPIENTS {
+                return Err(StoreError::TooManyRecipients {
+                    limit: MAX_DIRECTED_RECIPIENTS,
+                    count: committed_ids.len() + new_unique,
+                });
+            }
             for recipient in recipients {
                 self.assert_member(&mut tx, conversation_id, &recipient.peer_id)
                     .await?;

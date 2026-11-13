@@ -174,6 +174,19 @@ function ConvertTo-TomlString([string]$Value) {
     $Value -replace '\\', '\\\\' -replace '"', '\"'
 }
 
+function Protect-PrivateKey([string]$Path) {
+    # Windows has no umask: openssl writes keys with the directory's
+    # inherited ACLs, which can include Administrators or other local
+    # users on a shared box. Drop inheritance and grant the current
+    # user read+write only, via pure .NET ACLs (no cmd /c string).
+    $acl = Get-Acl -Path $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $env:USERNAME, "Read,Write", "Allow")
+    $acl.AddAccessRule($rule) | Out-Null
+    Set-Acl -Path $Path -AclObject $acl
+}
+
 function Invoke-OpenSsl([string[]]$ArgumentList, [string]$Step) {
     # cmd /c: PowerShell 5.1 raises a terminating NativeCommandError
     # for native stderr even when merged through a pipeline (observed
@@ -203,6 +216,7 @@ function Invoke-SetupPki {
             $caCn = Invoke-Ask "CA common name" "wrkspc-ca"
             Test-HostName $caCn
             Invoke-OpenSsl @("genrsa", "-out", "ca.key", "4096") "CA key"
+            Protect-PrivateKey (Join-Path $PkiDir "ca.key")
             Invoke-OpenSsl @("req", "-x509", "-new", "-nodes", "-key", "ca.key", "-sha256", "-days", "3650", "-subj", "/CN=$caCn", "-out", "ca.pem") "CA cert"
             Write-Step "CA written to $PkiDir (ca.pem, ca.key)"
         } elseif ((Invoke-Ask "CA already exists at $PkiDir\ca.pem -- reuse it? (y/n)" "y") -ne "y") {
@@ -213,6 +227,7 @@ function Invoke-SetupPki {
             $hubHost = Invoke-Ask "Hub hostname (the --card-url name; certificate SAN)" "hub.example.com"
             Test-HostName $hubHost
             Invoke-OpenSsl @("genrsa", "-out", "hub.key", "2048") "hub key"
+            Protect-PrivateKey (Join-Path $PkiDir "hub.key")
             Invoke-OpenSsl @("req", "-new", "-key", "hub.key", "-subj", "/CN=$hubHost", "-addext", "subjectAltName=DNS:$hubHost", "-out", "hub.csr") "hub CSR"
             Invoke-OpenSsl @("x509", "-req", "-in", "hub.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-days", "825", "-copy_extensions", "copy", "-sha256", "-out", "hub.crt") "hub cert"
             Remove-Item hub.csr -ErrorAction SilentlyContinue
@@ -223,6 +238,7 @@ function Invoke-SetupPki {
             $hostId = Invoke-Ask "Node host id (the client certificate SAN)" "this-machine.example"
             Test-HostName $hostId
             Invoke-OpenSsl @("genrsa", "-out", "node.key", "2048") "node key"
+            Protect-PrivateKey (Join-Path $PkiDir "node.key")
             Invoke-OpenSsl @("req", "-new", "-key", "node.key", "-subj", "/CN=$hostId", "-addext", "subjectAltName=DNS:$hostId", "-out", "node.csr") "node CSR"
             Invoke-OpenSsl @("x509", "-req", "-in", "node.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-days", "825", "-copy_extensions", "copy", "-sha256", "-out", "node.crt") "node cert"
             Remove-Item node.csr -ErrorAction SilentlyContinue
