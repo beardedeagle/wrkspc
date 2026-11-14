@@ -4379,6 +4379,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
  "wrkspc-a2a",
  "wrkspc-acp",
  "wrkspc-core",
