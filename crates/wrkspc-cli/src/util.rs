@@ -315,7 +315,8 @@ pub(crate) mod win_acl {
         GetLengthSid, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation,
         INHERITED_ACE, InitializeAcl, InitializeSecurityDescriptor, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_DESCRIPTOR,
-        SetFileSecurityW, SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        SetFileSecurityW, SetSecurityDescriptorDacl, TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
+        TokenOwner, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -333,6 +334,25 @@ pub(crate) mod win_acl {
     /// The current process token user's SID, copied out of the token
     /// so the token handle can be closed immediately.
     fn process_user_sid() -> Result<Vec<u8>, String> {
+        token_class_sid(TokenUser)
+    }
+
+    /// The token's default owner SID. On an elevated token (admin
+    /// ssh session, service account) the OS assigns newly created
+    /// objects to TOKEN_OWNER — often the Administrators group — not
+    /// TOKEN_USER, so a file this very process creates can legitimately
+    /// carry the token-owner SID. Both SIDs must pass the ownership
+    /// check.
+    fn process_owner_sid() -> Result<Vec<u8>, String> {
+        token_class_sid(TokenOwner)
+    }
+
+    /// Reads the first SID out of the process token for `class`
+    /// (`TokenUser` or `TokenOwner`). Both information classes store
+    /// their SID POINTER at offset 0 of the returned buffer
+    /// (TOKEN_USER.User.Sid, TOKEN_OWNER.Owner), with the SID bytes
+    /// following it in the same allocation.
+    fn token_class_sid(class: TOKEN_INFORMATION_CLASS) -> Result<Vec<u8>, String> {
         // SAFETY: GetCurrentProcess returns the process pseudohandle,
         // which is always valid and never needs closing.
         let process = unsafe { GetCurrentProcess() };
@@ -343,58 +363,54 @@ pub(crate) mod win_acl {
         if opened == 0 {
             return Err(format!("cannot open the process token: {}", last_error()));
         }
-        let sid = token_user_sid(token);
+        let result = token_sid(token, class);
         // SAFETY: `token` was opened by OpenProcessToken above and is
         // not used afterwards.
         unsafe {
             CloseHandle(token);
         }
-        sid
+        result
     }
 
-    /// Reads the SID out of an opened token's `TokenUser` information.
-    fn token_user_sid(token: HANDLE) -> Result<Vec<u8>, String> {
+    /// Reads the SID pointer at offset 0 of an opened token's `class`
+    /// information and copies the SID bytes out.
+    fn token_sid(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> Result<Vec<u8>, String> {
         let mut needed: u32 = 0;
         // SAFETY: the documented sizing call — a null buffer with a
         // zero length reports the required size in `needed`.
-        let _ = unsafe { GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut needed) };
+        let _ = unsafe { GetTokenInformation(token, class, ptr::null_mut(), 0, &mut needed) };
         if needed == 0 {
-            return Err(format!(
-                "cannot size the process token user: {}",
-                last_error()
-            ));
+            return Err(format!("cannot size the process token: {}", last_error()));
         }
-        // u64 slots keep the buffer aligned for the pointer inside
-        // TOKEN_USER on every Windows architecture.
+        // u64 slots keep the buffer aligned for the pointer at offset
+        // 0 on every Windows architecture.
         let mut buf = vec![0u64; needed.div_ceil(8) as usize];
         // SAFETY: `buf` is `needed` bytes, aligned to 8, and writable.
         let ok = unsafe {
             GetTokenInformation(
                 token,
-                TokenUser,
+                class,
                 buf.as_mut_ptr() as *mut core::ffi::c_void,
                 needed,
                 &mut needed,
             )
         };
         if ok == 0 {
-            return Err(format!(
-                "cannot read the process token user: {}",
-                last_error()
-            ));
+            return Err(format!("cannot read the process token: {}", last_error()));
         }
-        // SAFETY: GetTokenInformation succeeded, so `buf` holds a valid
-        // TOKEN_USER within `needed` bytes.
-        let user: &TOKEN_USER = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
-        let sid: PSID = user.User.Sid;
+        // SAFETY: GetTokenInformation succeeded, so `buf` holds a
+        // valid information blob whose first field is the SID pointer
+        // (TOKEN_USER.User.Sid / TOKEN_OWNER.Owner), with the SID
+        // itself following in the same allocation.
+        let sid: PSID = unsafe { *(buf.as_ptr() as *const PSID) };
         if sid.is_null() {
-            return Err("the process token user SID is null".to_string());
+            return Err("the process token SID is null".to_string());
         }
         // SAFETY: `sid` points into `buf`, which holds the complete
-        // TOKEN_USER returned above.
+        // information blob returned above.
         let sid_len = unsafe { GetLengthSid(sid) } as usize;
         if sid_len == 0 || sid_len > needed as usize {
-            return Err("the process token user SID has an invalid length".to_string());
+            return Err("the process token SID has an invalid length".to_string());
         }
         let mut bytes = vec![0u8; sid_len];
         // SAFETY: both pointers are valid for `sid_len` bytes and the
@@ -598,10 +614,15 @@ pub(crate) mod win_acl {
             ));
         }
         let me = process_user_sid()?;
-        // SAFETY: `owner` points into the descriptor buffer and `me`
-        // holds a SID copied from the process token; both are valid.
-        let same = unsafe { EqualSid(owner, me.as_ptr() as PSID) };
-        if same == 0 {
+        let default_owner = process_owner_sid()?;
+        // SAFETY: `owner` points into the descriptor buffer; `me` and
+        // `default_owner` hold SIDs copied from the process token;
+        // all three are valid.
+        let owned_by_us = unsafe {
+            EqualSid(owner, me.as_ptr() as PSID) != 0
+                || EqualSid(owner, default_owner.as_ptr() as PSID) != 0
+        };
+        if !owned_by_us {
             return Err(format!(
                 "token file {} is owned by another user — refusing to read it",
                 path.display()
