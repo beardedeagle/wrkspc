@@ -1,3 +1,7 @@
+// Both tests in this binary drive a fake `agy` through native process
+// spawning, and the fixture is an extensionless POSIX shell script —
+// Windows cannot execute it, so the whole binary is Unix-only.
+#![cfg(unix)]
 //! Native-MCP registration failure: a peer whose `mcp_http` binding
 //! fails its harness-side registration (`agy mcp add` exiting nonzero)
 //! must surface as a visible failure — never a session that looks

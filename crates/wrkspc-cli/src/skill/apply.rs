@@ -226,11 +226,16 @@ fn ensure_safe_target(home: &Path, target: &Path) -> Result<(), Box<dyn std::err
 /// Replaces `path` with `contents` atomically: the full
 /// text is written to a uniquely-named temporary sibling (created
 /// exclusively, synced to disk), given the destination's existing
-/// permissions, and only then renamed over the destination. A failure
-/// at ANY step — including the rename itself — removes the temporary
-/// and leaves the destination byte-for-byte untouched, so an I/O
-/// error or crash can never destroy user content outside the wrkspc
-/// markers the way a truncate-in-place write could.
+/// permissions, and only then renamed over the destination. The
+/// temporary is created with RESTRICTIVE permissions (0600 on Unix,
+/// an owner-only DACL on Windows) so the instruction text — which may
+/// be private — is never observable at the umask/inherited default
+/// while it sits in the sibling, even if the process crashes before
+/// the destination mode is applied. A failure at ANY step — including
+/// the rename itself — removes the temporary and leaves the
+/// destination byte-for-byte untouched, so an I/O error or crash can
+/// never destroy user content outside the wrkspc markers the way a
+/// truncate-in-place write could.
 fn replace_file_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
     let parent = path
         .parent()
@@ -260,11 +265,25 @@ fn replace_file_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
             ".{name}.wrkspc-tmp-{}-{attempt}",
             std::process::id()
         ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        // Restrictive permissions AT CREATION: the sibling carries the
+        // complete instruction text before the destination's mode is
+        // applied, so it must never exist at the umask/inherited
+        // default — not even for the window between create and write,
+        // and not after a crash before the post-write tightening.
+        #[cfg(windows)]
+        let opened = crate::util::win_acl::create_new_secured(&candidate);
+        #[cfg(not(windows))]
+        let opened = {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(&candidate)
+        };
+        match opened {
             Ok(file) => break (candidate, file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 attempt += 1;
