@@ -306,6 +306,7 @@ pub(crate) mod win_acl {
     use std::ptr;
     use windows_sys::Win32::Foundation::{
         CloseHandle, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+        INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
     use windows_sys::Win32::Security::{
@@ -314,12 +315,11 @@ pub(crate) mod win_acl {
         GetLengthSid, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation,
         INHERITED_ACE, InitializeAcl, InitializeSecurityDescriptor, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_DESCRIPTOR,
-        SetFileSecurityW, SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser, WRITE_DAC,
-        WRITE_OWNER,
+        SetFileSecurityW, SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, INVALID_HANDLE_VALUE,
+        FILE_SHARE_WRITE, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -490,7 +490,7 @@ pub(crate) mod win_acl {
                 ptr::null_mut(),
                 CREATE_NEW,
                 FILE_ATTRIBUTE_NORMAL,
-                0,
+                ptr::null_mut(),
             )
         };
         if handle == INVALID_HANDLE_VALUE {
