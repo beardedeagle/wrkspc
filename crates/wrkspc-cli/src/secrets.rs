@@ -767,22 +767,25 @@ impl TokenStore for FileStore {
         if crate::util::load_existing_token_settling(&path)?.is_some() {
             return Ok(());
         }
-        let mut options = std::fs::OpenOptions::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.write(true).create_new(true).mode(0o600);
-            options.custom_flags(libc::O_NOFOLLOW);
-        }
-        #[cfg(not(unix))]
-        options.write(true).create_new(true);
-        match options.open(&path) {
+        // Windows opens with WRITE_DAC/WRITE_OWNER and the owner-only
+        // DACL lands BEFORE the first secret byte (WRKSPC-011); Unix
+        // gets 0600 + O_NOFOLLOW from the open itself.
+        #[cfg(windows)]
+        let opened = crate::util::win_acl::create_new_secured(&path);
+        #[cfg(not(windows))]
+        let opened = {
+            let mut options = std::fs::OpenOptions::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.write(true).create_new(true).mode(0o600);
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            options.write(true).create_new(true);
+            options.open(&path)
+        };
+        match opened {
             Ok(mut file) => {
-                // Windows: the owner-only, inheritance-free DACL lands
-                // BEFORE the first secret byte (WRKSPC-011); Unix gets
-                // 0600 from the open above.
-                #[cfg(windows)]
-                crate::util::win_acl::set_owner_only_acl(&file)?;
                 use std::io::Write;
                 file.write_all(token.as_bytes())
                     .map_err(|e| format!("cannot write {path:?}: {e}"))?;

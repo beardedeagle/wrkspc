@@ -241,23 +241,25 @@ pub fn stable_token_sync(db: &Path, tag: &str) -> Result<String, String> {
     let token = uuid::Uuid::new_v4().to_string();
     // create_new + O_NOFOLLOW: an atomic exclusive create that can
     // never follow a link swapped into place by another process.
-    let mut options = std::fs::OpenOptions::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.write(true).create_new(true).mode(0o600);
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(not(unix))]
-    options.write(true).create_new(true);
-    match options.open(&path) {
+    // Windows opens with WRITE_DAC/WRITE_OWNER and applies the
+    // owner-only DACL before the first byte lands (WRKSPC-011); Unix
+    // gets 0600 from the open itself.
+    #[cfg(windows)]
+    let opened = win_acl::create_new_secured(&path);
+    #[cfg(not(windows))]
+    let opened = {
+        let mut options = std::fs::OpenOptions::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.write(true).create_new(true).mode(0o600);
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        options.write(true).create_new(true);
+        options.open(&path)
+    };
+    match opened {
         Ok(mut file) => {
-            // Windows: lock the ACL down to the owner BEFORE the first
-            // byte lands (WRKSPC-011) — an inherited ACL could
-            // otherwise expose the credential between create and
-            // write. (Unix gets 0600 from the open above.)
-            #[cfg(windows)]
-            win_acl::set_owner_only_acl(&file)?;
             use std::io::Write;
             file.write_all(token.as_bytes())
                 .map_err(|e| format!("cannot write token to {}: {e}", path.display()))?;
@@ -302,7 +304,9 @@ pub use win_acl::token_acl_is_owner_only;
 pub(crate) mod win_acl {
     use std::path::Path;
     use std::ptr;
-    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_ALL, GetLastError, HANDLE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+    };
     use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AclSizeInformation, AddAccessAllowedAce,
@@ -310,7 +314,12 @@ pub(crate) mod win_acl {
         GetLengthSid, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation,
         INHERITED_ACE, InitializeAcl, InitializeSecurityDescriptor, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_DESCRIPTOR,
-        SetFileSecurityW, SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        SetFileSecurityW, SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser, WRITE_DAC,
+        WRITE_OWNER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -457,23 +466,60 @@ pub(crate) mod win_acl {
         Ok((sd, acl_buf))
     }
 
-    /// Replaces an OPEN token file's DACL with the owner-only,
-    /// inheritance-free one. Called on the winning `create_new` handle
-    /// BEFORE the secret bytes are written, so no instant of the file
-    /// ever carries a broader ACL; the handle closes the path-TOCTOU
-    /// window.
-    pub(crate) fn set_owner_only_acl(file: &std::fs::File) -> Result<(), String> {
-        use std::os::windows::io::AsRawHandle;
+    /// Creates the token file with the owner-only, inheritance-free
+    /// DACL already applied: one exclusive `CreateFileW` open carries
+    /// `WRITE_DAC | WRITE_OWNER` (std `OpenOptions` opens with
+    /// `GENERIC_WRITE` alone, which Windows refuses for
+    /// `SetSecurityInfo` — ERROR_ACCESS_DENIED), and the DACL lands on
+    /// that handle BEFORE the first secret byte is written, so no
+    /// instant of the file ever carries a broader ACL; the handle
+    /// closes the path-TOCTOU window. `create_new` semantics: a
+    /// pre-existing file surfaces as `ErrorKind::AlreadyExists`.
+    pub(crate) fn create_new_secured(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: `wide` is NUL-terminated; null security attributes
+        // inherit the process default; CREATE_NEW is the atomic
+        // exclusive create; the share mode matches std's OpenOptions.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null_mut(),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                0,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        if let Err(error) = set_owner_only_acl_on_handle(handle) {
+            // SAFETY: `handle` is a valid, open file handle.
+            unsafe { CloseHandle(handle) };
+            return Err(std::io::Error::other(error));
+        }
+        // SAFETY: `handle` is a valid, newly created file handle;
+        // ownership transfers to the returned File, which closes it.
+        Ok(unsafe { std::fs::File::from_raw_handle(handle as *mut _) })
+    }
+
+    /// Replaces an OPEN file handle's DACL with the owner-only,
+    /// inheritance-free one. Requires a handle opened with WRITE_DAC
+    /// (see [`create_new_secured`](Self::create_new_secured)).
+    fn set_owner_only_acl_on_handle(handle: HANDLE) -> Result<(), String> {
         let sid = process_user_sid()?;
         // `_sd` is not passed (the ACL pointer is); the buffer it owns
         // is what must stay alive across the call.
         let (_sd, acl_buf) = owner_only_security_descriptor(&sid)?;
-        // SAFETY: the handle belongs to the open file (kept alive by
-        // `file`); the descriptor and its DACL buffer are valid for
-        // the call; null owner/group/SACL leave those unchanged.
+        // SAFETY: the handle belongs to the open file; the descriptor
+        // and its DACL buffer are valid for the call; null
+        // owner/group/SACL leave those unchanged.
         let result = unsafe {
             SetSecurityInfo(
-                file.as_raw_handle() as HANDLE,
+                handle,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 ptr::null_mut(),
