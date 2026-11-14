@@ -293,6 +293,11 @@ pub fn stable_token_sync(db: &Path, tag: &str) -> Result<String, String> {
 /// the same tightening (plus a foreign-owner refusal) before their
 /// value is read. This mirrors the Unix 0600 policy and the
 /// install.ps1 private-key ACL handling in the same threat model.
+/// The Windows ACL test hook: reachable from the integration tests
+/// (a `pub(crate)` module would hide it from the external test crate).
+#[cfg(windows)]
+pub use win_acl::token_acl_is_owner_only;
+
 #[cfg(windows)]
 pub(crate) mod win_acl {
     use std::path::Path;

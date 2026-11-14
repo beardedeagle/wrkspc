@@ -110,42 +110,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   larger lists outright: a near-limit request body could previously fan
   out to thousands of per-target store resolves and deliveries (CodeQL
   `rust/uncontrolled-allocation-size`).
-- Multi-family review hardening (the 2026-11-14 deduplicated findings
-  set, WRKSPC-001 through WRKSPC-031): mention resolution prefers
-  canonical peer ids and fails closed on ambiguity; explicit empty
-  recipient lists stay authoritative end to end instead of being
-  re-inferred at the hub; replays can no longer escalate a mail-only
-  acceptance to executable delivery, and replay fan-out takes its
-  authority from the committed message rather than the retry payload;
-  the hub fans operator posts out from the committed routing so
-  mention-derived recipients actually queue; a same-instance re-claim
-  re-evaluates the live fence and orphan deliveries are refused at the
-  claim gate.
-- More of the same wave: cancellation fences the fan-out atomically, so
-  a canceled intent can never produce a claimable task, and queued
-  deliveries refresh pending guidance at the poll boundary; mirrored
-  outcomes join the durable hub-task mapping instead of recomputing an
-  id that never matches; repaired fan-out preserves the sender's wire
-  origin so a co-hosted echo cannot mint a second local message;
-  guidance acks and unknown-mirror consumption are scoped to the
-  validated task and host; conversation deletion cleans outcome reports
-  and all delivery tasks inside a write-reserving transaction; the
-  bounded message window loads only its own delivery history.
-- Acceptance middleware now covers every send entry point: the legacy
+- Mention resolution prefers canonical peer ids and fails closed on
+  ambiguity instead of first-match routing; an explicit empty recipient
+  list stays authoritative end to end instead of being re-inferred by
+  the hub.
+- Replays can no longer escalate a mail-only acceptance to executable
+  delivery, and replay fan-out takes its authority from the committed
+  message rather than the retry payload; the hub fans operator posts
+  out from the committed routing, so mention-derived recipients
+  actually queue.
+- A same-instance re-claim re-evaluates the live fence, orphan
+  deliveries (parent message or recipient deleted) are refused at the
+  claim gate, and a canceled intent can never produce a claimable task:
+  cancellation fences task creation atomically.
+- Queued deliveries refresh pending guidance at the poll boundary;
+  mirrored outcomes join the durable hub-task mapping instead of
+  recomputing an id that never matches; repaired fan-out preserves the
+  sender's wire origin so a co-hosted echo cannot mint a second local
+  message; guidance acks and unknown-mirror consumption are scoped to
+  the validated task and host.
+- Conversation deletion cleans outcome reports and all delivery tasks
+  inside a write-reserving transaction; the bounded message window
+  loads only its own delivery history.
+- Acceptance now covers every send entry point: the legacy
   single-segment REST send alias runs full acceptance, continuation
-  sends are authorized against the host-queue ownership rule before the
-  SDK mutates anything, canonical task-action suffix spellings are
+  sends are authorized against the host-queue ownership rule before
+  anything is mutated, canonical task-action suffix spellings are
   normalized for the same check, and streaming sends are refused before
-  the SDK rather than skipping acceptance.
-- Client-side hardening: Windows credential files are created with
-  owner-only DACLs instead of inherited permissions; instruction-file
-  rewrites are atomic with permission preservation; skill installs
-  refuse targets whose nearest existing ancestor escapes the home
-  directory; canceled MCP HTTP setup closes its bound listener on every
-  drop path; queued harness lookups re-check spawn backoff under the
-  spawn lock; dead cached adapters report disconnected presence; an
-  adapter dying while idle ends its session loop; concurrent first
-  starts publish the operator token race-free.
-- Three previously ineffective regression signals now actually fail the
-  build on regressions: hung-binding delivery work, the withheld
-  clipboard-clear promise, and the held-delivery dispatch race.
+  reaching the SDK.
+- Windows credential files are created with owner-only DACLs instead of
+  inherited permissions; instruction-file rewrites are atomic with
+  permission preservation; skill installs refuse targets whose nearest
+  existing ancestor escapes the home directory.
+- Canceled MCP HTTP setup closes its bound listener on every drop path;
+  queued harness lookups re-check spawn backoff under the spawn lock;
+  dead cached adapters report disconnected presence, and an adapter
+  dying while idle ends its session loop; concurrent first starts
+  publish the operator token race-free.
