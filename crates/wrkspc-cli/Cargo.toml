@@ -42,6 +42,18 @@ core-foundation = "0.10"
 security-framework = "3"
 security-framework-sys = "2"
 
+[target.'cfg(windows)'.dependencies]
+# Owner-only DACLs on credential files (WRKSPC-011): Windows has no
+# umask, so token files get a current-user-only, inheritance-free ACL
+# through the platform ACL APIs. 0.61 is already in the dependency
+# graph, so this promotes an existing crate rather than adding one.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
 # The workspace lint table, spelled out because Cargo forbids
 # `workspace = true` combined with overrides: the ONLY deviation is
 # the reviewed platform-FFI exception below (T05). Keep this table in

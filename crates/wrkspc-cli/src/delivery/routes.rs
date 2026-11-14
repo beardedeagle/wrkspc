@@ -452,15 +452,26 @@ pub(crate) async fn delivery_report(
         }
     }
     // A final terminal state completes the reconciliation loop: the
-    // hub's mirrored unknown row (if any) is consumed.
-    let _ = state.store.consume_hub_unknown(&body.attempt_id).await;
+    // hub's mirrored unknown row (if any) is consumed — scoped to the
+    // authorized (task, host) tuple, so a report can never erase
+    // another host's mirror.
+    let _ = state
+        .store
+        .consume_hub_unknown(&body.attempt_id, &body.task_id, &host)
+        .await;
     // Guidance consumption ack (hub→node propagation loop): the node
     // reports which authoritative rows rode a successful prompt; the
-    // hub marks them delivered. Idempotent — unknown ids (node-local
+    // hub marks them delivered — scoped to THIS delivery's validated
+    // conversation, so a report can never acknowledge another
+    // conversation's guidance. Idempotent — unknown ids (node-local
     // guidance) are no-ops.
     if !body.guidance_delivered.is_empty() {
         let ids: Vec<&str> = body.guidance_delivered.iter().map(String::as_str).collect();
-        if let Err(error) = state.store.mark_guidance_delivered(&ids).await {
+        if let Err(error) = state
+            .store
+            .mark_guidance_delivered_scoped(&conversation_id, &ids)
+            .await
+        {
             tracing::warn!(%error, "guidance consumption ack failed; rows stay pending and re-ride");
         }
     }

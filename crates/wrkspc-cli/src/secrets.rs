@@ -762,7 +762,9 @@ impl TokenStore for FileStore {
         // open, synced before returning, symlink/owner/mode policy on
         // the pre-existing file; an existing stable value WINS — the
         // store never rotates a token another caller already wrote.
-        if crate::util::load_existing_token_sync(&path)?.is_some() {
+        // The settling read tolerates a concurrent creator's
+        // publication window (file exists, bytes not yet written).
+        if crate::util::load_existing_token_settling(&path)?.is_some() {
             return Ok(());
         }
         let mut options = std::fs::OpenOptions::new();
@@ -776,6 +778,11 @@ impl TokenStore for FileStore {
         options.write(true).create_new(true);
         match options.open(&path) {
             Ok(mut file) => {
+                // Windows: the owner-only, inheritance-free DACL lands
+                // BEFORE the first secret byte (WRKSPC-011); Unix gets
+                // 0600 from the open above.
+                #[cfg(windows)]
+                crate::util::win_acl::set_owner_only_acl(&file)?;
                 use std::io::Write;
                 file.write_all(token.as_bytes())
                     .map_err(|e| format!("cannot write {path:?}: {e}"))?;
@@ -784,8 +791,9 @@ impl TokenStore for FileStore {
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // A concurrent creator won: its value stands.
-                if crate::util::load_existing_token_sync(&path)?.is_some() {
+                // A concurrent creator won: its value stands. The
+                // settling read waits out the winner's write window.
+                if crate::util::load_existing_token_settling(&path)?.is_some() {
                     Ok(())
                 } else {
                     Err(format!(

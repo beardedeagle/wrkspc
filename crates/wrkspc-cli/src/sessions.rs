@@ -49,7 +49,33 @@ struct PeerSession {
     /// eviction — E04/H-15).
     handle: SessionHandle,
     /// The loopback HTTP listener task for `mcp_http` peers.
-    http_task: Option<tokio::task::JoinHandle<()>>,
+    http_task: Option<ListenerTask>,
+}
+
+/// Abort-on-drop ownership of the `mcp_http` listener task.
+///
+/// Session setup is cancellable at every await: the dispatcher
+/// deadline-bounds the whole lookup and drops the future on timeout,
+/// so listener cleanup cannot live in error branches. This guard
+/// aborts the task whenever its owner is dropped, and ownership moves
+/// into the cached [`PeerSession`] only once every awaited setup step
+/// has succeeded (E10).
+#[derive(Debug)]
+struct ListenerTask(Option<tokio::task::JoinHandle<()>>);
+
+impl ListenerTask {
+    /// Aborts the listener task, if it is still owned here.
+    fn abort(&self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for ListenerTask {
+    fn drop(&mut self) {
+        self.abort();
+    }
 }
 
 impl PeerSession {
@@ -103,7 +129,10 @@ impl crate::poll::PresenceSource for SessionRegistry {
                     peer_id: peer_id.clone(),
                     name: config.name.clone(),
                     class: "harness".to_string(),
-                    state: if sessions.contains_key(peer_id) {
+                    state: if sessions
+                        .get(peer_id)
+                        .is_some_and(|session| !session.is_closed())
+                    {
                         "connected".to_string()
                     } else {
                         "disconnected".to_string()
@@ -196,6 +225,14 @@ impl Inner {
         let _guard = spawn_lock.lock().await;
         if let Some(session) = self.sessions.lock().await.get(peer_id).cloned() {
             return Some(session.binding.clone());
+        }
+        // The admission decision must be made AFTER the lock: the
+        // previous holder may have failed while this lookup was queued
+        // and set a backoff deadline that must now govern (E10).
+        if let Some((deadline, _)) = self.backoff.lock().await.get(peer_id)
+            && Instant::now() < *deadline
+        {
+            return None;
         }
         // The config was checked above; a missing entry is the
         // conservative outcome (no binding → the dispatcher records
@@ -330,15 +367,20 @@ async fn spawn_session(
                 })
                 .await;
         });
+        // From here on every await is a cancellation point — the
+        // dispatcher deadline-bounds the whole lookup and drops the
+        // future on timeout — so the listener's lifetime rides this
+        // guard instead of the error branches below: dropping the
+        // future aborts the task and closes the bound port (E10).
+        let guard = ListenerTask(Some(task));
         let session_id = match handle
             .new_session_with_mcp(config.cwd.clone(), Vec::new())
             .await
         {
             Ok(session_id) => session_id,
             Err(error) => {
-                // The owned listener must not outlive a failed setup:
-                // close and join it before reporting the failure (E10).
-                task.abort();
+                // The guard aborts the listener on its way out; the
+                // failed setup must not leave the bound port behind.
                 return Err(format!(
                     "session/new for {} failed: {error}",
                     config.peer_id
@@ -348,7 +390,7 @@ async fn spawn_session(
         if let Some(model) = &config.model
             && let Err(error) = pin_model(&handle, &config.peer_id, &session_id, model).await
         {
-            task.abort();
+            // Same contract: the guard closes the listener on the way out.
             return Err(error);
         }
         tracing::info!(peer_id = %config.peer_id, %session_id, "session bound (mcp_http)");
@@ -359,7 +401,7 @@ async fn spawn_session(
                 driver: Arc::new(handle.clone()),
             },
             handle,
-            http_task: Some(task),
+            http_task: Some(guard),
         });
     } else {
         vec![bridge_injection(db, &config.peer_id, hub_connected)]
@@ -455,5 +497,181 @@ mod tests {
             false,
         );
         assert!(registry.lookup("codex").await.is_none());
+    }
+
+    /// Counts the spawn attempts recorded by the marker-writing dead
+    /// command below.
+    fn spawn_marker_lines(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .map(|contents| contents.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// A lookup queued behind a failing spawn must re-check backoff
+    /// AFTER acquiring the per-peer spawn lock: the first holder fails
+    /// and sets the backoff deadline while the second waits, so the
+    /// pre-lock admission check was already stale (E10).
+    #[tokio::test]
+    async fn queued_lookup_rechecks_backoff_after_the_spawn_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "wrkspc-registry-backoff-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("spawns");
+        // Each spawn writes a marker line, then dies after a pause
+        // without an ACP handshake: a deterministic failing spawn.
+        let command = format!("sh -c 'echo x >> {}; sleep 1; exit 1'", marker.display());
+        let store = Store::open_in_memory("registry-backoff-test")
+            .await
+            .unwrap();
+        let (_tx, rx) = watch::channel(false);
+        let registry = SessionRegistry::new(
+            vec![SessionConfig {
+                peer_id: "codex".to_string(),
+                name: "codex".to_string(),
+                command,
+                cwd: PathBuf::from("."),
+                model: None,
+                mcp_http: false,
+            }],
+            store.clone(),
+            PathBuf::from("/nonexistent.db"),
+            rx,
+            false,
+        );
+
+        // First lookup: the spawn starts (marker line 1) and fails
+        // after ~1s, establishing backoff.
+        let first = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.lookup("codex").await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while spawn_marker_lines(&marker) < 1 {
+            assert!(Instant::now() < deadline, "the first spawn never started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Second lookup: nothing has failed yet, so it passes the
+        // pre-lock backoff check and queues on the spawn lock behind
+        // the first.
+        let second = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.lookup("codex").await }
+        });
+        // Give the queued lookup time to reach the lock before the
+        // first spawn fails and sets the backoff deadline.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(first.await.unwrap().is_none());
+        assert!(second.await.unwrap().is_none());
+        assert_eq!(
+            spawn_marker_lines(&marker),
+            1,
+            "a lookup queued behind a failing spawn must honor the backoff set while it waited"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Presence must derive connected state from cached session health,
+    /// not map membership: a dead cached session advertises
+    /// disconnected without waiting for an evicting lookup (E10).
+    #[tokio::test]
+    async fn dead_cached_session_reports_disconnected_presence() {
+        let store = Store::open_in_memory("registry-presence-test")
+            .await
+            .unwrap();
+        let (_tx, rx) = watch::channel(false);
+        let registry = SessionRegistry::new(
+            vec![
+                SessionConfig {
+                    peer_id: "codex".to_string(),
+                    name: "codex".to_string(),
+                    command: "true".to_string(),
+                    cwd: PathBuf::from("."),
+                    model: None,
+                    mcp_http: false,
+                },
+                SessionConfig {
+                    peer_id: "randy".to_string(),
+                    name: "randy".to_string(),
+                    command: "sleep 10".to_string(),
+                    cwd: PathBuf::from("."),
+                    model: None,
+                    mcp_http: false,
+                },
+            ],
+            store.clone(),
+            PathBuf::from("/nonexistent.db"),
+            rx,
+            false,
+        );
+
+        // A cached session whose transport has already ended. The
+        // closed watch publishes when the session loop ends; shutdown
+        // ends the loop deterministically, and the witness clone then
+        // reads the published terminal state.
+        let (dead_handle, _events) = SessionHandle::spawn(StdioTransport::new("true".to_string()));
+        let dead_witness = dead_handle.clone();
+        dead_handle.shutdown().await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while dead_witness.closed().borrow().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the dead transport never reported closed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // A cached session whose transport is still running.
+        let (live_handle, _events) =
+            SessionHandle::spawn(StdioTransport::new("sleep 10".to_string()));
+        registry.inner.sessions.lock().await.insert(
+            "codex".to_string(),
+            Arc::new(PeerSession {
+                binding: SessionBinding {
+                    peer_id: "codex".to_string(),
+                    session_id: "fake-dead".to_string(),
+                    driver: Arc::new(dead_witness.clone()),
+                },
+                handle: dead_witness,
+                http_task: None,
+            }),
+        );
+        registry.inner.sessions.lock().await.insert(
+            "randy".to_string(),
+            Arc::new(PeerSession {
+                binding: SessionBinding {
+                    peer_id: "randy".to_string(),
+                    session_id: "fake-live".to_string(),
+                    driver: Arc::new(live_handle.clone()),
+                },
+                handle: live_handle,
+                http_task: None,
+            }),
+        );
+
+        // Reading presence performs no lookup/eviction, yet the dead
+        // session must not advertise connected.
+        let decls = crate::poll::PresenceSource::decls(&registry).await;
+        let state = |peer: &str| {
+            decls
+                .iter()
+                .find(|decl| decl.peer_id == peer)
+                .map(|decl| decl.state.as_str())
+                .unwrap_or("")
+        };
+        assert_eq!(
+            state("codex"),
+            "disconnected",
+            "a dead cached session must not advertise connected presence"
+        );
+        assert_eq!(
+            state("randy"),
+            "connected",
+            "a live cached session stays connected"
+        );
     }
 }
