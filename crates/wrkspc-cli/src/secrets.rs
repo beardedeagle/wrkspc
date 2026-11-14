@@ -768,7 +768,7 @@ impl TokenStore for FileStore {
             return Ok(());
         }
         // Windows opens with WRITE_DAC/WRITE_OWNER and the owner-only
-        // DACL lands BEFORE the first secret byte (WRKSPC-011); Unix
+        // DACL lands BEFORE the first secret byte; Unix
         // gets 0600 + O_NOFOLLOW from the open itself.
         #[cfg(windows)]
         let opened = crate::util::win_acl::create_new_secured(&path);

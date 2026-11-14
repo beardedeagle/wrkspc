@@ -1018,7 +1018,7 @@ async fn replay_deduplicates_repeated_peer_ids_in_the_count() {
     assert!(matches!(outcome, AcceptOutcome::Replay { .. }));
 }
 
-/// WRKSPC-001: deleting a conversation after a hub-originated delivery
+/// Deleting a conversation after a hub-originated delivery
 /// reported its terminal outcome must not trip the outcome ledger's
 /// foreign key — the room's `hub_outcome_reports` rows go with its
 /// attempts, and other rooms' ledgers are untouched.
@@ -1101,7 +1101,7 @@ async fn delete_conversation_succeeds_after_a_reported_outcome() {
     );
 }
 
-/// WRKSPC-002 (canonical precedence): a mention that collides with
+///  (canonical precedence): a mention that collides with
 /// another member's alias still routes to the member whose canonical id
 /// matches — once a client holds an id, it must never re-resolve as
 /// somebody else's alias (UI-04, the resolve_peer_ref contract).
@@ -1147,7 +1147,7 @@ async fn mention_resolution_prefers_the_canonical_id_over_an_alias() {
     );
 }
 
-/// WRKSPC-002 (ambiguity): a mention matching more than one member's
+///  (ambiguity): a mention matching more than one member's
 /// alias or display name is refused with AmbiguousPeerRef — routing
 /// fails closed instead of guessing by row order — and nothing commits.
 #[tokio::test]
@@ -1213,7 +1213,7 @@ async fn ambiguous_mentions_fail_closed() {
     );
 }
 
-/// WRKSPC-003 (store contract): an empty explicit recipient list is
+///  (store contract): an empty explicit recipient list is
 /// mention-inference at fresh acceptance, and the COMMITTED recipient
 /// set is the only routing record a hub fan-out may read. The hub UI's
 /// operator post must fan out from `message_recipients` after
@@ -1251,7 +1251,7 @@ async fn mention_only_posts_commit_recipients_for_fanout_to_read() {
     );
 }
 
-/// WRKSPC-015 (store side): an explicitly supplied empty recipient list
+///  (store side): an explicitly supplied empty recipient list
 /// is AUTHORITATIVE on the committed-routing path — the body is never
 /// re-resolved for @mentions, so a node that committed zero recipients
 /// wakes nobody at the hub even when the mention resolves there.
@@ -1313,7 +1313,7 @@ async fn committed_empty_recipients_stay_empty_at_the_hub() {
     );
 }
 
-/// WRKSPC-024: the message-level execution flag is authority too — a
+/// The message-level execution flag is authority too — a
 /// replay that omits recipients (or names them without the per-recipient
 /// flag) but sets execution_requested=true must be refused for a
 /// mail-only message, or the caller's fan-out would queue executable

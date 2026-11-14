@@ -167,7 +167,7 @@ pub(crate) async fn post_message(
                 // pre-resolution vector: a mention-only post resolves
                 // its recipients inside the store, and the original
                 // vector would queue nothing while core committed a
-                // recipient with execution requested (WRKSPC-003).
+                // recipient with execution requested.
                 let recipient_peers = state
                     .store
                     .message_recipients(&message_id)

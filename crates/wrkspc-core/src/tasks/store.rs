@@ -247,7 +247,7 @@ impl Store {
         // The queue read is the delivery handoff boundary: before an
         // unclaimed delivery envelope rides to a node, its guidance
         // snapshot is brought up to date with the conversation's
-        // current pending guidance (WRKSPC-026 — guidance added after
+        // current pending guidance (guidance added after
         // the task was queued must still reach the next prompt).
         for task in &mut tasks {
             self.refresh_unclaimed_delivery_guidance(task).await?;
@@ -256,7 +256,7 @@ impl Store {
     }
 
     /// Refreshes the guidance snapshot in an unclaimed, non-terminal
-    /// delivery envelope (WRKSPC-026).
+    /// delivery envelope.
     ///
     /// `task_create_delivery` snapshots pending guidance only at
     /// creation time; operator guidance added while a delivery waits
@@ -428,7 +428,7 @@ impl Store {
         // statement: the WHERE clause reads the committed intent state
         // atomically with the insert, so an operator cancel that
         // commits between the caller's preflight check and this insert
-        // still suppresses the row (WRKSPC-025). A mail-only message
+        // still suppresses the row. A mail-only message
         // (no intent row) is not canceled and always inserts; an
         // existing row keeps its original blob (INSERT OR IGNORE).
         sqlx::query(
@@ -540,7 +540,7 @@ impl Store {
                 kinds: "malformed delivery payload".to_string(),
             });
         };
-        // Orphan boundary (WRKSPC-023): a delivery whose committed
+        // Orphan boundary: a delivery whose committed
         // message or recipient no longer exists must never be claimed
         // — the room's deletion committed and the surviving task row is
         // a fan-out race artifact. The gate below treats a missing
@@ -563,7 +563,7 @@ impl Store {
                 kinds: "orphan:delivery parent message/recipient removed".to_string(),
             });
         }
-        // Canceled-intent boundary (WRKSPC-025): a delivery whose
+        // Canceled-intent boundary: a delivery whose
         // execution intent the operator canceled after the task was
         // created must not become executable — the intent tombstone is
         // the authoritative cancellation fence at the claim gate.
@@ -603,7 +603,7 @@ impl Store {
             // The same instance already holds the claim — idempotent
             // re-claim (restart mid-delivery). The current gate was
             // evaluated above: ownership idempotency must never let a
-            // now-effective hold/fence/ejection through (WRKSPC-006).
+            // now-effective hold/fence/ejection through.
             return Ok(DeliveryClaimOutcome::AlreadyClaimed);
         }
         sqlx::query(

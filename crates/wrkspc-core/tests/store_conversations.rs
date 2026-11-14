@@ -234,7 +234,7 @@ async fn list_messages_window_returns_the_latest_bounded_oldest_first() {
     assert_eq!(all.len(), 5);
 }
 
-/// WRKSPC-009: the bounded window bounds the DELIVERY fetch too. A room
+/// The bounded window bounds the DELIVERY fetch too. A room
 /// with a large old delivery history still costs the window, not the
 /// whole conversation, while the explicitly requested full-history list
 /// stays complete.
@@ -293,7 +293,7 @@ async fn bounded_window_scopes_deliveries_to_the_window() {
     );
 }
 
-/// WRKSPC-023 (deletion side): a room's delivery tasks — claim rows and
+///  (deletion side): a room's delivery tasks — claim rows and
 /// task rows — are cleaned for ALL current messages, so a deleted room
 /// can never keep pollable work alive.
 #[tokio::test]
@@ -381,7 +381,7 @@ async fn delete_conversation_cleans_delivery_tasks_and_claims() {
     }
 }
 
-/// WRKSPC-023 (deletion side): the deletion's dependency snapshot is
+///  (deletion side): the deletion's dependency snapshot is
 /// gathered INSIDE the write-reserving transaction. A message committed
 /// while a deletion is in flight — its writer blocked on the database
 /// write lock the deletion now takes up front — is still cleaned: its

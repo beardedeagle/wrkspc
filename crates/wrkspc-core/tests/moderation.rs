@@ -600,7 +600,7 @@ async fn resolve_peer_ref_prefers_the_canonical_id_over_a_colliding_alias() {
     );
 }
 
-/// WRKSPC-018 (store side): the delivery-report guidance ack is scoped
+///  (store side): the delivery-report guidance ack is scoped
 /// to the validated conversation — a client-supplied guidance id from
 /// another conversation is ignored without being modified, and the
 /// conversation's own rows clear their claimed attempt.
@@ -657,7 +657,7 @@ async fn guidance_ack_is_scoped_to_the_validated_conversation() {
     );
 }
 
-/// WRKSPC-026: guidance added AFTER a delivery task was queued still
+/// Guidance added AFTER a delivery task was queued still
 /// rides the envelope — the queue read (the node's poll) refreshes the
 /// guidance snapshot of unclaimed, non-terminal deliveries, and the
 /// claim freezes it.

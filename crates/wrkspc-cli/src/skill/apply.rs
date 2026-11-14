@@ -150,7 +150,7 @@ pub fn uninstall(
 /// (symlinked intermediate directories included).
 ///
 /// The containment check runs on the nearest EXISTING ancestor BEFORE
-/// any directory is created (WRKSPC-022): an escaping symlink in a
+/// any directory is created: an escaping symlink in a
 /// not-yet-created tail is refused without `create_dir_all` ever
 /// following it, so a rejected install cannot create anything outside
 /// home. The completed parent is re-validated afterwards in case the
@@ -223,7 +223,7 @@ fn ensure_safe_target(home: &Path, target: &Path) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Replaces `path` with `contents` atomically (WRKSPC-021): the full
+/// Replaces `path` with `contents` atomically: the full
 /// text is written to a uniquely-named temporary sibling (created
 /// exclusively, synced to disk), given the destination's existing
 /// permissions, and only then renamed over the destination. A failure
@@ -393,7 +393,7 @@ mod tests {
 
     use super::*;
 
-    /// WRKSPC-021: a failed replacement leaves the destination
+    /// A failed replacement leaves the destination
     /// byte-for-byte untouched and no temporary sibling behind. A
     /// non-empty directory stands in for any rename-stage failure
     /// (quota, I/O error, permission change): the complete text was
@@ -438,7 +438,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// WRKSPC-021: a successful replacement produces the full new
+    /// A successful replacement produces the full new
     /// content and preserves the destination's existing permissions.
     #[cfg(unix)]
     #[test]

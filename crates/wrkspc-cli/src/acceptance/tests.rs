@@ -702,7 +702,7 @@ async fn rest_task_routes_are_host_queue_scoped() {
     assert_eq!(response.status(), axum::http::StatusCode::OK);
 }
 
-// ─── WRKSPC-016: every registered send entry point runs acceptance ───
+// ─── Every registered send entry point runs acceptance ───
 
 /// Both REST unary spellings run the SAME verified-identity acceptance
 /// as the JSON-RPC surface: the legacy slash alias (/rest/message/send)
@@ -811,7 +811,7 @@ async fn streaming_sends_are_refused_before_the_sdk() {
     assert_eq!(total, 0, "no streaming send may commit or fan out");
 }
 
-// ─── WRKSPC-017: continuation taskId is authorized before the SDK ───
+// ─── Continuation taskId is authorized before the SDK ───
 
 /// A send naming another host's delivery task (or any unreadable task)
 /// is refused with the fail-closed host-queue rule BEFORE the SDK
@@ -912,7 +912,7 @@ async fn own_queue_task_continuation_is_authorized() {
     );
 }
 
-// ─── WRKSPC-020: canonical task-action suffixes authorize correctly ───
+// ─── Canonical task-action suffixes authorize correctly ───
 
 /// The canonical `:cancel`/`:subscribe` spellings authorize the SAME
 /// host-queue rule as the legacy slash forms: the owning host's
@@ -963,7 +963,7 @@ async fn canonical_task_action_suffixes_are_host_queue_scoped() {
     );
 }
 
-// ─── WRKSPC-015 (wire side): committed routing stays authoritative ───
+// ───  (wire side): committed routing stays authoritative ───
 
 /// An EXPLICITLY EMPTY recipient list is a node's committed routing —
 /// the hub must not re-infer @mentions from the body. The same post
@@ -1054,7 +1054,7 @@ async fn explicit_empty_recipient_list_stays_authoritative_at_the_hub() {
     assert_eq!(total, 1, "an absent field keeps mention inference");
 }
 
-// ─── WRKSPC-024 (wire side): replay fan-out uses committed authority ───
+// ───  (wire side): replay fan-out uses committed authority ───
 
 /// Replay fan-out authority comes from the COMMITTED message state,
 /// never the retry payload's flag: a replay of an executable message

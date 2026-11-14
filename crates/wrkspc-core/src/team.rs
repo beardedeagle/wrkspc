@@ -618,7 +618,7 @@ impl Store {
 
     /// Marks guidance entries delivered ONLY when they belong to the
     /// validated conversation — the delivery-report guidance ack
-    /// boundary (WRKSPC-018).
+    /// boundary.
     ///
     /// The delivery-report route authorizes one delivery (task,
     /// conversation); a client-supplied guidance id from another

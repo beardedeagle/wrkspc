@@ -268,7 +268,7 @@ async fn prompt_queue_rejects_beyond_the_admission_bound() {
 /// An adapter that dies while its session is cached and idle must end
 /// the session loop on its own: the closed watch flips with no command,
 /// eviction, or shutdown — a dead adapter must never advertise a live
-/// presence (WRKSPC-014 residual).
+/// presence ( residual).
 #[tokio::test]
 async fn dead_idle_adapter_flips_closed_without_a_command() {
     let (handle, _events) = SessionHandle::spawn(StdioTransport::new("sleep 1"));

@@ -252,7 +252,7 @@ fn status_reports_unreadable_instead_of_missing() {
 
 /// CU-04: installing through a symlinked SKILL leaf is refused and
 /// the link's target is untouched. Unix-only: creating a symlink on
-/// Windows needs different std APIs and privileges (WRKSPC-031).
+/// Windows needs different std APIs and privileges.
 #[cfg(unix)]
 #[test]
 fn install_refuses_a_symlinked_skill_leaf() {
@@ -274,7 +274,7 @@ fn install_refuses_a_symlinked_skill_leaf() {
 
 /// CU-04: uninstalling through a symlinked parent directory is
 /// refused, never followed. Unix-only: symlink creation on Windows
-/// needs different std APIs and privileges (WRKSPC-031).
+/// needs different std APIs and privileges.
 #[cfg(unix)]
 #[test]
 fn uninstall_refuses_a_symlinked_skill_directory() {
@@ -356,7 +356,7 @@ async fn shared_skill_uninstall_is_refused_when_partial() {
 /// copy back: an install must never persist a half-install (new skill,
 /// missing pointer). The prior skill content is restored byte-for-byte.
 /// Unix-only: the failure is induced with POSIX directory modes
-/// (WRKSPC-031).
+///.
 #[cfg(unix)]
 #[test]
 fn pointer_failure_rolls_the_skill_copy_back() {
@@ -382,7 +382,7 @@ fn pointer_failure_rolls_the_skill_copy_back() {
     std::fs::set_permissions(home.join(".codex"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// WRKSPC-021: when the pointer write fails, the user's instruction
+/// When the pointer write fails, the user's instruction
 /// file keeps its original bytes. The parent is made read-only so the
 /// temporary sibling cannot be created — a truncate-in-place write
 /// would have destroyed the existing file under the same failure; the
@@ -418,7 +418,7 @@ fn failed_pointer_write_preserves_existing_instructions() {
     std::fs::set_permissions(home.join(".codex"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// WRKSPC-021: a failed UNINSTALL pointer write leaves the
+/// A failed UNINSTALL pointer write leaves the
 /// instructions byte-for-byte intact (the section still present).
 /// Unix-only: the failure is induced with POSIX directory modes.
 #[cfg(unix)]
@@ -447,7 +447,7 @@ fn failed_uninstall_write_preserves_instructions() {
     std::fs::set_permissions(home.join(".codex"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// WRKSPC-022: a REFUSED install must not create anything outside
+/// A REFUSED install must not create anything outside
 /// home. With .claude symlinked to an external directory that lacks
 /// skills/wrkspc, the install is refused on the pre-create containment
 /// check — the external directory must not gain the missing

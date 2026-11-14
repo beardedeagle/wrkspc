@@ -53,7 +53,7 @@ async fn empty_existing_token_file_is_an_error() {
 
 /// CU-02: a symlinked sidecar is refused, and its target is untouched.
 /// Unix-only: symlink creation on Windows needs different std APIs and
-/// privileges (WRKSPC-031).
+/// privileges.
 #[cfg(unix)]
 #[tokio::test]
 async fn symlinked_token_file_is_refused_and_its_target_untouched() {
@@ -75,7 +75,7 @@ async fn symlinked_token_file_is_refused_and_its_target_untouched() {
 
 /// CU-02: creation is exclusive and stable under REAL concurrent
 /// publication — first-callers on separate OS threads all receive the
-/// SAME token value even while the winner is mid-write (WRKSPC-027).
+/// SAME token value even while the winner is mid-write.
 /// The previous version spawned onto the single-threaded test runtime
 /// and, with no await point inside the token path, ran every caller
 /// sequentially — the create→write publication window was never
@@ -142,7 +142,7 @@ async fn permissive_existing_token_is_tightened_not_rotated() {
 /// CU-10: the same database reached through a symlink alias maps to
 /// the SAME canonical path, so sidecar keys and instance identity do
 /// not change across restarts. Unix-only: symlink creation on Windows
-/// needs different std APIs and privileges (WRKSPC-031).
+/// needs different std APIs and privileges.
 #[cfg(unix)]
 #[test]
 fn canonical_path_resolves_final_component_aliases() {
@@ -181,7 +181,7 @@ fn canonical_path_resolves_the_parent_of_a_new_database() {
     let _ = Path::new("");
 }
 
-/// WRKSPC-011: on Windows, a created token file must carry an
+/// On Windows, a created token file must carry an
 /// owner-only, non-inherited DACL, and a pre-existing token file is
 /// tightened to the same before its value is used — the Windows
 /// equivalent of the Unix 0600 assertion above (which does not

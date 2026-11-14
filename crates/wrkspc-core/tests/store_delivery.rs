@@ -779,7 +779,7 @@ async fn fanout_and_repair_skip_canceled_intents() {
     );
 }
 
-/// WRKSPC-005: the H-10 outcome outbox joins the DURABLE
+/// The H-10 outcome outbox joins the DURABLE
 /// local-execution-to-hub-task mapping the mirror wrote (the processed
 /// marker row, keyed by the hub task id with the hub envelope in its
 /// payload). The hub task id is never recomputed from the local
@@ -1057,7 +1057,7 @@ async fn hub_pending_outcomes_joins_the_mirrored_hub_task_mapping() {
     );
 }
 
-/// WRKSPC-006: a same-instance re-claim (restart mid-delivery) must
+/// A same-instance re-claim (restart mid-delivery) must
 /// re-evaluate the CURRENT moderation gate — ownership idempotency
 /// must never admit a delivery the operator held or fenced after the
 /// first claim.
@@ -1139,7 +1139,7 @@ async fn seeded_hub_delivery_conversation(store: &Store, task_id: &str) -> Strin
         .to_string()
 }
 
-/// WRKSPC-023 (claim side): a delivery task whose committed message or
+///  (claim side): a delivery task whose committed message or
 /// recipient no longer exists — the room was deleted and a racing
 /// fan-out committed its task afterwards — must never be claimable.
 #[tokio::test]
@@ -1227,7 +1227,7 @@ async fn orphan_delivery_tasks_are_not_claimable() {
     );
 }
 
-/// WRKSPC-025: cancellation racing the fan-out cannot produce
+/// Cancellation racing the fan-out cannot produce
 /// executable work — the task insertion carries the canceled-intent
 /// fence in the same statement, and the claim gate rejects deliveries
 /// whose intent the operator canceled after the task already existed.
@@ -1370,7 +1370,7 @@ async fn cancellation_racing_fanout_and_claim_stays_unexecutable() {
     );
 }
 
-/// WRKSPC-008: the startup fan-out repair recovers the sender's wire
+/// The startup fan-out repair recovers the sender's wire
 /// message identity (persisted as the hub acceptance key) and carries
 /// it as the envelope origin, so a co-hosted echo maps back onto the
 /// original local row — no duplicate message, no duplicate execution.
@@ -1579,7 +1579,7 @@ async fn repair_preserves_the_sender_wire_origin_identity() {
     );
 }
 
-/// WRKSPC-019: the unknown-attempt mirror is owned by the (task,
+/// The unknown-attempt mirror is owned by the (task,
 /// host) tuple the reporting node presented — a conflicting re-report
 /// is rejected without modifying the row, and only the owning tuple
 /// can consume it.

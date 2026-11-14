@@ -506,7 +506,7 @@ async fn oversized_fanout_room_post_is_refused_with_400() {
 
 /// A mention-only operator post on the hub fans out from the COMMITTED
 /// routing: the member the mention resolves to gets a pollable remote
-/// delivery even though the request named no recipients (WRKSPC-003).
+/// delivery even though the request named no recipients.
 #[tokio::test]
 async fn hub_mention_only_post_fans_out_from_committed_routing() {
     let ui = spawn_ui_hub().await;

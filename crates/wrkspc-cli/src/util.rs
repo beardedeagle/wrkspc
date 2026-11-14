@@ -242,7 +242,7 @@ pub fn stable_token_sync(db: &Path, tag: &str) -> Result<String, String> {
     // create_new + O_NOFOLLOW: an atomic exclusive create that can
     // never follow a link swapped into place by another process.
     // Windows opens with WRITE_DAC/WRITE_OWNER and applies the
-    // owner-only DACL before the first byte lands (WRKSPC-011); Unix
+    // owner-only DACL before the first byte lands; Unix
     // gets 0600 from the open itself.
     #[cfg(windows)]
     let opened = win_acl::create_new_secured(&path);
@@ -284,7 +284,7 @@ pub fn stable_token_sync(db: &Path, tag: &str) -> Result<String, String> {
     }
 }
 
-/// Windows owner-only ACL enforcement for token files (WRKSPC-011).
+/// Windows owner-only ACL enforcement for token files.
 ///
 /// Windows has no umask: a file created through [`std::fs::OpenOptions`]
 /// carries the directory's INHERITED ACL, which can grant other local
