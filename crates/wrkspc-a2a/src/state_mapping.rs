@@ -38,8 +38,6 @@ pub enum LifecycleState {
 /// Maps a wrkspc lifecycle state to the A2A task state the submitting agent
 /// sees.
 ///
-/// # Arguments
-///
 /// * `state` — the wrkspc-side lifecycle state.
 ///
 /// # Returns
@@ -63,8 +61,6 @@ pub fn to_task_state(state: LifecycleState) -> Option<TaskState> {
 
 /// Returns the wire literal for a task state (the `TASK_STATE_*` strings).
 ///
-/// # Arguments
-///
 /// * `state` — the A2A task state.
 pub fn task_state_literal(state: &TaskState) -> &'static str {
     match state {
@@ -81,8 +77,6 @@ pub fn task_state_literal(state: &TaskState) -> &'static str {
 }
 
 /// Parses a wire literal back into a task state.
-///
-/// # Arguments
 ///
 /// * `literal` — the `TASK_STATE_*` string.
 ///

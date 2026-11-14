@@ -58,7 +58,7 @@ pub fn install(
     if let Some((instructions, updated, true, section_existed)) = pointer_plan {
         if let Err(error) = (|| -> Result<(), Box<dyn std::error::Error>> {
             ensure_safe_target(home, &instructions)?;
-            std::fs::write(&instructions, updated)?;
+            replace_file_atomically(&instructions, &updated)?;
             Ok(())
         })() {
             if skill_changed {
@@ -88,10 +88,7 @@ pub fn install(
 
 /// Removes the skill from one harness's directories.
 ///
-/// # Arguments
-///
-/// * `home` — the home directory.
-/// * `entry` — the target harness.
+/// `home` is the home directory; `entry` is the target harness.
 ///
 /// # Returns
 ///
@@ -134,7 +131,7 @@ pub fn uninstall(
         let (updated, removed) = without_section(&current)?;
         if removed {
             ensure_safe_target(home, &instructions)?;
-            std::fs::write(&instructions, updated)?;
+            replace_file_atomically(&instructions, &updated)?;
             removed_anything = true;
         }
     }
@@ -152,10 +149,15 @@ pub fn uninstall(
 /// must live under the resolved home root, closing every path escape
 /// (symlinked intermediate directories included).
 ///
-/// # Arguments
+/// The containment check runs on the nearest EXISTING ancestor BEFORE
+/// any directory is created: an escaping symlink in a
+/// not-yet-created tail is refused without `create_dir_all` ever
+/// following it, so a rejected install cannot create anything outside
+/// home. The completed parent is re-validated afterwards in case the
+/// directory tree changed while it was being made.
 ///
-/// * `home` — the (already validated) home root.
-/// * `target` — the leaf being written or deleted.
+/// `home` is the (already validated) home root; `target` is the leaf
+/// being written or deleted.
 ///
 /// # Errors
 ///
@@ -173,18 +175,150 @@ fn ensure_safe_target(home: &Path, target: &Path) -> Result<(), Box<dyn std::err
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-        let resolved_home = std::fs::canonicalize(home)?;
-        let resolved_parent = std::fs::canonicalize(parent)?;
-        if !resolved_parent.starts_with(&resolved_home) {
-            return Err(format!(
-                "{} resolves outside {} — refusing",
-                parent.display(),
-                resolved_home.display()
-            )
-            .into());
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let resolved_home = std::fs::canonicalize(home)?;
+    // Walk up to the nearest existing ancestor of the parent; every
+    // component above it resolves, exactly like the database-path
+    // canonicalization. A dangling symlink in the path is treated as
+    // existing and fails canonicalization — refused, never written
+    // through.
+    let mut existing = parent;
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no existing ancestor for {}", parent.display()),
+                    )
+                })?;
+            }
+            Err(e) => return Err(e.into()),
         }
+    }
+    let resolved_existing = std::fs::canonicalize(existing)?;
+    if !resolved_existing.starts_with(&resolved_home) {
+        return Err(format!(
+            "{} resolves outside {} — refusing",
+            parent.display(),
+            resolved_home.display()
+        )
+        .into());
+    }
+    // Only now create the missing tail.
+    std::fs::create_dir_all(parent)?;
+    let resolved_parent = std::fs::canonicalize(parent)?;
+    if !resolved_parent.starts_with(&resolved_home) {
+        return Err(format!(
+            "{} resolves outside {} — refusing",
+            parent.display(),
+            resolved_home.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Replaces `path` with `contents` atomically: the full
+/// text is written to a uniquely-named temporary sibling (created
+/// exclusively, synced to disk), given the destination's existing
+/// permissions, and only then renamed over the destination. The
+/// temporary is created with RESTRICTIVE permissions (0600 on Unix,
+/// an owner-only DACL on Windows) so the instruction text — which may
+/// be private — is never observable at the umask/inherited default
+/// while it sits in the sibling, even if the process crashes before
+/// the destination mode is applied. A failure at ANY step — including
+/// the rename itself — removes the temporary and leaves the
+/// destination byte-for-byte untouched, so an I/O error or crash can
+/// never destroy user content outside the wrkspc markers the way a
+/// truncate-in-place write could.
+fn replace_file_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("no parent directory for {}", path.display()),
+            )
+        })?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("no file name for {}", path.display()),
+            )
+        })?;
+    // The destination's permissions (mode bits / Windows attributes)
+    // survive the replacement; a brand-new destination keeps the
+    // defaults a plain create would have produced.
+    let permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
+    let mut attempt: u32 = 0;
+    let (tmp_path, mut tmp) = loop {
+        let candidate = parent.join(format!(
+            ".{name}.wrkspc-tmp-{}-{attempt}",
+            std::process::id()
+        ));
+        // Restrictive permissions AT CREATION: the sibling carries the
+        // complete instruction text before the destination's mode is
+        // applied, so it must never exist at the umask/inherited
+        // default — not even for the window between create and write,
+        // and not after a crash before the post-write tightening.
+        #[cfg(windows)]
+        let opened = crate::util::win_acl::create_new_secured(&candidate);
+        #[cfg(not(windows))]
+        let opened = {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(&candidate)
+        };
+        match opened {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+                if attempt >= 16 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("cannot create a temporary sibling for {}", path.display()),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    // A failure below must never leave the temporary behind; the
+    // destination is only ever touched by the final rename.
+    let write_result = (|| {
+        use std::io::Write;
+        tmp.write_all(contents.as_bytes())?;
+        tmp.sync_all()?;
+        if let Some(ref permissions) = permissions {
+            std::fs::set_permissions(&tmp_path, permissions.clone())?;
+        }
+        std::fs::rename(&tmp_path, path)
+    })();
+    drop(tmp);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    // Best-effort directory sync so the rename itself is durable
+    // across a crash; filesystems that cannot sync a directory
+    // handle simply skip it.
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
     }
     Ok(())
 }
@@ -211,10 +345,7 @@ fn read_or_default(path: &Path) -> std::io::Result<String> {
 /// symlinked leaf each report their own problem, so remediation is
 /// distinguishable from "not installed yet".
 ///
-/// # Arguments
-///
-/// * `home` — the home directory.
-/// * `entry` — the target harness.
+/// `home` is the home directory; `entry` is the target harness.
 ///
 /// # Returns
 ///
@@ -246,14 +377,14 @@ pub fn status(home: &Path, entry: &HarnessEntry) -> Result<SkillStatus, String> 
 }
 
 /// The standing-instructions pointer component, reported separately
-/// from copy freshness (CU-09): `absent`, `current`, or `stale` — a
-/// harness whose pointer file is missing or drifted is NOT a fully
-/// healthy install even when its skill copy matches.
+/// from copy freshness (CU-09): `n/a` for harnesses without a pointer
+/// file, `current` when the section matches, `stale or missing` when
+/// it drifted or is absent, and `unreadable: …`/`malformed: …` when
+/// the file cannot be used — a harness whose pointer file is missing
+/// or drifted is NOT a fully healthy install even when its skill copy
+/// matches.
 ///
-/// # Arguments
-///
-/// * `home` — the home directory.
-/// * `entry` — the target harness.
+/// `home` is the home directory; `entry` is the target harness.
 pub fn pointer_state(home: &Path, entry: &HarnessEntry) -> String {
     let Some(instructions) = entry.pointer.then(|| pointer_file(home, entry)).flatten() else {
         return "n/a".to_string();
@@ -272,5 +403,92 @@ pub fn pointer_state(home: &Path, entry: &HarnessEntry) -> String {
             }
         }
         Err(error) => format!("malformed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// A failed replacement leaves the destination
+    /// byte-for-byte untouched and no temporary sibling behind. A
+    /// non-empty directory stands in for any rename-stage failure
+    /// (quota, I/O error, permission change): the complete text was
+    /// written and synced to the temporary, yet the destination is
+    /// still only ever touched by the final rename.
+    #[test]
+    fn failed_replacement_preserves_the_destination() {
+        let dir = std::env::temp_dir().join(format!(
+            "wrkspc-apply-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dest = dir.join("AGENTS.md");
+        std::fs::create_dir_all(&dest).expect("directory in place of the file");
+        std::fs::write(dest.join("user-note.txt"), "precious").expect("user content");
+
+        let error = match replace_file_atomically(&dest, "# replaced") {
+            Ok(()) => panic!("replacing onto a directory must fail"),
+            Err(error) => error,
+        };
+        assert!(!error.to_string().is_empty());
+        assert!(dest.is_dir(), "the destination must be untouched");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("user-note.txt")).expect("read"),
+            "precious",
+            "the destination's content must survive the failed replace"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains("wrkspc-tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary siblings must be cleaned up: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A successful replacement produces the full new
+    /// content and preserves the destination's existing permissions.
+    #[cfg(unix)]
+    #[test]
+    fn successful_replacement_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "wrkspc-apply-perms-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dest = dir.join("AGENTS.md");
+        std::fs::write(&dest, "old content").expect("seed");
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).expect("mode");
+
+        replace_file_atomically(&dest, "new content").expect("replace");
+
+        assert_eq!(
+            std::fs::read_to_string(&dest).expect("read"),
+            "new content",
+            "the full updated content must be in place"
+        );
+        let mode = std::fs::symlink_metadata(&dest)
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the original permissions must survive");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

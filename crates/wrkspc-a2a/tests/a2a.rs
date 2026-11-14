@@ -1,6 +1,6 @@
-//! Integration tests for the A2A surface: the TaskStore adapter over the
-//! durable store, and the full wire path (card discovery → six methods)
-//! against a real loopback socket with the pinned client.
+//! Integration tests for the A2A surface: the `TaskStore` adapter over the
+//! durable store, and the full wire path (card discovery → the core A2A
+//! methods) against a real loopback socket with the pinned client.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use a2a::{
@@ -49,7 +49,7 @@ fn task(id: &str, context_id: &str, state: TaskState, status_text: Option<&str>)
 
 // ── TaskStore adapter ──────────────────────────────────────────────────────
 
-/// Adapter CRUD: create returns version 1 and get/update round-trip the row through the TaskStore seam.
+/// Adapter CRUD: `create` returns version 1 and `get`/`update` round-trip the row through the `TaskStore` seam.
 #[tokio::test]
 async fn adapter_create_get_update_versioning() {
     let store = Store::open_in_memory("a2a-test").await.unwrap();
@@ -420,7 +420,7 @@ async fn wire_setup() -> (
     (addr, client, store, shutdown_tx)
 }
 
-/// A message/send accepts on the wire and returns a submitted task without claiming completion.
+/// A `message/send` accepts on the wire and returns a submitted task without claiming completion.
 #[tokio::test]
 async fn send_message_accepts_without_claiming_completion() {
     let (_addr, client, _store, _shutdown) = wire_setup().await;

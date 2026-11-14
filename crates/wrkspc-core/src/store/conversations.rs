@@ -11,7 +11,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn create_conversation(&self, members: &[&str]) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -47,8 +47,6 @@ impl Store {
     /// authoritative mirror ([`Store::mirror_conversations`]) and local
     /// creation add members.
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation id to ensure (the hub id
     ///   when mirroring).
     /// * `members` — the peers to enrol (on creation only).
@@ -60,7 +58,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn ensure_conversation(
         &self,
         conversation_id: &str,
@@ -96,13 +94,11 @@ impl Store {
     }
     /// Lists the peer ids currently enrolled in a conversation.
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation to query.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn conversation_members(&self, conversation_id: &str) -> Result<Vec<String>> {
         let rows = sqlx::query(
             "SELECT peer_id FROM conversation_members WHERE conversation_id = ? ORDER BY joined_at",
@@ -122,15 +118,13 @@ impl Store {
     /// interrupted mid-flight. The `operator` member can never be removed
     /// (a conversation without its moderator has no one to arbitrate).
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation to modify.
     /// * `peer_id` — the member to remove.
     /// * `actor` — who performed the removal (moderation provenance).
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`crate::error::StoreError::NotFound`] when the
     /// peer is not a member of that conversation.
     pub async fn remove_conversation_member(
         &self,
@@ -186,8 +180,6 @@ impl Store {
     /// wipe an unrelated host's queue, and deleting a room must not
     /// leave its remote tasks live).
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation to delete.
     ///
     /// # Returns
@@ -197,22 +189,35 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn delete_conversation(&self, conversation_id: &str) -> Result<bool> {
-        // Existence FIRST: a nonexistent id deletes nothing, so a host
-        // id string can never be mistaken for a room and wipe that
-        // host's delivery queue.
+        // The deletion is a read-modify-write path: the dependency
+        // snapshot (the room's message/recipient pairs) must be gathered
+        // UNDER the same write-reserving transaction that deletes the
+        // rows. A snapshot taken before the transaction can miss a
+        // message committed in between, and that message's delivery task
+        // would then outlive the room as pollable, executable work. BEGIN
+        // IMMEDIATE takes the write lock up front (see set_peer_alias
+        // for the shared rationale): a concurrent acceptance either
+        // commits before the snapshot — and is cleaned here — or starts
+        // after the room row is gone and fails on the conversation
+        // foreign key.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // Existence FIRST, inside the transaction: a nonexistent id
+        // deletes nothing, so a host id string can never be mistaken
+        // for a room and wipe that host's delivery queue.
         let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM conversations WHERE id = ?")
             .bind(conversation_id)
-            .fetch_optional(self.pool())
+            .fetch_optional(&mut *tx)
             .await?;
         if exists.is_none() {
+            tx.rollback().await?;
             return Ok(false);
         }
 
         // The room's delivery-task ids: deterministic for current rows
         // and envelope-matched for legacy random-id rows — both keyed
-        // on the conversation's committed message ids.
+        // on the conversation's CURRENT committed message ids.
         let pairs: Vec<(String, String)> = sqlx::query(
             "SELECT r.message_id, r.peer_id
              FROM message_recipients r
@@ -220,7 +225,7 @@ impl Store {
              WHERE m.conversation_id = ?",
         )
         .bind(conversation_id)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(|r| (r.get("message_id"), r.get("peer_id")))
@@ -232,7 +237,20 @@ impl Store {
             }
         }
 
-        let mut tx = self.pool.begin().await?;
+        // Outcome-ledger rows reference attempts without a cascade and
+        // are populated by the normal hub outcome-reporting loop: they
+        // must go before the attempts they describe, or deleting a room
+        // whose terminal outcome was reported trips the foreign key.
+        sqlx::query(
+            "DELETE FROM hub_outcome_reports WHERE attempt_id IN
+               (SELECT a.id FROM attempts a
+                JOIN execution_intents i ON i.id = a.intent_id
+                JOIN messages m ON m.id = i.message_id
+                WHERE m.conversation_id = ?)",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
         // attempts -> intents -> recipients -> messages -> events/fences/members
         sqlx::query(
             "DELETE FROM attempts WHERE intent_id IN
@@ -333,8 +351,6 @@ impl Store {
     /// The name is display metadata: nullable, not unique, and never a key. An
     /// empty or whitespace-only name clears it.
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the room.
     /// * `name` — the new name, or `None` to clear it.
     ///
@@ -370,8 +386,6 @@ impl Store {
     /// the hub omits stay as the node last knew them: a node that
     /// missed one poll must not lose a transcript, and node-local rooms
     /// are never touched.
-    ///
-    /// # Arguments
     ///
     /// * `conversations` — the hub's conversations, as the hub serves them.
     ///

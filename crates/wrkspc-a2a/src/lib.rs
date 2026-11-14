@@ -2,13 +2,14 @@
 //!
 //! The pilot runs this in-process as the coordinator role. It serves the
 //! v1.0 agent card, a `TaskStore` impl over the wrkspc store, and the six
-//! A2A methods (`SendMessage`, `SendStreamingMessage`, `GetTask`,
-//! `ListTasks`, `CancelTask`, `SubscribeToTask`).
+//! core A2A methods (`send_message`, `send_streaming_message`, `get_task`,
+//! `list_tasks`, `cancel_task`, `subscribe_to_task`).
 //!
 //! The executor deliberately does NOT complete tasks: acceptance is
-//! recorded as `submitted` with a status message, and execution state is
-//! driven by the dispatcher (unit 5). A completed *turn* is never claimed
-//! as task success (D-3 predicate).
+//! recorded as `submitted` with a status message (a continuation keeps
+//! its existing non-terminal state), and execution state is driven by
+//! the dispatcher (unit 5). A completed *turn* is never claimed as task
+//! success (D-3 predicate).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod executor;

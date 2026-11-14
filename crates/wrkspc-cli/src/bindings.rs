@@ -44,9 +44,7 @@ pub struct BindingConfig {
 impl BindingsFile {
     /// Parses a bindings TOML file.
     ///
-    /// # Arguments
-    ///
-    /// * `path` — the file to read.
+    /// `path` is the file to read.
     ///
     /// # Returns
     ///
@@ -65,13 +63,10 @@ impl BindingsFile {
 /// Builds the stdio MCP injection config for a peer: this binary's
 /// `mcp-bridge` subcommand pointed at the node's database.
 ///
-/// # Arguments
-///
-/// * `db_path` — the node's database file.
-/// * `peer_id` — the peer whose surface the bridge serves.
-/// * `hub_connected` — whether the node runs against a hub; the bridge
-///   mirrors the flag so hub-mode posts never create local execution
-///   intents.
+/// `db_path` is the node's database file; `peer_id` is the peer whose
+/// surface the bridge serves; `hub_connected` mirrors whether the node
+/// runs against a hub so hub-mode posts never create local execution
+/// intents.
 ///
 /// # Returns
 ///

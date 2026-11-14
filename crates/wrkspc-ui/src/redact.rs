@@ -51,11 +51,7 @@ struct Regexes {
     api_key: regex::Regex,
 }
 
-/// Masks credential-shaped spans in a display string.
-///
-/// # Arguments
-///
-/// * `text` — the string to redact.
+/// Masks credential-shaped spans in the display string `text`.
 ///
 /// # Returns
 ///
@@ -91,13 +87,10 @@ fn is_sensitive_key(key: &str) -> bool {
 
 /// Redacts every string leaf in a JSON value (event payloads).
 ///
-/// # Arguments
-///
-/// * `value` — the payload to redact.
-///
 /// # Returns
 ///
-/// A redacted copy; structure and non-string leaves are untouched.
+/// A redacted copy of `value`; structure and non-string leaves are
+/// untouched.
 pub fn redact_value(value: &Value) -> Value {
     match value {
         Value::String(s) => Value::String(redact(s)),

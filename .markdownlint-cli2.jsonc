@@ -19,6 +19,10 @@
   "ignores": [
     // mdBook build output.
     "docs/book/",
+    // Cargo output (rustdoc ships markdown licenses under target/doc/).
+    "target/",
+    // Verbatim upstream Contributor Covenant text — canonical, unwrapped.
+    ".github/CODE_OF_CONDUCT.md",
     // Generated at docs-build time from the root CHANGELOG.md.
     "docs/src/changelog.md",
     // Build-time copy of deploy/README.md.

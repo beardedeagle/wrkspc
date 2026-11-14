@@ -76,7 +76,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn list_conversations(&self) -> Result<Vec<ConversationView>> {
         let rows = sqlx::query(
             "SELECT c.id AS id, c.name AS name, c.created_at AS created_at,
@@ -108,13 +108,11 @@ impl Store {
     /// Lists a conversation's transcript, oldest first, with per-recipient
     /// delivery states.
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn list_messages(&self, conversation_id: &str) -> Result<Vec<MessageView>> {
         let messages = sqlx::query(
             "SELECT id, sender_id, content, created_at, execution_requested
@@ -126,7 +124,20 @@ impl Store {
         .fetch_all(self.pool())
         .await?;
 
-        self.assemble_messages(conversation_id, messages).await
+        // The explicitly requested FULL-history read fetches the full
+        // delivery history too; the bounded window below scopes its own
+        // fetch to the selected message ids.
+        let deliveries = sqlx::query(
+            "SELECT r.message_id, r.peer_id, r.delivery_state
+             FROM message_recipients r
+             JOIN messages m ON m.id = r.message_id
+             WHERE m.conversation_id = ?",
+        )
+        .bind(conversation_id)
+        .fetch_all(self.pool())
+        .await?;
+
+        self.assemble_messages(messages, deliveries).await
     }
 
     /// The latest `window` messages of a conversation, oldest first,
@@ -134,8 +145,6 @@ impl Store {
     /// load (UI-19). A client that would otherwise page an entire
     /// room into memory at startup only ever sees this window, and
     /// can request the full list on demand.
-    ///
-    /// # Arguments
     ///
     /// * `conversation_id` — the room.
     /// * `window` — the maximum number of most recent messages.
@@ -161,27 +170,45 @@ impl Store {
         .fetch_all(self.pool())
         .await?;
 
-        self.assemble_messages(conversation_id, messages).await
+        // The window bounds the DELIVERY fetch too: recipient rows are
+        // read for the SELECTED message ids only, so a long-lived room
+        // with years of delivery history costs the window, not the whole
+        // conversation. (The old conversation-wide fetch built a
+        // per-message index for every historical row and then discarded
+        // the out-of-window entries — unbounded work behind a bounded
+        // API.) The exact selected ids are bound (not a second ORDER/LIMIT
+        // projection), so a created_at tie can never fetch rows for a
+        // message the outer query did not return. Chunked so a huge
+        // window stays under SQLite's variable limit.
+        let selected_ids: Vec<String> = messages.iter().map(|row| row.get("id")).collect();
+        let mut deliveries: Vec<sqlx::sqlite::SqliteRow> = Vec::new();
+        for chunk in selected_ids.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT message_id, peer_id, delivery_state
+                 FROM message_recipients
+                 WHERE message_id IN ({placeholders})"
+            );
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            deliveries.extend(query.fetch_all(self.pool()).await?);
+        }
+
+        self.assemble_messages(messages, deliveries).await
     }
 
-    /// Joins delivery rows onto fetched message rows. The delivery
-    /// query is conversation-wide, and delivery rows dropped here
-    /// belong to messages outside the window — never shown, never
-    /// serialized.
+    /// Joins delivery rows onto fetched message rows. The CALLER decides
+    /// the delivery fetch's scope — the full-history list passes the
+    /// conversation-wide rows, the bounded window passes only the rows
+    /// for its selected ids — so no delivery row outside the caller's
+    /// message set is ever materialized here.
     async fn assemble_messages(
         &self,
-        conversation_id: &str,
         messages: Vec<sqlx::sqlite::SqliteRow>,
+        deliveries: Vec<sqlx::sqlite::SqliteRow>,
     ) -> Result<Vec<MessageView>> {
-        let deliveries = sqlx::query(
-            "SELECT r.message_id, r.peer_id, r.delivery_state
-             FROM message_recipients r
-             JOIN messages m ON m.id = r.message_id
-             WHERE m.conversation_id = ?",
-        )
-        .bind(conversation_id)
-        .fetch_all(self.pool())
-        .await?;
         // One pass into a per-message index, then O(1) lookups: the
         // transcript assembly is O(M + R), not O(M × R) — with large
         // rooms the quadratic filter made the view 15× slower (C12).
@@ -216,13 +243,11 @@ impl Store {
 
     /// Lists a conversation's active moderation fences.
     ///
-    /// # Arguments
-    ///
     /// * `conversation_id` — the conversation.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn conversation_fences(&self, conversation_id: &str) -> Result<Vec<crate::Fence>> {
         let rows = sqlx::query(
             "SELECT id, conversation_id, peer_id, kind, set_by, set_at, acked_at
@@ -251,7 +276,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn unknown_attempts(&self) -> Result<Vec<UnknownAttemptView>> {
         let rows = sqlx::query(
             "SELECT a.id AS attempt_id, a.intent_id, a.state, a.stop_reason,

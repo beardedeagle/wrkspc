@@ -24,7 +24,7 @@ pub struct Event {
     pub created_at: String,
 }
 
-/// Outcome of [`Store::accept_message`](Store::accept_message).
+/// Outcome of [`Store::accept_message`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptOutcome {
     /// A fresh message committed with its recipients and intents.
@@ -50,7 +50,7 @@ pub struct RecipientRequest {
 /// it per database, regardless of role labels, and a crashed process
 /// releases it automatically). Dropping the LAST clone closes the lock
 /// file and releases the lock; use
-/// [`Store::release_lock`](Store::release_lock) when handing the
+/// [`Store::release_lock`] when handing the
 /// database to another process without dropping the store.
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -85,6 +85,7 @@ pub mod conversations;
 pub mod events;
 pub mod fences;
 pub mod messages;
+pub use messages::MAX_DIRECTED_RECIPIENTS;
 pub mod peers;
 pub mod reconcile;
 
@@ -102,8 +103,6 @@ impl Store {
     /// handling — observed transient holds have silently wedged dispatcher
     /// turns. A genuine long-held lock still fails (and surfaces visibly)
     /// after the retry budget.
-    ///
-    /// # Arguments
     ///
     /// * `op` — the operation to run; must be safe to re-run (all store
     ///   writes here are idempotent or single-attempt).

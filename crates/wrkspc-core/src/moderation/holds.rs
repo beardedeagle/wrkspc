@@ -56,17 +56,17 @@ impl Store {
     ///
     /// Idempotent: holding an already-held delivery is a no-op.
     ///
-    /// # Arguments
-    ///
     /// * `message_id` — the message whose delivery to hold.
     /// * `peer_id` — the recipient.
     /// * `set_by` — the operator/peer requesting the hold.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
-    /// recipient row does not exist or is `delivered`/`expired`,
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::NotFound`] when the
+    /// recipient row does not exist,
+    /// [`StoreError::TerminalState`] when the delivery is already
+    /// in a state that cannot be held (`delivered`/`expired`/
+    /// `blocked`), and [`StoreError::Db`] on failure.
     pub async fn hold_delivery(&self, message_id: &str, peer_id: &str, set_by: &str) -> Result<()> {
         let mut tx = self.pool().begin().await?;
         let row = sqlx::query(
@@ -126,8 +126,6 @@ impl Store {
     /// (moderation can land after the claim); the delivery claim path
     /// runs the same checks at the hub's claim boundary.
     ///
-    /// # Arguments
-    ///
     /// * `message_id` — the message being delivered.
     /// * `peer_id` — the recipient.
     ///
@@ -137,9 +135,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::BlockedByFence`](StoreError::BlockedByFence)
+    /// Returns [`StoreError::BlockedByFence`]
     /// naming the effective gate, and
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// [`StoreError::Db`] on failure.
     pub async fn delivery_gate(&self, message_id: &str, peer_id: &str) -> Result<()> {
         let mut tx = self.pool().begin().await?;
         let gate = delivery_gate_in_tx(&mut tx, message_id, peer_id).await?;
@@ -156,17 +154,15 @@ impl Store {
 
     /// Releases a held delivery back into the eligible queue.
     ///
-    /// # Arguments
-    ///
     /// * `message_id` — the message whose delivery to release.
     /// * `peer_id` — the recipient.
     /// * `set_by` — the operator/peer requesting the release.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// recipient row does not exist or is not `held`,
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// [`StoreError::Db`] on failure.
     pub async fn release_delivery(
         &self,
         message_id: &str,
@@ -226,8 +222,6 @@ impl Store {
 /// kinds))` describing the first blocking gate, or `None` when the
 /// delivery may proceed.
 ///
-/// # Arguments
-///
 /// * `tx` — the open transaction the checks run in.
 /// * `message_id` — the message being delivered.
 /// * `peer_id` — the recipient.
@@ -238,7 +232,7 @@ impl Store {
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Db`](StoreError::Db) on failure.
+/// Returns [`StoreError::Db`] on failure.
 pub(crate) async fn delivery_gate_in_tx(
     tx: &mut sqlx::SqliteConnection,
     message_id: &str,

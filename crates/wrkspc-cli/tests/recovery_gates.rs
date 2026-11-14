@@ -249,13 +249,32 @@ fn held_delivery_survives_restart_and_releases_cleanly() {
     let (node, port, token) = boot(&dir, &db, fake.to_str().unwrap());
     let client = api_client(&token);
 
-    // Hold lands before the next dispatcher tick (250 ms), so the
-    // intent never dispatches.
+    // The hold must land while the delivery is still queued — but the
+    // dispatcher ticks every 250 ms and the fake agent answers
+    // instantly, so racing post → hold → assert-held against the tick
+    // flakes under load (a dispatched delivery refuses the hold with
+    // 409). A pause fence placed BEFORE the post removes the race
+    // deterministically: the fence blocks both the claim and the
+    // dispatch-boundary gate, so the delivery cannot dispatch before
+    // the hold lands.
+    let fence_id = fence(&client, port, &conversation, "codex", "pause");
     let held = post(&client, port, &conversation, "held-work");
     hold(&client, port, &held, "codex");
     assert_eq!(
         delivery_state(&client, port, &conversation, &held, "codex").as_deref(),
         Some("held")
+    );
+    clear_fence(&client, port, &fence_id);
+    // With the fence gone, the HOLD alone must keep the delivery from
+    // dispatching.
+    wait_state_holds(
+        &client,
+        port,
+        &conversation,
+        &held,
+        "codex",
+        "delivered",
+        Duration::from_secs(3),
     );
 
     // The hold is durable moderation: after a node kill + restart the

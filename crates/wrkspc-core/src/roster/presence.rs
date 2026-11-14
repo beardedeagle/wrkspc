@@ -142,7 +142,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn roster(&self) -> Result<Vec<RosterEntry>> {
         let rows = sqlx::query(
             "SELECT r.peer_id, r.name, r.alias, r.class, r.host_id, r.status, r.state,
@@ -157,8 +157,6 @@ impl Store {
 
     /// Reads one roster row.
     ///
-    /// # Arguments
-    ///
     /// * `peer_id` — the peer to look up.
     ///
     /// # Returns
@@ -167,7 +165,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn roster_entry(&self, peer_id: &str) -> Result<Option<RosterEntry>> {
         let row = sqlx::query(
             "SELECT r.peer_id, r.name, r.alias, r.class, r.host_id, r.status, r.state,
@@ -188,13 +186,11 @@ impl Store {
     /// hub round-trips. All-or-nothing; a failed fetch keeps the last
     /// known mirror (stale-but-visible, per the freshness decision).
     ///
-    /// # Arguments
-    ///
     /// * `entries` — the hub's current roster.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn replace_roster(&self, entries: &[RosterEntry]) -> Result<()> {
         // IMMEDIATE: a delete-and-rebuild must not interleave with other
         // writers mid-stream.

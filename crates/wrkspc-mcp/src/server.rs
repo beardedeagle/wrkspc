@@ -7,7 +7,7 @@
 //!
 //! # rmcp adapter contract
 //!
-//! The pinned SDK is rmcp 3.9. `tool_router(server_handler)` generates the
+//! The pinned SDK is `rmcp` 3.9. `tool_router(server_handler)` generates the
 //! tools-only handler. Tool methods return `Result<T, String>`: `Err(String)`
 //! becomes a successful JSON-RPC response with `is_error: true`, preserving
 //! operational failures as failed tool calls. `ErrorData` instead produces a
@@ -92,12 +92,8 @@ pub struct McpServer {
 impl McpServer {
     /// Builds a server for `peer_id` backed by `store`.
     ///
-    /// # Arguments
-    ///
-    /// * `store` — the transactional store (shared with the dispatcher).
-    /// * `peer_id` — the enrolled peer this surface speaks for.
-    /// * `hub_connected` — whether this node runs against a hub; gates
-    ///   local execution behind hub acceptance and delivery claims.
+    /// The store is shared with the dispatcher; `hub_connected` gates
+    /// local execution behind hub acceptance and delivery claims.
     pub fn new(store: Store, peer_id: impl Into<String>, hub_connected: bool) -> Self {
         Self {
             store,
@@ -149,10 +145,6 @@ impl McpServer {
 /// (`-32600`), which misclassifies an ordinary business denial as an
 /// invalid MCP request. Store errors are operational failures, so they
 /// ride the `is_error` envelope, never the protocol channel.
-///
-/// # Arguments
-///
-/// * `error` — the store error.
 fn store_error(error: StoreError) -> String {
     error.to_string()
 }
@@ -165,13 +157,10 @@ fn store_error(error: StoreError) -> String {
 /// and separates the peers that will take a harness turn from those that never
 /// will.
 ///
-/// # Arguments
-///
-/// * `store` — the node's store, read for peer classes.
-/// * `verb` — `accepted` or `replay`.
-/// * `message_id` — the committed message.
-/// * `delivered` — the peers the message was delivered to.
-/// * `execution_requested` — whether the caller asked for execution.
+/// `store` is read for peer classes, `verb` is `accepted` or `replay`,
+/// `message_id` is the committed message, `delivered` names the peers the
+/// message reached, and `execution_requested` says whether the caller asked
+/// for execution.
 async fn routing_summary(
     store: &wrkspc_core::Store,
     verb: &str,
@@ -378,21 +367,14 @@ pub struct HttpListener {
 }
 
 impl HttpListener {
-    /// Builds a listener for `server` with `config`.
-    ///
-    /// # Arguments
-    ///
-    /// * `server` — the peer's MCP server.
-    /// * `config` — bind address and token allowlist.
+    /// Builds a listener for `server` with `config` (bind address and
+    /// token allowlist).
     pub fn new(server: McpServer, config: HttpListenerConfig) -> Self {
         Self { config, server }
     }
 
-    /// Binds the configured address and serves until `shutdown` resolves.
-    ///
-    /// # Arguments
-    ///
-    /// * `shutdown` — a future that ends serving when it resolves.
+    /// Binds the configured address and serves until the `shutdown` future
+    /// resolves.
     ///
     /// # Errors
     ///
@@ -405,13 +387,11 @@ impl HttpListener {
         self.serve_on(listener, shutdown).await
     }
 
-    /// Serves on an already-bound `listener` until `shutdown` resolves.
+    /// Serves on an already-bound `listener` until the `shutdown` future
+    /// resolves.
     ///
-    /// # Arguments
-    ///
-    /// * `listener` — a bound TCP listener (tests bind port 0 themselves to
-    ///   discover the address).
-    /// * `shutdown` — a future that ends serving when it resolves.
+    /// Tests bind port 0 themselves to discover the address before calling
+    /// this.
     ///
     /// # Errors
     ///

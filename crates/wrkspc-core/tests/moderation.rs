@@ -599,3 +599,189 @@ async fn resolve_peer_ref_prefers_the_canonical_id_over_a_colliding_alias() {
         Some("claude")
     );
 }
+
+///  (store side): the delivery-report guidance ack is scoped
+/// to the validated conversation — a client-supplied guidance id from
+/// another conversation is ignored without being modified, and the
+/// conversation's own rows clear their claimed attempt.
+#[tokio::test]
+async fn guidance_ack_is_scoped_to_the_validated_conversation() {
+    let (store, conversation_id) = setup().await;
+    let other = store
+        .create_conversation(&["operator", "agent"])
+        .await
+        .unwrap();
+    let g1 = store
+        .add_guidance(&conversation_id, "operator", "only for this room")
+        .await
+        .unwrap();
+    let g_other = store
+        .add_guidance(&other, "operator", "for the other room")
+        .await
+        .unwrap();
+
+    // The dispatcher claimed the conversation's guidance for an attempt.
+    let claimed = store
+        .claim_guidance(&conversation_id, "attempt-1")
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+
+    // A report for THIS conversation that also names a foreign id:
+    // only the scoped row is marked; the foreign row survives pending.
+    let marked = store
+        .mark_guidance_delivered_scoped(&conversation_id, &[&g1, &g_other])
+        .await
+        .unwrap();
+    assert_eq!(marked, 1, "only the conversation's own row is acknowledged");
+    assert!(
+        store
+            .undelivered_guidance(&conversation_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the scoped row is delivered"
+    );
+    let other_pending = store.undelivered_guidance(&other).await.unwrap();
+    assert_eq!(other_pending.len(), 1, "the foreign row is untouched");
+    assert_eq!(other_pending[0].id, g_other);
+
+    // The delivered row's claim was cleared: a fresh claim sees nothing.
+    assert!(
+        store
+            .claim_guidance(&conversation_id, "attempt-2")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a delivered row is no longer claimable"
+    );
+}
+
+/// Guidance added AFTER a delivery task was queued still
+/// rides the envelope — the queue read (the node's poll) refreshes the
+/// guidance snapshot of unclaimed, non-terminal deliveries, and the
+/// claim freezes it.
+#[tokio::test]
+async fn queued_deliveries_refresh_pending_guidance_at_the_poll_boundary() {
+    let store = Store::open_in_memory("queued-guidance-refresh")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer_on_host("codex", "codex", "harness", "node-work-mac")
+        .await
+        .unwrap();
+    let conversation_id = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+    let AcceptOutcome::Accepted { message_id } = store
+        .accept_message(
+            &conversation_id,
+            "operator",
+            "queue-guidance-1",
+            "do the thing",
+            true,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "codex".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("fresh accept");
+    };
+
+    // The task is queued BEFORE any guidance exists: the snapshot is
+    // empty.
+    let task_id = store
+        .task_create_delivery(wrkspc_core::DeliveryTaskRequest {
+            recipient_host: "node-work-mac",
+            recipient_peer: "codex",
+            recipient_name: "codex",
+            recipient_class: "harness",
+            message_id: &message_id,
+            origin_message_id: None,
+            conversation_id: &conversation_id,
+            sender_peer: "operator",
+            sender_name: "operator",
+            sender_class: "human",
+            sender_host: "hub",
+            content: "do the thing",
+            execution_requested: true,
+        })
+        .await
+        .unwrap();
+    let envelope_guidance = |payload: &serde_json::Value| -> Vec<String> {
+        payload["metadata"]["delivery"]["guidance"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .get("text")
+                            .and_then(|text| text.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let row = store.task_get(&task_id).await.unwrap().unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&row.task_json).unwrap();
+    assert!(
+        envelope_guidance(&payload).is_empty(),
+        "the envelope snapshots empty guidance at creation"
+    );
+
+    // Guidance lands while the delivery waits unclaimed (node offline /
+    // fence active).
+    store
+        .add_guidance(&conversation_id, "operator", "only once")
+        .await
+        .unwrap();
+
+    // The node's poll read refreshes the envelope — the guidance rides.
+    let (rows, _) = store
+        .task_list(Some("node-work-mac"), None, None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let payload: serde_json::Value = serde_json::from_str(&rows[0].task_json).unwrap();
+    assert_eq!(
+        envelope_guidance(&payload),
+        vec!["only once".to_string()],
+        "the poll boundary attaches guidance added after queueing"
+    );
+    // The refresh is a metadata update, not a state transition.
+    assert_eq!(rows[0].version, 1, "the version is untouched");
+
+    // The claim freezes the envelope: guidance added afterwards does
+    // NOT mutate the handed-off blob.
+    assert_eq!(
+        store
+            .claim_delivery(&task_id, "node-work-mac", "inst-1")
+            .await
+            .unwrap(),
+        wrkspc_core::DeliveryClaimOutcome::Claimed
+    );
+    store
+        .add_guidance(&conversation_id, "operator", "too late")
+        .await
+        .unwrap();
+    let (rows, _) = store
+        .task_list(Some("node-work-mac"), None, None, None, 10)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&rows[0].task_json).unwrap();
+    assert_eq!(
+        envelope_guidance(&payload),
+        vec!["only once".to_string()],
+        "a claimed envelope is frozen at the handoff"
+    );
+}

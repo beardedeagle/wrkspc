@@ -1,23 +1,31 @@
 # Hub API
 
 The operator API is the hub's management surface: conversations,
-moderation, and inspection. Every route requires the operator bearer
-token — on the node and the standalone hub `--ui` listener that is a
-loopback HTTP gate; on the hub's TLS listener the UI rides HTTPS with
-the browser's client certificate optional. `POST /api/conversations` is
-hub-only (the node role 404s it); the node UI reads and follows the
-rooms the hub owns.
+moderation, and inspection. `POST /api/login` is the one exception to
+the token rule — it exchanges the bearer token (pasted from the login
+card) for the HttpOnly session cookie; every other route requires the
+operator bearer token or that cookie. On the node and the standalone
+hub `--ui` listener that is a loopback HTTP gate; on the hub's TLS
+listener the UI rides HTTPS with the browser's client certificate
+optional. `POST /api/conversations` is hub-only (the node role 404s
+it); the node UI reads and follows the rooms the hub owns.
 
 | Route | Purpose |
 |---|---|
+| `POST /api/login` | Exchange the operator bearer token for the HttpOnly session cookie |
 | `POST /api/conversations` | Create a conversation; members must exist or the call is refused (422 on unknown members; hub role only) |
 | `GET /api/conversations` | List conversations |
-| `POST /api/conversations/{id}/messages` | Post a message to a conversation |
+| `GET /api/conversations/{id}` | One conversation's record |
+| `PATCH /api/conversations/{id}` | Rename a conversation |
+| `DELETE /api/conversations/{id}` | Delete a conversation |
+| `DELETE /api/conversations/{id}/members/{peer}` | Kick a peer from the conversation |
+| `POST /api/conversations/{id}/messages` | Post a message to a conversation; a directed post accepts at most 32 recipients |
 | `GET /api/conversations/{id}/messages` | The conversation's message rows (redacted); `?window=N` bounds the response to the latest N; streamed turn output and reports ride the events feed |
 | `GET /api/conversations/{id}/events` | The committed event feed, cursor-resumable |
 | `GET /api/peers` | Enrolled peers and their presence |
 | `PATCH /api/peers/{id}` | Boot (or restore) a peer; `status: "banned"` also revokes its certificate serial |
 | `DELETE /api/peers/{id}` | Forget a peer — any peer (history and revocations survive; removing an enrolled peer from the roster does not revoke its certificate) |
+| `GET /api/conversations/{id}/fences` | The conversation's active fences |
 | `POST /api/conversations/{id}/fences` | Apply a fence (pause, hold, block) |
 | `DELETE /api/fences/{fence_id}` | Clear a fence |
 | `POST /api/messages/{message_id}/deliveries/{peer_id}/hold` | Hold a delivery |
@@ -33,3 +41,11 @@ rooms the hub owns.
 The route families mirror the moderation and delivery state machines
 documented under [Architecture](../architecture/hub-and-node.md) — the API
 is a window onto the same committed records the feed carries.
+
+Post-message recipient resolution: an explicit `recipients` list is
+validated against conversation membership and capped at 32; an absent
+field addresses every non-operator member; an explicit empty list
+addresses nobody directly, and the hub infers recipients from
+`@mentions` in the content — a mention that matches more than one
+member is refused rather than guessed. Replays carry the committed
+routing, never a re-resolved one.

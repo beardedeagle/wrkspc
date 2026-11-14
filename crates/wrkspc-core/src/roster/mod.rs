@@ -106,8 +106,6 @@ pub struct ModerationEvent {
 impl PeerStatus {
     /// Parses a status string, rejecting unknown values.
     ///
-    /// # Arguments
-    ///
     /// * `value` — the status string (`enrolled`, `booted`, `banned`).
     pub fn parse(value: &str) -> Option<Self> {
         match value {
@@ -137,8 +135,6 @@ impl PeerStatus {
 ///
 /// The string form is the store's persisted status; this is the single
 /// policy expression every ejection check routes through.
-///
-/// # Arguments
 ///
 /// * `value` — the status string (`enrolled`, `booted`, `banned`).
 pub fn status_is_ejected(value: &str) -> bool {

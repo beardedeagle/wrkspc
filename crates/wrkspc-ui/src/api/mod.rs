@@ -101,20 +101,16 @@ impl std::fmt::Debug for AppState {
 impl AppState {
     /// Builds the state.
     ///
-    /// # Arguments
-    ///
-    /// * `store` — the transactional store.
-    /// * `cancel` — the cancel seam (the dispatcher handle in production).
-    /// * `queue_remote_deliveries` — hub mode: operator posts queue
-    ///   delivery tasks for remote-host recipients.
-    /// * `hub_role` — hub mode: the operator surface that owns the
-    ///   shared store (conversation creation); the node role returns
-    ///   404 for it (a node-created conversation would never reach the
-    ///   hub).
-    /// * `hub_connected` — whether this surface mirrors hub-owned
-    ///   state (connected node): hub-owned mutations refuse loudly.
-    /// * `deny` — the hub's live certificate-serial revocation set,
-    ///   when this surface can moderate TLS identity.
+    /// `store` is the transactional store; `cancel` is the cancel seam
+    /// (the dispatcher handle in production). `queue_remote_deliveries`
+    /// is hub mode: operator posts queue delivery tasks for
+    /// remote-host recipients. `hub_role` is hub mode: the operator
+    /// surface that owns the shared store (conversation creation); the
+    /// node role returns 404 for it (a node-created conversation would
+    /// never reach the hub). `hub_connected` marks a connected node
+    /// that mirrors hub-owned state: hub-owned mutations refuse loudly.
+    /// `deny` is the hub's live certificate-serial revocation set, when
+    /// this surface can moderate TLS identity.
     pub fn new(
         store: Store,
         cancel: Arc<dyn CancelRequester>,
@@ -139,6 +135,7 @@ fn store_error(error: StoreError) -> (StatusCode, Json<Value>) {
     use StoreError::*;
     let status = match error {
         NotFound { .. } => StatusCode::NOT_FOUND,
+        TooManyRecipients { .. } | AmbiguousPeerRef { .. } => StatusCode::BAD_REQUEST,
         TerminalState { .. }
         | IntentTerminal { .. }
         | BlockedByFence { .. }

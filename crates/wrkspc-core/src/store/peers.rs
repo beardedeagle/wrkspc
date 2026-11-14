@@ -7,11 +7,12 @@ use chrono::Utc;
 use sqlx::Row;
 
 impl Store {
-    /// Enrols a peer in a conversation, creating both rows if needed.
+    /// Enrols a peer on the pilot host, creating the host and peer
+    /// rows if needed.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn ensure_peer(&self, peer_id: &str, name: &str, class: &str) -> Result<()> {
         self.ensure_peer_on_host(peer_id, name, class, PILOT_HOST_ID)
             .await
@@ -22,16 +23,14 @@ impl Store {
     /// with [`PILOT_HOST_ID`]). Idempotent: an existing row is left
     /// untouched, so a re-enrolment never rewrites `host_id`.
     ///
-    /// # Arguments
-    ///
     /// * `peer_id` — the peer to enrol.
     /// * `name` — the peer's display name.
-    /// * `class` — the peer's [`PeerClass`] string.
+    /// * `class` — the peer's [`crate::model::PeerClass`] string.
     /// * `host_id` — the host that owns the peer.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn ensure_peer_on_host(
         &self,
         peer_id: &str,
@@ -87,8 +86,6 @@ impl Store {
     /// [`ensure_peer_on_host`](Store::ensure_peer_on_host) stays
     /// immutable for existing peers).
     ///
-    /// # Arguments
-    ///
     /// * `peer_id` — the peer to re-assign.
     /// * `host_id` — the new host.
     ///
@@ -99,9 +96,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// peer is not enrolled, and
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// [`StoreError::Db`] on failure.
     pub async fn assign_peer_host(&self, peer_id: &str, host_id: &str) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         // IMMEDIATE: read-modify-write (host binding must not race a ban).
@@ -146,8 +143,6 @@ impl Store {
 
     /// Looks up a peer's `host_id` (the host that owns the peer).
     ///
-    /// # Arguments
-    ///
     /// * `peer_id` — the peer to look up.
     ///
     /// # Returns
@@ -156,7 +151,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn peer_host(&self, peer_id: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT host_id FROM peers WHERE id = ?")
             .bind(peer_id)
@@ -167,8 +162,6 @@ impl Store {
 
     /// Looks up a peer's enrolment record.
     ///
-    /// # Arguments
-    ///
     /// * `peer_id` — the peer to look up.
     ///
     /// # Returns
@@ -178,7 +171,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn peer_details(&self, peer_id: &str) -> Result<Option<(String, String, String)>> {
         let row = sqlx::query("SELECT name, class, host_id FROM peers WHERE id = ?")
             .bind(peer_id)
@@ -189,8 +182,6 @@ impl Store {
 
     /// Reads a peer's operator-moderated hub status.
     ///
-    /// # Arguments
-    ///
     /// * `peer_id` — the peer to query.
     ///
     /// # Returns
@@ -200,7 +191,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn peer_status(&self, peer_id: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT status FROM peers WHERE id = ?")
             .bind(peer_id)
@@ -212,8 +203,6 @@ impl Store {
     /// Reads the certificate serial a peer presented on its stamped
     /// connection, when one has been recorded.
     ///
-    /// # Arguments
-    ///
     /// * `peer_id` — the peer to query.
     ///
     /// # Returns
@@ -223,7 +212,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn peer_cert_serial(&self, peer_id: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT cert_serial FROM peers WHERE id = ?")
             .bind(peer_id)
@@ -235,8 +224,6 @@ impl Store {
     /// Lists a peer's host-assignment history, oldest first
     /// (append-only; the last entry is the current projection).
     ///
-    /// # Arguments
-    ///
     /// * `peer_id` — the peer to query.
     ///
     /// # Returns
@@ -245,7 +232,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn peer_assignments(&self, peer_id: &str) -> Result<Vec<(String, String)>> {
         let rows = sqlx::query(
             "SELECT host_id, assigned_at FROM peer_host_assignments

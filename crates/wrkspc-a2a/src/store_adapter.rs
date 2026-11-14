@@ -43,8 +43,6 @@ pub struct WrkspcTaskStore {
 impl WrkspcTaskStore {
     /// Builds the adapter over a wrkspc store.
     ///
-    /// # Arguments
-    ///
     /// * `store` — the transactional store (shared with the dispatcher).
     pub fn new(store: Store) -> Self {
         Self { store }

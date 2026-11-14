@@ -1,4 +1,5 @@
-//! The transport seam: `SessionHandle` depends only on [`AcpTransport`].
+//! The transport seam: [`crate::session::SessionHandle`] depends only on
+//! [`AcpTransport`].
 //!
 //! [`StdioTransport`] owns the adapter child process and its pipes (the only
 //! implementation today, per D-3's verified transport reality). A future
@@ -46,8 +47,6 @@ pub trait AcpTransport: Send + 'static {
     /// Opens a connection, wires session updates and permission requests,
     /// runs `task` against it, and cleans up afterwards.
     ///
-    /// # Arguments
-    ///
     /// * `updates` — broadcast of `session/update` notifications (multiple
     ///   subscribers: the dispatcher drive task and future UI pumps).
     /// * `task` — the session-control loop; runs with a live connection.
@@ -72,8 +71,6 @@ pub struct StdioTransport {
 
 impl StdioTransport {
     /// Builds a transport for the given adapter command.
-    ///
-    /// # Arguments
     ///
     /// * `command` — the adapter launch command (parsed by the ACP SDK).
     pub fn new(command: impl Into<String>) -> Self {

@@ -153,25 +153,94 @@ lint-md:
 
 # Build the book. CHANGELOG.md and deploy/README.md are copied into
 # docs/src for the build (single source of truth stays at the repo root).
+# The rustdoc API reference is built from the same tree and embedded at
+# docs/book/rustdoc so the Pages site carries the type docs beside the
+# book (house pattern). The crates are product-internal, so the API
+# page frames them as a no-semver surface.
 docs:
     #!/usr/bin/env bash
     set -euo pipefail
-    # The copied pages are cleaned up on EVERY exit — a failed build
-    # must not leave untracked copies behind.
-    trap 'rm -f docs/src/changelog.md docs/src/hub-container-deployment.md' EXIT
+    # The copied pages and the staged rustdoc tree are cleaned up on
+    # EVERY exit — a failed build must not leave untracked copies
+    # behind. The committed placeholder at docs/src/rustdoc is
+    # restored verbatim so the tree ends exactly as it began.
+    trap 'rm -rf docs/src/rustdoc; mkdir -p docs/src/rustdoc/wrkspc_core; printf "# Rust API Reference\\n\\nGenerated API documentation is embedded here at build time.\\n" > docs/src/rustdoc/wrkspc_core/index.html; rm -f docs/src/changelog.md docs/src/hub-container-deployment.md' EXIT
     cp CHANGELOG.md docs/src/changelog.md
     cp deploy/README.md docs/src/hub-container-deployment.md
+    cargo +{{ toolchain }} doc --no-deps --workspace --locked
+    # Resolve Cargo's effective target directory instead of assuming
+    # target/: CARGO_TARGET_DIR or [build] target-dir redirects the
+    # doc output too, and the embedded API reference must follow it.
+    target_dir="$(cargo +{{ toolchain }} metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)"
+    # mdbook parses the SUMMARY chapter as content: keep the tiny
+    # placeholder in src during the build (a full rustdoc index.html
+    # panics the mdbook HTML parser), then drop the real tree into the
+    # output afterward.
+    rm -rf docs/src/rustdoc docs/book
+    mkdir -p docs/src/rustdoc/wrkspc_core
+    printf "# Rust API Reference\\n\\nGenerated API documentation is embedded here at build time.\\n" > docs/src/rustdoc/wrkspc_core/index.html
     mdbook build docs
+    rm -rf docs/book/rustdoc
+    cp -R "$target_dir/doc" docs/book/rustdoc
     echo "Documentation built: docs/book/"
 
-# Serve the book locally with hot reload.
+# Serve the book locally with hot reload. The rustdoc tree lands in
+# the served output after mdbook's initial build (the same
+# placeholder-versus-real-tree order as `docs`).
 docs-serve:
     #!/usr/bin/env bash
     set -euo pipefail
+    server_pid=""
+    watcher_pid=""
+    stamp=""
+    cleanup() {
+        # Reap the serve process and the rustdoc watchdog so neither
+        # outlives the recipe: a failed `wait` under set -e must not
+        # leave the watchdog rewriting docs/book indefinitely.
+        if [[ -n "$server_pid" ]]; then kill "$server_pid" 2>/dev/null || true; fi
+        if [[ -n "$watcher_pid" ]]; then kill "$watcher_pid" 2>/dev/null || true; fi
+        if [[ -n "$stamp" ]]; then rm -f "$stamp"; fi
+        rm -rf docs/src/rustdoc
+        mkdir -p docs/src/rustdoc/wrkspc_core
+        printf "# Rust API Reference\\n\\nGenerated API documentation is embedded here at build time.\\n" > docs/src/rustdoc/wrkspc_core/index.html
+        rm -f docs/src/changelog.md docs/src/hub-container-deployment.md
+    }
+    trap cleanup EXIT
     cp CHANGELOG.md docs/src/changelog.md
     cp deploy/README.md docs/src/hub-container-deployment.md
-    trap 'rm -f docs/src/changelog.md docs/src/hub-container-deployment.md' EXIT
-    (cd docs && mdbook serve --open)
+    cargo +{{ toolchain }} doc --no-deps --workspace --locked
+    target_dir="$(cargo +{{ toolchain }} metadata --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d'"' -f4)"
+    rm -rf docs/src/rustdoc
+    mkdir -p docs/src/rustdoc/wrkspc_core
+    printf "# Rust API Reference\\n\\nGenerated API documentation is embedded here at build time.\\n" > docs/src/rustdoc/wrkspc_core/index.html
+    stamp="$(mktemp)"
+    (cd docs && mdbook serve --open) &
+    server_pid=$!
+    for _ in $(seq 1 120); do
+        [[ -f docs/book/index.html && docs/book/index.html -nt "$stamp" ]] && break
+        sleep 0.5
+    done
+    rm -rf docs/book/rustdoc
+    cp -R "$target_dir/doc" docs/book/rustdoc
+    # The watchdog starts only after the initial build and the
+    # foreground copy finished: on a clean checkout docs/book does not
+    # exist yet, and a watchdog that starts earlier would either die
+    # on the missing directory under set -e or race the foreground
+    # remove-and-copy as a second writer. Startup keeps exactly one
+    # writer; later mdbook rebuilds restore the PLACEHOLDER chapter,
+    # so the watchdog compares the served index against the generated
+    # one and re-drops the real tree whenever they diverge.
+    (
+        while :; do
+            if ! cmp -s "docs/book/rustdoc/wrkspc_core/index.html" "$target_dir/doc/wrkspc_core/index.html"; then
+                rm -rf docs/book/rustdoc
+                cp -R "$target_dir/doc" docs/book/rustdoc
+            fi
+            sleep 2
+        done
+    ) &
+    watcher_pid=$!
+    wait "$server_pid"
 
 # Shipping-artifact audit: the release binary must not contain builder
 # home paths (/Users/... or /home/...) from panic locations, error

@@ -6,10 +6,13 @@ a surface it wasn't built for.
 
 ## A2A — coordination
 
-A2A is the agent-to-agent layer: discovery, task delegation, and
-streaming results. The hub serves it; nodes speak it outbound. Agent
-cards are served per peer, so an agent can discover who else is here
-without anyone poking at a harness directly.
+A2A is the agent-to-agent layer: discovery, task delegation, and turn
+results. The hub serves it; nodes speak it outbound. Sends are unary:
+a streaming send is refused before it reaches the handler (fail
+closed) — streamed turn output reaches the operator through the
+events feed, not through the A2A send path. Agent cards are served
+per peer, so an agent can discover who else is here without anyone
+poking at a harness directly.
 
 ## ACP — session control
 

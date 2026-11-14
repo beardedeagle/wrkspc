@@ -17,8 +17,6 @@ impl Store {
     /// `codex`. Only when no peer carries the id does the target
     /// resolve as an alias, and an ambiguous alias fails closed.
     ///
-    /// # Arguments
-    ///
     /// * `target` — the alias or peer id as typed by the operator.
     ///
     /// # Errors
@@ -91,8 +89,6 @@ impl Store {
     /// clears a soft-forget, and re-materializes the roster row (the
     /// forget path deleted it) so the operator's restore is complete.
     ///
-    /// # Arguments
-    ///
     /// * `peer_id` — the peer to moderate.
     /// * `status` — the target status.
     /// * `actor` — who performed the action (audit trail).
@@ -103,7 +99,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn set_peer_status(
         &self,
         peer_id: &str,
@@ -234,8 +230,6 @@ impl Store {
     /// stays banned at the TLS layer). Forgotten peers are refused
     /// re-enrolment by the presence path.
     ///
-    /// # Arguments
-    ///
     /// * `peer_id` — the peer to forget.
     /// * `actor` — who performed the action (audit trail).
     ///
@@ -245,7 +239,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn forget_peer(&self, peer_id: &str, actor: &str) -> Result<bool> {
         // IMMEDIATE: read-modify-write (see set_peer_alias).
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
@@ -281,13 +275,11 @@ impl Store {
 
     /// Reads the moderation audit log, newest first.
     ///
-    /// # Arguments
-    ///
     /// * `limit` — the maximum number of rows to return.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn moderation_log(&self, limit: i64) -> Result<Vec<ModerationEvent>> {
         let rows = sqlx::query_as::<_, ModerationEvent>(
             "SELECT id, peer_id, actor, action, before, after, at
@@ -310,14 +302,12 @@ impl Store {
     /// the leaf, and a ban must revoke the serial the peer presents now,
     /// not the first one the hub ever saw.
     ///
-    /// # Arguments
-    ///
     /// * `host_id` — the presenting host (the certificate's first SAN).
     /// * `serial` — the lowercase hex certificate serial.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn record_host_cert_serial(&self, host_id: &str, serial: &str) -> Result<()> {
         // The host-level record stands independent of peer enrolment: a
         // connection that arrived before any peer was enrolled still
@@ -367,7 +357,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn cert_revocations(&self) -> Result<Vec<String>> {
         let rows: Vec<(String,)> =
             sqlx::query_as("SELECT DISTINCT serial FROM cert_revocations ORDER BY serial")

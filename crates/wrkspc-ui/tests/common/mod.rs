@@ -51,18 +51,25 @@ pub async fn spawn_ui() -> TestUi {
 /// Spawns the UI with hub-mode delivery queueing and the hub-role
 /// operator surface on or off.
 pub async fn spawn_ui_with(queue_remote_deliveries: bool, hub_role: bool) -> TestUi {
-    spawn_ui_full(queue_remote_deliveries, hub_role, false).await
+    spawn_ui_full(queue_remote_deliveries, hub_role, false, false).await
+}
+
+/// Spawns the UI as the hub: hub-connected, remote-delivery queueing
+/// on, hub-role operator surface.
+pub async fn spawn_ui_hub() -> TestUi {
+    spawn_ui_full(true, true, true, false).await
 }
 
 /// Spawns the UI as a TLS-listener surface: the login cookie is
 /// marked Secure.
 pub async fn spawn_ui_secure() -> TestUi {
-    spawn_ui_full(false, false, true).await
+    spawn_ui_full(false, false, false, true).await
 }
 
 async fn spawn_ui_full(
     queue_remote_deliveries: bool,
     hub_role: bool,
+    hub_connected: bool,
     cookie_secure: bool,
 ) -> TestUi {
     let store = Store::open_in_memory("ui-test").await.unwrap();
@@ -91,7 +98,7 @@ async fn spawn_ui_full(
             token: Some(TOKEN.to_string()),
             queue_remote_deliveries,
             hub_role,
-            hub_connected: false,
+            hub_connected,
         },
         None,
     );

@@ -264,3 +264,23 @@ async fn prompt_queue_rejects_beyond_the_admission_bound() {
         .expect("cancel must resolve the held prompt");
     handle.shutdown().await.expect("shutdown");
 }
+
+/// An adapter that dies while its session is cached and idle must end
+/// the session loop on its own: the closed watch flips with no command,
+/// eviction, or shutdown — a dead adapter must never advertise a live
+/// presence ( residual).
+#[tokio::test]
+async fn dead_idle_adapter_flips_closed_without_a_command() {
+    let (handle, _events) = SessionHandle::spawn(StdioTransport::new("sleep 1"));
+    assert!(handle.closed().borrow().is_none());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if handle.closed().borrow().is_some() {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("closed watch never fired after the adapter exited");
+}

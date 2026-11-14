@@ -5,6 +5,8 @@
 //! names agree across machines.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod common;
+
 use wrkspc_core::Store;
 use wrkspc_core::views::ConversationView;
 
@@ -230,4 +232,303 @@ async fn list_messages_window_returns_the_latest_bounded_oldest_first() {
     // A window larger than the room degrades to the whole room.
     let all = store.list_messages_window(&room, 50).await.unwrap();
     assert_eq!(all.len(), 5);
+}
+
+/// The bounded window bounds the DELIVERY fetch too. A room
+/// with a large old delivery history still costs the window, not the
+/// whole conversation, while the explicitly requested full-history list
+/// stays complete.
+#[tokio::test]
+async fn bounded_window_scopes_deliveries_to_the_window() {
+    let store = Store::open_in_memory("window-deliveries").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    let room = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+
+    // A large old history: every message has its own delivery row.
+    for n in 0..120 {
+        store
+            .accept_message(
+                &room,
+                "operator",
+                &format!("key-{n}"),
+                &format!("m{n}"),
+                false,
+                &[wrkspc_core::RecipientRequest {
+                    peer_id: "codex".to_string(),
+                    execution_requested: false,
+                }],
+            )
+            .await
+            .unwrap();
+    }
+
+    let window = store.list_messages_window(&room, 5).await.unwrap();
+    assert_eq!(window.len(), 5, "the window is bounded: {window:#?}");
+    assert_eq!(window[0].content, "m115", "oldest first within the window");
+    assert_eq!(window[4].content, "m119");
+    // Every windowed message carries exactly its own delivery row — no
+    // more, no less.
+    assert!(
+        window.iter().all(|message| message.deliveries.len() == 1),
+        "in-window deliveries are joined"
+    );
+
+    // The full-history endpoint is unchanged: every historical delivery
+    // is still served when explicitly requested.
+    let full = store.list_messages(&room).await.unwrap();
+    assert_eq!(full.len(), 120, "the unbounded list stays complete");
+    assert!(
+        full.iter().all(|message| message.deliveries.len() == 1),
+        "the full list keeps every delivery row"
+    );
+}
+
+///  (deletion side): a room's delivery tasks — claim rows and
+/// task rows — are cleaned for ALL current messages, so a deleted room
+/// can never keep pollable work alive.
+#[tokio::test]
+async fn delete_conversation_cleans_delivery_tasks_and_claims() {
+    let store = Store::open_in_memory("delete-tasks").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    let room = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+
+    let mut task_ids = Vec::new();
+    for n in 0..2 {
+        let outcome = store
+            .accept_message(
+                &room,
+                "operator",
+                &format!("key-{n}"),
+                &format!("work {n}"),
+                true,
+                &[wrkspc_core::RecipientRequest {
+                    peer_id: "codex".to_string(),
+                    execution_requested: true,
+                }],
+            )
+            .await
+            .unwrap();
+        let message_id = match outcome {
+            wrkspc_core::AcceptOutcome::Accepted { message_id } => message_id,
+            wrkspc_core::AcceptOutcome::Replay { .. } => panic!("expected Accepted"),
+        };
+        let task_id = store
+            .task_create_delivery(wrkspc_core::DeliveryTaskRequest {
+                recipient_host: "node-host",
+                recipient_peer: "codex",
+                recipient_name: "codex",
+                recipient_class: "harness",
+                message_id: &message_id,
+                origin_message_id: None,
+                conversation_id: &room,
+                sender_peer: "operator",
+                sender_name: "operator",
+                sender_class: "human",
+                sender_host: wrkspc_core::PILOT_HOST_ID,
+                content: &format!("work {n}"),
+                execution_requested: true,
+            })
+            .await
+            .unwrap();
+        // The node claims the delivery before the room is deleted.
+        assert!(matches!(
+            store
+                .claim_delivery(&task_id, "node-host", "instance-1")
+                .await
+                .unwrap(),
+            wrkspc_core::DeliveryClaimOutcome::Claimed
+        ));
+        task_ids.push(task_id);
+    }
+
+    assert!(
+        store.delete_conversation(&room).await.unwrap(),
+        "the room deletes"
+    );
+
+    // Every task for the deleted room is gone: the claim rows cannot
+    // survive without their task rows, and the task rows cannot
+    // survive the room.
+    for task_id in &task_ids {
+        let err = store
+            .claim_delivery(task_id, "node-host", "instance-1")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, wrkspc_core::StoreError::NotFound { .. }),
+            "task {task_id} must not outlive its room: {err:?}"
+        );
+    }
+}
+
+///  (deletion side): the deletion's dependency snapshot is
+/// gathered INSIDE the write-reserving transaction. A message committed
+/// while a deletion is in flight — its writer blocked on the database
+/// write lock the deletion now takes up front — is still cleaned: its
+/// delivery task cannot outlive the room as executable work.
+#[tokio::test]
+async fn delete_conversation_cleans_tasks_committed_while_it_holds_the_write_lock() {
+    use std::str::FromStr;
+
+    let path = common::temp_db_path();
+    let store = Store::open(&path, "delete-interleave").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    let room = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+
+    // One message and task committed before the deletion starts.
+    let outcome = store
+        .accept_message(
+            &room,
+            "operator",
+            "key-before",
+            "before",
+            false,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "codex".to_string(),
+                execution_requested: false,
+            }],
+        )
+        .await
+        .unwrap();
+    let message_before = match outcome {
+        wrkspc_core::AcceptOutcome::Accepted { message_id } => message_id,
+        wrkspc_core::AcceptOutcome::Replay { .. } => panic!("expected Accepted"),
+    };
+    store
+        .task_create_delivery(wrkspc_core::DeliveryTaskRequest {
+            recipient_host: "node-host",
+            recipient_peer: "codex",
+            recipient_name: "codex",
+            recipient_class: "harness",
+            message_id: &message_before,
+            origin_message_id: None,
+            conversation_id: &room,
+            sender_peer: "operator",
+            sender_name: "operator",
+            sender_class: "human",
+            sender_host: wrkspc_core::PILOT_HOST_ID,
+            content: "before",
+            execution_requested: false,
+        })
+        .await
+        .unwrap();
+    let task_before = wrkspc_core::tasks::delivery_task_id(&message_before, "codex");
+
+    // A second writer takes the database write lock and holds it while
+    // the deletion runs: the deletion blocks (at its first write — or,
+    // with the fix, at the write-reserving begin) until the holder
+    // commits.
+    let side = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                .unwrap()
+                .foreign_keys(true)
+                .busy_timeout(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    let mut hold = side.begin_with("BEGIN IMMEDIATE").await.unwrap();
+
+    let deleting = {
+        let store = store.clone();
+        let room = room.clone();
+        tokio::spawn(async move { store.delete_conversation(&room).await })
+    };
+
+    // The deletion is now blocked on the held write lock. Commit a NEW
+    // message and its delivery task from the lock holder — the fan-out
+    // racing the deletion.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let message_late = uuid::Uuid::new_v4().to_string();
+    let task_late = wrkspc_core::tasks::delivery_task_id(&message_late, "codex");
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO messages
+           (id, conversation_id, sender_id, idempotency_key, content,
+            execution_requested, created_at)
+         VALUES (?, ?, ?, 'late-key', 'late', 0, ?)",
+    )
+    .bind(&message_late)
+    .bind(&room)
+    .bind("operator")
+    .bind(&now)
+    .execute(&mut *hold)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO message_recipients (message_id, peer_id, delivery_state)
+         VALUES (?, 'codex', 'stored')",
+    )
+    .bind(&message_late)
+    .execute(&mut *hold)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO a2a_tasks
+           (task_id, context_id, state, terminal, task_json, version, created_at, updated_at)
+         VALUES (?, 'node-host', 'submitted', 0, ?, 1, ?, ?)",
+    )
+    .bind(&task_late)
+    .bind(format!(
+        "{{\"metadata\":{{\"delivery\":{{\"kind\":\"delivery\",\"message_id\":\"{message_late}\",\"recipient_peer\":\"codex\"}}}}}}"
+    ))
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *hold)
+    .await
+    .unwrap();
+    hold.commit().await.unwrap();
+
+    let deleted = deleting.await.unwrap().unwrap();
+    assert!(deleted, "the room deletes");
+
+    // Both tasks — the one committed before AND the one committed while
+    // the deletion was in flight — are gone, and so are the room's
+    // messages.
+    for task_id in [&task_before, &task_late] {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM a2a_tasks WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_one(&side)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "task {task_id} must not outlive its room");
+    }
+    let messages: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = ?")
+            .bind(&room)
+            .fetch_one(&side)
+            .await
+            .unwrap();
+    assert_eq!(messages, 0, "the room's messages are gone");
 }

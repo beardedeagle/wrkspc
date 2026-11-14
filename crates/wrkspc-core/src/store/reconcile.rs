@@ -17,7 +17,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// attempt does not exist or is not in the `unknown` state.
     pub async fn reconcile_unknown(
         &self,

@@ -11,7 +11,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn append_event(
         &self,
         conversation_id: &str,
@@ -69,7 +69,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn events_since(
         &self,
         conversation_id: &str,

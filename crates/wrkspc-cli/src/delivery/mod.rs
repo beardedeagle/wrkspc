@@ -27,9 +27,7 @@ pub(crate) struct DeliveryState {
 impl DeliveryState {
     /// Builds the route state.
     ///
-    /// # Arguments
-    ///
-    /// * `store` — the hub's shared store.
+    /// `store` is the hub's shared store.
     pub(crate) fn new(store: Store) -> Self {
         Self { store }
     }
@@ -81,9 +79,7 @@ pub(crate) struct DeliveryReport {
 
 /// Extracts the presenting host from the stamped identity header.
 ///
-/// # Arguments
-///
-/// * `headers` — the request headers.
+/// `headers` is the request headers.
 ///
 /// # Returns
 ///
@@ -104,10 +100,7 @@ pub(crate) fn stamped_host(headers: &HeaderMap) -> Result<String, (StatusCode, &
 /// Loads a delivery task row, enforcing the shared shape checks
 /// (existence + `metadata.delivery.kind == "delivery"`).
 ///
-/// # Arguments
-///
-/// * `store` — the hub store.
-/// * `task_id` — the task to load.
+/// `store` is the hub store; `task_id` is the task to load.
 ///
 /// # Returns
 ///

@@ -7,6 +7,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use wrkspc_core::store::MAX_DIRECTED_RECIPIENTS;
 use wrkspc_core::{CancelOutcome, FenceKind};
 
 /// Removes one member from a conversation (kick from the room). The peer
@@ -54,6 +55,15 @@ pub(crate) async fn post_message(
     // that is not a member rather than silently dropping it.
     let directed: Option<Vec<String>> = match body.recipients {
         Some(requested) => {
+            if requested.len() > MAX_DIRECTED_RECIPIENTS {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!(
+                        "too many recipients: {} (max {MAX_DIRECTED_RECIPIENTS})",
+                        requested.len()
+                    ) })),
+                ));
+            }
             let mut resolved = Vec::with_capacity(requested.len());
             for target in requested {
                 let peer_id = state
@@ -153,10 +163,16 @@ pub(crate) async fn post_message(
             // Hub mode: fan the operator's post out to recipients on
             // remote hosts as pollable delivery tasks.
             if state.queue_remote_deliveries {
-                let recipient_peers: Vec<String> = recipients
-                    .iter()
-                    .map(|recipient| recipient.peer_id.clone())
-                    .collect();
+                // Fan out from the COMMITTED routing, not the
+                // pre-resolution vector: a mention-only post resolves
+                // its recipients inside the store, and the original
+                // vector would queue nothing while core committed a
+                // recipient with execution requested.
+                let recipient_peers = state
+                    .store
+                    .message_recipients(&message_id)
+                    .await
+                    .map_err(store_error)?;
                 if let Err(error) = state
                     .store
                     .queue_remote_deliveries(wrkspc_core::RemoteFanoutRequest {

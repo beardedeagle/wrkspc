@@ -22,7 +22,7 @@ pub struct NodeRunArgs {
     /// Database file (created if absent).
     #[arg(long)]
     pub db: PathBuf,
-    /// Bindings TOML (one [[binding]] per harness peer).
+    /// Bindings TOML (one \[\[binding\]\] per harness peer).
     #[arg(long)]
     pub bindings: PathBuf,
     /// UI bind address (default 127.0.0.1:8081).
@@ -65,12 +65,11 @@ pub struct NodeRunArgs {
 }
 
 /// The node's keychain identity: `--node-name` when given, otherwise the
-/// host id (shortened to the bare hostname), otherwise `default`.
+/// host id (its certificate SAN, with the `.mtls.devlocal.home.arpa`
+/// suffix trimmed), otherwise `default`.
 ///
-/// # Arguments
-///
-/// * `node_name` — the explicit `--node-name` value.
-/// * `host_id` — the node's `--host-id` value.
+/// `node_name` is the explicit `--node-name` value; `host_id` is the
+/// node's `--host-id` value.
 fn node_identity(node_name: Option<&str>, host_id: Option<&str>) -> String {
     if let Some(name) = node_name.filter(|name| !name.is_empty()) {
         return name.to_string();
@@ -85,9 +84,7 @@ fn node_identity(node_name: Option<&str>, host_id: Option<&str>) -> String {
 
 /// Runs the pilot node until ctrl-c.
 ///
-/// # Arguments
-///
-/// * `args` — the parsed run arguments.
+/// Takes `args`, the parsed run arguments.
 ///
 /// # Errors
 ///

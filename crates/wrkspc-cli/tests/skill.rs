@@ -251,7 +251,9 @@ fn status_reports_unreadable_instead_of_missing() {
 }
 
 /// CU-04: installing through a symlinked SKILL leaf is refused and
-/// the link's target is untouched.
+/// the link's target is untouched. Unix-only: creating a symlink on
+/// Windows needs different std APIs and privileges.
+#[cfg(unix)]
 #[test]
 fn install_refuses_a_symlinked_skill_leaf() {
     let home = temp_home("symlink-leaf");
@@ -271,7 +273,9 @@ fn install_refuses_a_symlinked_skill_leaf() {
 }
 
 /// CU-04: uninstalling through a symlinked parent directory is
-/// refused, never followed.
+/// refused, never followed. Unix-only: symlink creation on Windows
+/// needs different std APIs and privileges.
+#[cfg(unix)]
 #[test]
 fn uninstall_refuses_a_symlinked_skill_directory() {
     let home = temp_home("symlink-dir");
@@ -351,6 +355,9 @@ async fn shared_skill_uninstall_is_refused_when_partial() {
 /// A pointer write that fails AFTER the skill copy succeeded rolls the
 /// copy back: an install must never persist a half-install (new skill,
 /// missing pointer). The prior skill content is restored byte-for-byte.
+/// Unix-only: the failure is induced with POSIX directory modes
+///.
+#[cfg(unix)]
 #[test]
 fn pointer_failure_rolls_the_skill_copy_back() {
     let home = temp_home("rollback");
@@ -373,4 +380,96 @@ fn pointer_failure_rolls_the_skill_copy_back() {
 
     // Restore permissions so cleanup can remove the scratch dir.
     std::fs::set_permissions(home.join(".codex"), std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// When the pointer write fails, the user's instruction
+/// file keeps its original bytes. The parent is made read-only so the
+/// temporary sibling cannot be created — a truncate-in-place write
+/// would have destroyed the existing file under the same failure; the
+/// atomic replace leaves it byte-for-byte intact (and rolls the skill
+/// copy back).
+#[cfg(unix)]
+#[test]
+fn failed_pointer_write_preserves_existing_instructions() {
+    let home = temp_home("preserve-install");
+    std::fs::create_dir_all(home.join(".codex/skills/wrkspc")).unwrap();
+    std::fs::write(home.join(".codex/AGENTS.md"), "# My notes\n\nkeep this\n").unwrap();
+    std::fs::write(
+        home.join(".codex/skills/wrkspc/SKILL.md"),
+        "user's own skill content",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(home.join(".codex"), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let error = skill::install(&home, entry("codex")).unwrap_err();
+    assert!(!error.to_string().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(home.join(".codex/AGENTS.md")).unwrap(),
+        "# My notes\n\nkeep this\n",
+        "the original instruction bytes must survive the failed write"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join(".codex/skills/wrkspc/SKILL.md")).unwrap(),
+        "user's own skill content",
+        "the prior skill copy must be restored by the rollback"
+    );
+
+    std::fs::set_permissions(home.join(".codex"), std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A failed UNINSTALL pointer write leaves the
+/// instructions byte-for-byte intact (the section still present).
+/// Unix-only: the failure is induced with POSIX directory modes.
+#[cfg(unix)]
+#[test]
+fn failed_uninstall_write_preserves_instructions() {
+    let home = temp_home("preserve-uninstall");
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(home.join(".codex/AGENTS.md"), "# My notes\n").unwrap();
+    skill::install(&home, entry("codex")).unwrap();
+    let before = std::fs::read_to_string(home.join(".codex/AGENTS.md")).unwrap();
+    assert!(
+        before.contains("WRKSPC_START"),
+        "test premise: section installed"
+    );
+
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(home.join(".codex"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let error = skill::uninstall(&home, entry("codex")).unwrap_err();
+    assert!(!error.to_string().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(home.join(".codex/AGENTS.md")).unwrap(),
+        before,
+        "the instruction bytes must survive the failed uninstall write"
+    );
+
+    std::fs::set_permissions(home.join(".codex"), std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A REFUSED install must not create anything outside
+/// home. With .claude symlinked to an external directory that lacks
+/// skills/wrkspc, the install is refused on the pre-create containment
+/// check — the external directory must not gain the missing
+/// directories. Unix-only: the escape is built with a symlink.
+#[cfg(unix)]
+#[test]
+fn refused_install_creates_nothing_outside_home() {
+    let home = temp_home("escape-install");
+    let outside = temp_home("escape-outside");
+    std::os::unix::fs::symlink(&outside, home.join(".claude")).unwrap();
+
+    let error = skill::install(&home, entry("claude-code")).unwrap_err();
+    assert!(
+        error.to_string().contains("resolves outside"),
+        "got: {error}"
+    );
+    assert!(
+        !outside.join("skills").exists(),
+        "the refused install must not create ANY of the missing tail"
+    );
+    assert!(
+        !outside.join("skills/wrkspc").exists(),
+        "the refused install must not create directories outside home"
+    );
 }

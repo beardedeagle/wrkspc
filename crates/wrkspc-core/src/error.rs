@@ -11,6 +11,12 @@ pub enum StoreError {
     #[error("idempotency conflict: key `{key}` was already used with different content")]
     IdempotencyConflict { key: String },
 
+    /// A recipient list exceeded the directed-post ceiling: the fence
+    /// holds for every acceptance path (operator UI and MCP), so one
+    /// post can never fan out into unbounded per-recipient work.
+    #[error("too many recipients: {count} (max {limit})")]
+    TooManyRecipients { limit: usize, count: usize },
+
     /// The referenced record does not exist.
     #[error("{entity} `{id}` not found")]
     NotFound { entity: &'static str, id: String },

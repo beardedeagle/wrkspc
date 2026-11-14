@@ -24,9 +24,7 @@ pub struct McpBridgeArgs {
 
 /// Serves the bridge over stdio until the parent closes the stream.
 ///
-/// # Arguments
-///
-/// * `args` — the bridge arguments.
+/// Takes `args`, the bridge arguments.
 ///
 /// # Errors
 ///

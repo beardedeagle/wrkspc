@@ -46,9 +46,7 @@ pub struct Delivery {
 impl Delivery {
     /// Parses a delivery from a hub task row's payload.
     ///
-    /// # Arguments
-    ///
-    /// * `task` — the hub task row.
+    /// `task` is the hub task row.
     ///
     /// # Returns
     ///
@@ -148,16 +146,13 @@ pub enum ClaimOutcome {
 /// after the ack, so a crash anywhere in the chain re-runs the whole
 /// delivery idempotently on the next poll.
 ///
-/// # Arguments
-///
-/// * `store` — the node's local store.
-/// * `host_id` — this node's host id (its certificate SAN); the
-///   recipient peer is enrolled on it.
-/// * `tasks` — the hub's delivery task rows for this host.
-/// * `claim` — the claim callback (`POST /delivery-claim` over the
-///   mTLS client); returns the hub's claim verdict.
-/// * `ack` — the ack callback (`POST /delivery-ack` over the mTLS
-///   client); returns `true` on success.
+/// `store` is the node's local store; `host_id` is this node's host id
+/// (its certificate SAN), the host the recipient peer is enrolled on;
+/// `tasks` is the hub's delivery task rows for this host; `claim` is
+/// the claim callback (`POST /delivery-claim` over the mTLS client)
+/// returning the hub's claim verdict; `ack` is the ack callback
+/// (`POST /delivery-ack` over the mTLS client) returning `true` on
+/// success.
 ///
 /// # Returns
 ///

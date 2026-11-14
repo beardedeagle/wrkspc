@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::Path;
-use wrkspc_cli::util::{canonical_db_path, stable_token};
+use wrkspc_cli::util::{canonical_db_path, stable_token, stable_token_sync};
 
 /// A scratch directory per test, removed on drop.
 struct Scratch {
@@ -52,6 +52,9 @@ async fn empty_existing_token_file_is_an_error() {
 }
 
 /// CU-02: a symlinked sidecar is refused, and its target is untouched.
+/// Unix-only: symlink creation on Windows needs different std APIs and
+/// privileges.
+#[cfg(unix)]
 #[tokio::test]
 async fn symlinked_token_file_is_refused_and_its_target_untouched() {
     let scratch = Scratch::new("symlink");
@@ -70,29 +73,44 @@ async fn symlinked_token_file_is_refused_and_its_target_untouched() {
     );
 }
 
-/// CU-02: creation is exclusive and stable — concurrent first-callers
-/// all receive the SAME token value.
-#[tokio::test]
-async fn concurrent_first_callers_agree_on_one_token() {
-    let scratch = Scratch::new("concurrent");
-    let db = scratch.join("node.db");
-    let mut handles = Vec::new();
-    for _ in 0..16 {
-        let db = db.clone();
-        handles.push(tokio::spawn(async move {
-            stable_token(&db, "ui-token").await.unwrap()
-        }));
+/// CU-02: creation is exclusive and stable under REAL concurrent
+/// publication — first-callers on separate OS threads all receive the
+/// SAME token value even while the winner is mid-write.
+/// The previous version spawned onto the single-threaded test runtime
+/// and, with no await point inside the token path, ran every caller
+/// sequentially — the create→write publication window was never
+/// exercised. Each round uses a fresh scratch dir so the create race
+/// repeats.
+#[test]
+fn concurrent_first_callers_agree_on_one_token() {
+    for round in 0..8 {
+        let scratch = Scratch::new(&format!("concurrent-{round}"));
+        let db = scratch.join("node.db");
+        let mut tokens = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..16 {
+                let db = db.clone();
+                handles.push(scope.spawn(move || stable_token_sync(&db, "ui-token")));
+            }
+            for handle in handles {
+                tokens.push(handle.join().expect("token thread panicked"));
+            }
+        });
+        let mut tokens: Vec<String> = tokens
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|error| panic!("every caller must succeed: {error}"))
+            })
+            .collect();
+        tokens.sort();
+        tokens.dedup();
+        assert_eq!(
+            tokens.len(),
+            1,
+            "every caller must agree on one value: {tokens:?}"
+        );
     }
-    let mut values = Vec::new();
-    for handle in handles {
-        values.push(handle.await.unwrap());
-    }
-    values.dedup();
-    assert_eq!(
-        values.len(),
-        1,
-        "every caller must agree on one value: {values:?}"
-    );
 }
 
 /// CU-02: a permissive existing token file is tightened to 0600
@@ -123,7 +141,9 @@ async fn permissive_existing_token_is_tightened_not_rotated() {
 
 /// CU-10: the same database reached through a symlink alias maps to
 /// the SAME canonical path, so sidecar keys and instance identity do
-/// not change across restarts.
+/// not change across restarts. Unix-only: symlink creation on Windows
+/// needs different std APIs and privileges.
+#[cfg(unix)]
 #[test]
 fn canonical_path_resolves_final_component_aliases() {
     let scratch = Scratch::new("canonical");
@@ -159,4 +179,32 @@ fn canonical_path_resolves_the_parent_of_a_new_database() {
     );
     let _ = db;
     let _ = Path::new("");
+}
+
+/// On Windows, a created token file must carry an
+/// owner-only, non-inherited DACL, and a pre-existing token file is
+/// tightened to the same before its value is used — the Windows
+/// equivalent of the Unix 0600 assertion above (which does not
+/// exercise DACLs).
+#[cfg(windows)]
+#[test]
+fn windows_token_files_carry_owner_only_acls() {
+    let scratch = Scratch::new("acl-create");
+    let db = scratch.join("node.db");
+    let token = stable_token_sync(&db, "ui-token").unwrap();
+    assert!(!token.is_empty());
+    assert!(
+        wrkspc_cli::util::token_acl_is_owner_only(&scratch.join("node.db.ui-token")).unwrap(),
+        "a created token file must grant access to the owner alone"
+    );
+
+    let scratch = Scratch::new("acl-tighten");
+    let db = scratch.join("node.db");
+    std::fs::write(scratch.join("node.db.ui-token"), "existing-value").unwrap();
+    let read_back = stable_token_sync(&db, "ui-token").unwrap();
+    assert_eq!(read_back, "existing-value", "the value must not change");
+    assert!(
+        wrkspc_cli::util::token_acl_is_owner_only(&scratch.join("node.db.ui-token")).unwrap(),
+        "a pre-existing token file must be tightened to owner-only before use"
+    );
 }
