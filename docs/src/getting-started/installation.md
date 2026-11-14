@@ -108,3 +108,32 @@ Any machine that can reach the hub over TLS can run a node: install
 the binary, enroll with hub-issued certificate material, and bind its
 harnesses. The node dials the hub; no inbound port on the node is
 required for conversation flow.
+
+## Removing wrkspc
+
+The installers write only into user scope — the binary, the share
+directory, and the harness files — and start no services, so removal
+is deletion of your own files:
+
+```console
+# macOS / Linux (defaults; use your WRKSPC_INSTALL_DIR and share path)
+$ wrkspc skill uninstall          # removes the harness pointers
+$ rm ~/.local/bin/wrkspc
+$ rm -rf ~/.local/share/wrkspc    # store, PKI, bindings.toml
+```
+
+Windows (PowerShell) is the same three steps: `wrkspc skill uninstall`,
+delete the installed `wrkspc.exe` (`%LOCALAPPDATA%\wrkspc\bin` by
+default), and delete the share directory (`%LOCALAPPDATA%\wrkspc` by
+default). The owner-only permissions the installer applies to keys and
+tokens grant their owner full control — they make the material
+unreadable by *other* users, never undeletable by the user who
+installed it. A hub that was stood up from a container is removed by
+removing the container and its volume.
+
+Nodes supervised by launchd or systemd under your own user account
+remove like any user service: unload the unit, then delete the files.
+A peer enrolled with a hub additionally holds a certificate the hub
+may still accept: `DELETE /api/peers/{id}` forgets the peer, and a ban
+revokes its certificate serial for cases where forgetting is not
+enough.
