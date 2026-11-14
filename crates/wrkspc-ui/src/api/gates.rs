@@ -163,10 +163,16 @@ pub(crate) async fn post_message(
             // Hub mode: fan the operator's post out to recipients on
             // remote hosts as pollable delivery tasks.
             if state.queue_remote_deliveries {
-                let recipient_peers: Vec<String> = recipients
-                    .iter()
-                    .map(|recipient| recipient.peer_id.clone())
-                    .collect();
+                // Fan out from the COMMITTED routing, not the
+                // pre-resolution vector: a mention-only post resolves
+                // its recipients inside the store, and the original
+                // vector would queue nothing while core committed a
+                // recipient with execution requested (WRKSPC-003).
+                let recipient_peers = state
+                    .store
+                    .message_recipients(&message_id)
+                    .await
+                    .map_err(store_error)?;
                 if let Err(error) = state
                     .store
                     .queue_remote_deliveries(wrkspc_core::RemoteFanoutRequest {

@@ -503,3 +503,61 @@ async fn oversized_fanout_room_post_is_refused_with_400() {
     );
     let _ = ui.shutdown.send(());
 }
+
+/// A mention-only operator post on the hub fans out from the COMMITTED
+/// routing: the member the mention resolves to gets a pollable remote
+/// delivery even though the request named no recipients (WRKSPC-003).
+#[tokio::test]
+async fn hub_mention_only_post_fans_out_from_committed_routing() {
+    let ui = spawn_ui_hub().await;
+    // A member on a REMOTE host: the pilot-host skip in
+    // queue_remote_deliveries would mask the fan-out for a local peer.
+    ui.store
+        .ensure_peer_on_host("remote-agent", "Remote Agent", "harness", "remote-host-7")
+        .await
+        .unwrap();
+    let conversation_id = ui
+        .store
+        .create_conversation(&["operator", "remote-agent"])
+        .await
+        .unwrap();
+
+    let res = ui
+        .client()
+        .post(format!(
+            "{}/api/conversations/{conversation_id}/messages",
+            ui.base
+        ))
+        .bearer_auth(TOKEN)
+        .json(&serde_json::json!({
+            "content": "@remote-agent please review",
+            "recipients": []
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let message_id = res.json::<serde_json::Value>().await.unwrap()["message_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The mention resolved to the remote member in the committed
+    // routing, and the hub queued exactly one delivery task for it.
+    assert_eq!(
+        ui.store.message_recipients(&message_id).await.unwrap(),
+        vec!["remote-agent".to_string()]
+    );
+    // Delivery tasks are filed under the RECIPIENT HOST's queue.
+    let (tasks, _total) = ui
+        .store
+        .task_list(Some("remote-host-7"), None, None, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        tasks.len(),
+        1,
+        "the mention-resolved member gets a pollable delivery task"
+    );
+    let _ = ui.shutdown.send(());
+}
