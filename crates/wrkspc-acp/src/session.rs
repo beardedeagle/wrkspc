@@ -303,6 +303,16 @@ async fn run_session_loop(connection: ConnectionTo<Agent>, mut cmd_rx: mpsc::Rec
 
     loop {
         tokio::select! {
+            // The SDK resolves incoming_closed on clean EOF — the
+            // adapter child exiting closes its stdout even when no
+            // request is in flight. Observing it here is the SDK's
+            // documented pattern for main_fn in connect_with mode;
+            // without it a dead cached adapter stays connected in
+            // presence (decls) until a command or eviction touches it.
+            _ = connection.incoming_closed() => {
+                tracing::info!("ACP adapter connection closed; ending the session loop");
+                break;
+            }
             _ = async {
                 if let Some(rx) = &mut done_rx {
                     let _ = rx.await;
