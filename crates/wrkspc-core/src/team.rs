@@ -196,8 +196,8 @@ impl Store {
     /// Returns [`StoreError::Db`] on failure.
     pub async fn repair_remote_fanout(&self, local_host: &str) -> Result<usize> {
         let rows = sqlx::query(
-            "SELECT m.id AS message_id, m.conversation_id, m.sender_id, m.content,
-                    m.execution_requested, r.peer_id,
+            "SELECT m.id AS message_id, m.idempotency_key, m.conversation_id,
+                    m.sender_id, m.content, m.execution_requested, r.peer_id,
                     p.name AS recipient_name, p.class AS recipient_class,
                     p.host_id AS recipient_host
              FROM message_recipients r
@@ -233,6 +233,19 @@ impl Store {
                 entity: "peer",
                 id: sender_peer.clone(),
             })?;
+            // The sender wire-message identity survives in
+            // `messages.idempotency_key` for node-originated sends (the
+            // A2A acceptance key IS the node's wire message id). A
+            // repaired envelope must carry it so a co-hosted echo maps
+            // back onto the original local row instead of minting a
+            // second message and execution intent — the normal fan-out
+            // forwards it explicitly and the repair must not degrade
+            // to the hub-derived id. Hub-local senders (the operator
+            // UI) have no node-side origin: their key is a fresh
+            // acceptance id, not a wire identity, and must not ride as
+            // the origin.
+            let origin_message_id =
+                (sender_host != local_host).then(|| row.get::<String, _>("idempotency_key"));
             let recipient_host: String = row.get("recipient_host");
             let recipient_name: String = row.get("recipient_name");
             let recipient_class: String = row.get("recipient_class");
@@ -245,7 +258,7 @@ impl Store {
                 recipient_name: &recipient_name,
                 recipient_class: &recipient_class,
                 message_id: &message_id,
-                origin_message_id: None,
+                origin_message_id: origin_message_id.as_deref(),
                 conversation_id: &conversation_id,
                 sender_peer: &sender_peer,
                 sender_name: &sender_name,
@@ -294,6 +307,15 @@ impl Store {
     /// delivery-task row qualify — those are hub-originated deliveries;
     /// node-local messages have no such row and are never reported.
     ///
+    /// The mirrored task is identified through the durable mapping the
+    /// mirror wrote: when a node processes a delivery it records a
+    /// processed marker — a local `a2a_tasks` row under the HUB task
+    /// id whose payload still carries the hub delivery envelope. The
+    /// hub task id is therefore read from that marker, never
+    /// recomputed from the local message id: mirroring allocates a
+    /// fresh local `messages.id`, so a recomputed id would differ from
+    /// the hub's and every outcome would be silently dropped.
+    ///
     /// # Returns
     ///
     /// The pending reports in completion order (oldest first).
@@ -302,9 +324,58 @@ impl Store {
     ///
     /// Returns [`StoreError::Db`] on failure.
     pub async fn hub_pending_outcomes(&self) -> Result<Vec<AttemptOutcomeReport>> {
+        // The processed markers: one local row per mirrored delivery,
+        // keyed by the hub task id, with the hub envelope still in the
+        // payload. The envelope names the accept key the mirror used —
+        // the origin when the delivery echoed a node-propagated
+        // message (matching the original local `messages.id`), the hub
+        // message id otherwise (matching the local row's
+        // `idempotency_key`).
+        let marker_rows =
+            sqlx::query("SELECT task_id, task_json FROM a2a_tasks WHERE terminal = 1")
+                .fetch_all(self.pool())
+                .await?;
+        let mut mirrored: std::collections::HashMap<(String, String, String), String> =
+            std::collections::HashMap::new();
+        for row in marker_rows {
+            let task_id: String = row.get("task_id");
+            let task_json: String = row.get("task_json");
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&task_json) else {
+                continue;
+            };
+            let Some(delivery) = payload
+                .get("metadata")
+                .and_then(|metadata| metadata.get("delivery"))
+            else {
+                continue;
+            };
+            if delivery.get("kind").and_then(|kind| kind.as_str()) != Some("delivery") {
+                continue;
+            }
+            let (Some(hub_message_id), Some(recipient_peer), Some(conversation_id)) = (
+                delivery.get("message_id").and_then(|v| v.as_str()),
+                delivery.get("recipient_peer").and_then(|v| v.as_str()),
+                delivery.get("conversation_id").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let accept_key = delivery
+                .get("origin_message_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(hub_message_id);
+            mirrored.insert(
+                (
+                    conversation_id.to_string(),
+                    accept_key.to_string(),
+                    recipient_peer.to_string(),
+                ),
+                task_id,
+            );
+        }
         let rows = sqlx::query(
             "SELECT a.id AS attempt_id, a.state,
-                    i.message_id, i.recipient_id, m.conversation_id
+                    i.message_id, i.recipient_id,
+                    m.conversation_id, m.idempotency_key
              FROM attempts a
              JOIN execution_intents i ON i.id = a.intent_id
              JOIN messages m ON m.id = i.message_id
@@ -317,24 +388,37 @@ impl Store {
         let mut reports = Vec::with_capacity(rows.len());
         for row in rows {
             let message_id: String = row.get("message_id");
+            let idempotency_key: String = row.get("idempotency_key");
+            let conversation_id: String = row.get("conversation_id");
             let recipient_peer: String = row.get("recipient_id");
-            let task_id = crate::tasks::delivery_task_id(&message_id, &recipient_peer);
-            let mirrored: Option<i64> =
-                sqlx::query_scalar("SELECT 1 FROM a2a_tasks WHERE task_id = ?")
-                    .bind(&task_id)
-                    .fetch_optional(self.pool())
-                    .await?;
-            if mirrored.is_none() {
+            // An echoed delivery replays the ORIGINAL local row (its
+            // id equals the envelope origin); a hub-originated
+            // delivery mirrors under the hub message id, recorded as
+            // the row's idempotency key.
+            let Some(task_id) = mirrored
+                .get(&(
+                    conversation_id.clone(),
+                    message_id.clone(),
+                    recipient_peer.clone(),
+                ))
+                .or_else(|| {
+                    mirrored.get(&(
+                        conversation_id.clone(),
+                        idempotency_key.clone(),
+                        recipient_peer.clone(),
+                    ))
+                })
+            else {
                 // A local message: no hub delivery task exists to
                 // report against.
                 continue;
-            }
+            };
             reports.push(AttemptOutcomeReport {
                 attempt_id: row.get("attempt_id"),
-                task_id,
+                task_id: task_id.clone(),
                 message_id,
                 recipient_peer,
-                conversation_id: row.get("conversation_id"),
+                conversation_id,
                 state: row.get("state"),
             });
         }
@@ -366,9 +450,17 @@ impl Store {
     /// a re-report refreshes the reason and timestamp but preserves any
     /// queued operator decision.
     ///
+    /// The mirror is OWNED by the (task, host) tuple the reporting node
+    /// presented: a re-report whose attempt id already exists under a
+    /// DIFFERENT task or host is a conflicting ownership claim and is
+    /// rejected without modifying the stored row — a node can never
+    /// overwrite another host's mirror by reusing its attempt id.
+    ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`] on failure.
+    /// Returns [`StoreError::AlreadyExists`] when the attempt id
+    /// belongs to another task/host, and [`StoreError::Db`] on
+    /// failure.
     pub async fn record_hub_unknown(
         &self,
         attempt_id: &str,
@@ -379,14 +471,16 @@ impl Store {
         stop_reason: &str,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO hub_unknown_attempts
                (attempt_id, task_id, host_id, recipient_id, conversation_id,
                 stop_reason, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(attempt_id) DO UPDATE SET
                 stop_reason = excluded.stop_reason,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at
+             WHERE hub_unknown_attempts.task_id = excluded.task_id
+               AND hub_unknown_attempts.host_id = excluded.host_id",
         )
         .bind(attempt_id)
         .bind(task_id)
@@ -398,6 +492,14 @@ impl Store {
         .bind(&now)
         .execute(self.pool())
         .await?;
+        if result.rows_affected() == 0 {
+            // The conflict's ownership guard rejected the update: this
+            // attempt id exists under another (task, host) tuple.
+            return Err(StoreError::AlreadyExists {
+                entity: "hub unknown attempt",
+                id: attempt_id.to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -484,15 +586,81 @@ impl Store {
     /// Consumes the mirror row once the node reports the final terminal
     /// state (the reconciliation is complete).
     ///
+    /// Scoped to the (attempt, task, host) tuple the node presented
+    /// with its terminal report: a report can only consume the mirror
+    /// owned by its own authorized task and host, never another
+    /// host's unresolved row that happens to reuse the attempt id.
+    ///
+    /// # Returns
+    ///
+    /// `true` when a matching mirror row was consumed.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Db`] on failure.
-    pub async fn consume_hub_unknown(&self, attempt_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM hub_unknown_attempts WHERE attempt_id = ?")
-            .bind(attempt_id)
-            .execute(self.pool())
+    pub async fn consume_hub_unknown(
+        &self,
+        attempt_id: &str,
+        task_id: &str,
+        host_id: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "DELETE FROM hub_unknown_attempts
+             WHERE attempt_id = ? AND task_id = ? AND host_id = ?",
+        )
+        .bind(attempt_id)
+        .bind(task_id)
+        .bind(host_id)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Marks guidance entries delivered ONLY when they belong to the
+    /// validated conversation — the delivery-report guidance ack
+    /// boundary (WRKSPC-018).
+    ///
+    /// The delivery-report route authorizes one delivery (task,
+    /// conversation); a client-supplied guidance id from another
+    /// conversation must never be acknowledged by it. This scoped
+    /// update ignores foreign ids without modifying them: rows outside
+    /// the conversation keep their pending state and claimed attempt.
+    ///
+    /// * `conversation_id` — the validated conversation of the
+    ///   reported task.
+    /// * `ids` — the client-supplied guidance ids to acknowledge.
+    ///
+    /// # Returns
+    ///
+    /// The number of rows actually marked delivered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`] on failure.
+    pub async fn mark_guidance_delivered_scoped(
+        &self,
+        conversation_id: &str,
+        ids: &[&str],
+    ) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool().begin().await?;
+        let mut marked = 0;
+        for id in ids {
+            let result = sqlx::query(
+                "UPDATE guidance
+                 SET delivered = 1, claimed_attempt = NULL
+                 WHERE id = ? AND conversation_id = ?",
+            )
+            .bind(id)
+            .bind(conversation_id)
+            .execute(&mut *tx)
             .await?;
-        Ok(())
+            marked += result.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(marked as usize)
     }
 }
 

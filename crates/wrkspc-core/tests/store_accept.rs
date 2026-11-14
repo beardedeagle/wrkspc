@@ -883,8 +883,15 @@ async fn hub_unknown_mirror_round_trip() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].decision.as_deref(), Some("close:failed"));
 
-    // The terminal report consumes the mirror.
-    store.consume_hub_unknown("att-1").await.unwrap();
+    // The terminal report consumes the mirror, scoped to the (attempt,
+    // task, host) tuple the reporting node presented.
+    assert!(
+        store
+            .consume_hub_unknown("att-1", "task-1", "node-host")
+            .await
+            .unwrap(),
+        "the owned mirror row is consumed"
+    );
     assert!(store.hub_unknowns().await.unwrap().is_empty());
     assert!(
         !store
@@ -1009,4 +1016,381 @@ async fn replay_deduplicates_repeated_peer_ids_in_the_count() {
         .await
         .expect("a deduplicated replay at exactly the cap must pass");
     assert!(matches!(outcome, AcceptOutcome::Replay { .. }));
+}
+
+/// WRKSPC-001: deleting a conversation after a hub-originated delivery
+/// reported its terminal outcome must not trip the outcome ledger's
+/// foreign key — the room's `hub_outcome_reports` rows go with its
+/// attempts, and other rooms' ledgers are untouched.
+#[tokio::test]
+async fn delete_conversation_succeeds_after_a_reported_outcome() {
+    let store = Store::open_in_memory("reported-outcome").await.unwrap();
+    let (operator, agent, conversation) = seeded(&store).await;
+    let second = store
+        .create_conversation(&[&operator, &agent])
+        .await
+        .unwrap();
+
+    // Each room: an executable message, a claimed attempt that reaches a
+    // terminal state, and an outcome report written to the hub ledger —
+    // the normal node-side outcome-reporting lifecycle.
+    let mut second_message = None;
+    for room in [&conversation, &second] {
+        let AcceptOutcome::Accepted { message_id } = store
+            .accept_message(
+                room,
+                &operator,
+                &key(),
+                "run this",
+                true,
+                &[RecipientRequest {
+                    peer_id: agent.clone(),
+                    execution_requested: true,
+                }],
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Accepted");
+        };
+        let attempt = store.claim_intent(&message_id, &agent).await.unwrap();
+        store
+            .mark_terminal(&attempt, AttemptState::Completed, Some("end_turn"), None)
+            .await
+            .unwrap();
+        store
+            .mark_outcome_reported(
+                &attempt,
+                &wrkspc_core::tasks::delivery_task_id(&message_id, &agent),
+            )
+            .await
+            .unwrap();
+        if room == &second {
+            second_message = Some(message_id);
+        }
+    }
+
+    // Deleting the first room succeeds: its ledger rows were deleted
+    // with its attempts (the FK would otherwise fail the delete).
+    assert!(
+        store.delete_conversation(&conversation).await.unwrap(),
+        "deleting a conversation with a reported outcome must succeed"
+    );
+    assert!(
+        store
+            .conversation_members(&conversation)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the deleted room's membership is gone"
+    );
+
+    // The surviving room's attempt — and, via the foreign key, its
+    // ledger row — is untouched and still deletes cleanly.
+    let err = store
+        .claim_intent(second_message.as_deref().expect("second message"), &agent)
+        .await
+        .expect_err("the surviving room's intent is still terminal");
+    assert!(
+        matches!(err, StoreError::IntentTerminal { .. }),
+        "the surviving room's terminal attempt is untouched: {err:?}"
+    );
+    assert!(
+        store.delete_conversation(&second).await.unwrap(),
+        "the surviving room still deletes cleanly"
+    );
+}
+
+/// WRKSPC-002 (canonical precedence): a mention that collides with
+/// another member's alias still routes to the member whose canonical id
+/// matches — once a client holds an id, it must never re-resolve as
+/// somebody else's alias (UI-04, the resolve_peer_ref contract).
+#[tokio::test]
+async fn mention_resolution_prefers_the_canonical_id_over_an_alias() {
+    let store = Store::open_in_memory("mention-id-wins").await.unwrap();
+    let (operator, codex, kestrel, conversation) = room(&store).await;
+    // `kestrel` takes the alias `codex` — legal today (the alias setter
+    // does not check collisions) — but @codex must still wake the peer
+    // whose id IS codex, not whichever row the query returns first.
+    store
+        .set_peer_alias(&kestrel, Some("codex"), "operator")
+        .await
+        .unwrap();
+
+    let outcome = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &key(),
+            "@codex please run this",
+            true,
+            &[],
+        )
+        .await
+        .unwrap();
+    let message_id = match outcome {
+        AcceptOutcome::Accepted { message_id } | AcceptOutcome::Replay { message_id } => message_id,
+    };
+
+    assert_eq!(
+        store.message_recipients(&message_id).await.unwrap(),
+        vec![codex.clone()],
+        "the canonical id wins over a colliding alias"
+    );
+    assert!(
+        store.claim_intent(&message_id, &codex).await.is_ok(),
+        "the canonical peer's intent is claimable"
+    );
+    assert!(
+        store.claim_intent(&message_id, &kestrel).await.is_err(),
+        "no intent may exist for the alias-holder"
+    );
+}
+
+/// WRKSPC-002 (ambiguity): a mention matching more than one member's
+/// alias or display name is refused with AmbiguousPeerRef — routing
+/// fails closed instead of guessing by row order — and nothing commits.
+#[tokio::test]
+async fn ambiguous_mentions_fail_closed() {
+    let store = Store::open_in_memory("mention-ambiguous").await.unwrap();
+    let (operator, codex, kestrel, conversation) = room(&store).await;
+
+    // Two members share one alias.
+    store
+        .set_peer_alias(&codex, Some("shared-alias"), "operator")
+        .await
+        .unwrap();
+    store
+        .set_peer_alias(&kestrel, Some("shared-alias"), "operator")
+        .await
+        .unwrap();
+    let err = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &key(),
+            "@shared-alias go",
+            true,
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::AmbiguousPeerRef { .. }),
+        "a shared alias must fail closed: {err:?}"
+    );
+
+    // A shared display name is just as ambiguous.
+    store
+        .ensure_peer("twin-a", "twin", "harness")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("twin-b", "twin", "harness")
+        .await
+        .unwrap();
+    let second = store
+        .create_conversation(&[&operator, "twin-a", "twin-b"])
+        .await
+        .unwrap();
+    let err = store
+        .accept_message(&second, &operator, &key(), "@twin go", true, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::AmbiguousPeerRef { .. }),
+        "a shared display name must fail closed: {err:?}"
+    );
+
+    // Nothing committed for either refused post.
+    assert!(
+        store.list_messages(&conversation).await.unwrap().is_empty(),
+        "a refused mention must not commit a message"
+    );
+    assert!(
+        store.list_messages(&second).await.unwrap().is_empty(),
+        "a refused mention must not commit a message"
+    );
+}
+
+/// WRKSPC-003 (store contract): an empty explicit recipient list is
+/// mention-inference at fresh acceptance, and the COMMITTED recipient
+/// set is the only routing record a hub fan-out may read. The hub UI's
+/// operator post must fan out from `message_recipients` after
+/// acceptance — never from its pre-resolution request list, which is
+/// empty here and would queue no remote delivery for the woken peer.
+#[tokio::test]
+async fn mention_only_posts_commit_recipients_for_fanout_to_read() {
+    let store = Store::open_in_memory("mention-committed").await.unwrap();
+    let (operator, codex, _, conversation) = room(&store).await;
+
+    let outcome = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &key(),
+            "@codex please review",
+            true,
+            &[],
+        )
+        .await
+        .unwrap();
+    let message_id = match outcome {
+        AcceptOutcome::Accepted { message_id } | AcceptOutcome::Replay { message_id } => message_id,
+    };
+
+    // The committed recipient set the hub fan-out must read.
+    assert_eq!(
+        store.message_recipients(&message_id).await.unwrap(),
+        vec![codex.clone()]
+    );
+    // The execution intent exists for the same committed peer.
+    assert!(
+        store.claim_intent(&message_id, &codex).await.is_ok(),
+        "the committed mention recipient's intent is claimable"
+    );
+}
+
+/// WRKSPC-015 (store side): an explicitly supplied empty recipient list
+/// is AUTHORITATIVE on the committed-routing path — the body is never
+/// re-resolved for @mentions, so a node that committed zero recipients
+/// wakes nobody at the hub even when the mention resolves there.
+#[tokio::test]
+async fn committed_empty_recipients_stay_empty_at_the_hub() {
+    let store = Store::open_in_memory("committed-empty").await.unwrap();
+    let (operator, _codex, kestrel, conversation) = room(&store).await;
+
+    let outcome = store
+        .accept_message_committed_routing(
+            &conversation,
+            &operator,
+            &key(),
+            "@kestrel please review",
+            true,
+            &[],
+        )
+        .await
+        .unwrap();
+    let message_id = match outcome {
+        AcceptOutcome::Accepted { message_id } | AcceptOutcome::Replay { message_id } => message_id,
+    };
+
+    // The frozen routing: no recipients, no intents.
+    assert!(
+        store
+            .message_recipients(&message_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an explicit empty committed list must stay empty at the hub"
+    );
+    assert!(
+        store.claim_intent(&message_id, &kestrel).await.is_err(),
+        "no execution intent may exist for the un-routed peer"
+    );
+
+    // Contrast: the same post through the fresh-caller path DOES resolve
+    // the mention — the mention is hub-resolvable, so the empty routing
+    // is what held, not a resolution failure.
+    let outcome = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &key(),
+            "@kestrel please review",
+            true,
+            &[],
+        )
+        .await
+        .unwrap();
+    let message_id = match outcome {
+        AcceptOutcome::Accepted { message_id } | AcceptOutcome::Replay { message_id } => message_id,
+    };
+    assert_eq!(
+        store.message_recipients(&message_id).await.unwrap(),
+        vec![kestrel.clone()],
+        "the fresh-caller path still infers mentions"
+    );
+}
+
+/// WRKSPC-024: the message-level execution flag is authority too — a
+/// replay that omits recipients (or names them without the per-recipient
+/// flag) but sets execution_requested=true must be refused for a
+/// mail-only message, or the caller's fan-out would queue executable
+/// work the original acceptance never granted.
+#[tokio::test]
+async fn replay_cannot_escalate_mail_only_with_the_global_flag() {
+    let store = Store::open_in_memory("mail-only-global").await.unwrap();
+    let (operator, agent, conversation) = seeded(&store).await;
+    let idem = key();
+
+    // Mail-only acceptance with a committed recipient: the supported
+    // partial-fan-out window (the message has recipients; a remote
+    // delivery task was not yet created).
+    store
+        .accept_message(
+            &conversation,
+            &operator,
+            &idem,
+            "mail only",
+            false,
+            &[RecipientRequest {
+                peer_id: agent.clone(),
+                execution_requested: false,
+            }],
+        )
+        .await
+        .unwrap();
+
+    // Empty-recipient replay carrying the global flag: refused.
+    let replay = store
+        .accept_message(&conversation, &operator, &idem, "mail only", true, &[])
+        .await;
+    assert!(
+        matches!(replay, Err(StoreError::ExecutionAuthorityConflict { .. })),
+        "a mail-only replay with the global execution flag must be refused: {replay:?}"
+    );
+
+    // A recipient re-ack with the per-recipient flag clear but the
+    // global flag set: refused the same way.
+    let replay = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &idem,
+            "mail only",
+            true,
+            &[RecipientRequest {
+                peer_id: agent.clone(),
+                execution_requested: false,
+            }],
+        )
+        .await;
+    assert!(
+        matches!(replay, Err(StoreError::ExecutionAuthorityConflict { .. })),
+        "a mail-only replay must not smuggle authority through the global flag: {replay:?}"
+    );
+
+    // The benign re-ack (no execution anywhere) still passes: the
+    // per-recipient delivery loop depends on it.
+    let outcome = store
+        .accept_message(
+            &conversation,
+            &operator,
+            &idem,
+            "mail only",
+            false,
+            &[RecipientRequest {
+                peer_id: agent.clone(),
+                execution_requested: false,
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, AcceptOutcome::Replay { .. }));
+
+    assert!(
+        store.due_intents().await.unwrap().is_empty(),
+        "no intent may exist for the mail-only message"
+    );
 }

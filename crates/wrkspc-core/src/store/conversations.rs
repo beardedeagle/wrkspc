@@ -191,20 +191,33 @@ impl Store {
     ///
     /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn delete_conversation(&self, conversation_id: &str) -> Result<bool> {
-        // Existence FIRST: a nonexistent id deletes nothing, so a host
-        // id string can never be mistaken for a room and wipe that
-        // host's delivery queue.
+        // The deletion is a read-modify-write path: the dependency
+        // snapshot (the room's message/recipient pairs) must be gathered
+        // UNDER the same write-reserving transaction that deletes the
+        // rows. A snapshot taken before the transaction can miss a
+        // message committed in between, and that message's delivery task
+        // would then outlive the room as pollable, executable work. BEGIN
+        // IMMEDIATE takes the write lock up front (see set_peer_alias
+        // for the shared rationale): a concurrent acceptance either
+        // commits before the snapshot — and is cleaned here — or starts
+        // after the room row is gone and fails on the conversation
+        // foreign key.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // Existence FIRST, inside the transaction: a nonexistent id
+        // deletes nothing, so a host id string can never be mistaken
+        // for a room and wipe that host's delivery queue.
         let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM conversations WHERE id = ?")
             .bind(conversation_id)
-            .fetch_optional(self.pool())
+            .fetch_optional(&mut *tx)
             .await?;
         if exists.is_none() {
+            tx.rollback().await?;
             return Ok(false);
         }
 
         // The room's delivery-task ids: deterministic for current rows
         // and envelope-matched for legacy random-id rows — both keyed
-        // on the conversation's committed message ids.
+        // on the conversation's CURRENT committed message ids.
         let pairs: Vec<(String, String)> = sqlx::query(
             "SELECT r.message_id, r.peer_id
              FROM message_recipients r
@@ -212,7 +225,7 @@ impl Store {
              WHERE m.conversation_id = ?",
         )
         .bind(conversation_id)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(|r| (r.get("message_id"), r.get("peer_id")))
@@ -224,7 +237,20 @@ impl Store {
             }
         }
 
-        let mut tx = self.pool.begin().await?;
+        // Outcome-ledger rows reference attempts without a cascade and
+        // are populated by the normal hub outcome-reporting loop: they
+        // must go before the attempts they describe, or deleting a room
+        // whose terminal outcome was reported trips the foreign key.
+        sqlx::query(
+            "DELETE FROM hub_outcome_reports WHERE attempt_id IN
+               (SELECT a.id FROM attempts a
+                JOIN execution_intents i ON i.id = a.intent_id
+                JOIN messages m ON m.id = i.message_id
+                WHERE m.conversation_id = ?)",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
         // attempts -> intents -> recipients -> messages -> events/fences/members
         sqlx::query(
             "DELETE FROM attempts WHERE intent_id IN
