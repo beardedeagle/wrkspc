@@ -244,7 +244,11 @@ impl A2aSurface {
     ///   requiring them.
     /// * `base_url` — the externally reachable base URL with scheme
     ///   (e.g. `https://hub.example:8443`); the agent card derives from
-    ///   it, so it must match the served transport.
+    ///   it, so it must match the served transport. The card always
+    ///   declares `mtlsSecurityScheme` here: this transport IS the
+    ///   certificate-stamped TLS surface, regardless of the
+    ///   [`A2aSurface::with_mtls`] flag (callers cannot serve mTLS
+    ///   while advertising a plaintext card).
     /// * `shutdown` — a future that ends serving when it resolves.
     /// * `resolve_peer` — per-connection policy over the peer
     ///   certificate chain.
@@ -274,7 +278,11 @@ impl A2aSurface {
         D: FnOnce(axum::Router) -> axum::Router + Send + 'static,
     {
         let addr = listener.local_addr()?;
-        let app = decorate(self.into_router(&base_url));
+        // The TLS transport is the certificate-stamped surface: the
+        // served agent card declares `mtlsSecurityScheme` regardless of
+        // the caller's `with_mtls` flag (mTLS serving must never
+        // advertise a plaintext card).
+        let app = decorate(self.with_mtls(true).into_router(&base_url));
         let resolve_peer = std::sync::Arc::new(resolve_peer);
         let mut shutdown = std::pin::pin!(shutdown);
         // Connection tasks are TRACKED and aborted at shutdown (P09):
@@ -315,7 +323,15 @@ impl A2aSurface {
                             .1
                             .peer_certificates()
                             .unwrap_or_default();
-                        let identity = match resolve_peer(certs) {
+                        // The stamp set is ONE identity decision: a
+                        // Stamped verdict carries the peer identity AND
+                        // its serial together. Unstamped — including a
+                        // CA-issued certificate the policy refuses to
+                        // stamp — carries NEITHER: a serial without the
+                        // identity would let per-request gates read a
+                        // revoked cert as attributed while the request
+                        // itself stayed anonymous.
+                        let (identity, serial) = match resolve_peer(certs) {
                             PeerDecision::Deny => {
                                 let identity_display = certs
                                     .first()
@@ -326,11 +342,11 @@ impl A2aSurface {
                             }
                             PeerDecision::Unstamped => {
                                 tracing::debug!(%peer_addr, "TLS connection accepted (no client certificate)");
-                                None
+                                (None, None)
                             }
                             PeerDecision::Stamped(identity) => {
                                 tracing::debug!(%peer_addr, %identity, "TLS connection accepted");
-                                Some(identity)
+                                (Some(identity), certs.first().and_then(cert_serial_hex))
                             }
                         };
                         // Stamp the verified identity and serial onto every
@@ -339,8 +355,9 @@ impl A2aSurface {
                         // payload. Unstamped connections carry neither — and
                         // any client-supplied stamp is removed FIRST, so a
                         // cert-less connection can never forge the peer
-                        // identity this surface enforces.
-                        let serial = certs.first().and_then(cert_serial_hex);
+                        // identity this surface enforces. The request is
+                        // marked transport-verified so the router-level
+                        // strip keeps these values in place.
                         let stamped = tower::ServiceBuilder::new()
                             .map_request(
                                 move |mut request: hyper::Request<hyper::body::Incoming>| {
@@ -369,6 +386,7 @@ impl A2aSurface {
                                             value,
                                         );
                                     }
+                                    request.extensions_mut().insert(VerifiedStamp);
                                     request
                                 },
                             )
@@ -416,7 +434,46 @@ impl A2aSurface {
             )
             .nest("/rest", a2a_server::rest::rest_router(handler.clone()))
             .merge(agent_card_router(card_producer))
+            // The identity headers are transport-written only. Every
+            // transport that skips the TLS accept loop's strip-and-stamp
+            // (plaintext [`A2aSurface::serve`], custom transports built
+            // over this router) must still never trust client-supplied
+            // `x-wrkspc-*` headers, so the routers strip them here. The
+            // TLS loop marks its requests [`VerifiedStamp`] and the
+            // middleware keeps those transport-written values.
+            .layer(axum::middleware::from_fn(strip_forged_identity_headers))
     }
+}
+
+/// Marks a request whose `x-wrkspc-*` identity headers were written by
+/// the TLS accept loop from a verified certificate chain. The
+/// router-level strip must keep those transport-written values: they
+/// are the authenticated identity, not client assertion.
+#[derive(Debug, Clone, Copy)]
+struct VerifiedStamp;
+
+/// Strips client-supplied `x-wrkspc-peer` / `x-wrkspc-serial` headers.
+///
+/// The identity headers are written by the transport, never taken from
+/// the client: the TLS accept loop strips what the client sent and
+/// stamps the verified certificate identity. A request that already
+/// passed that loop carries an internal transport-verified marker and
+/// keeps its transport-written values; every other request has the
+/// headers removed, so no transport can let a client forge the peer
+/// identity.
+///
+/// Exposed so callers serving [`A2aSurface::into_router`] routers over
+/// custom transports can apply the same contract to routes they add
+/// themselves.
+pub async fn strip_forged_identity_headers(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if request.extensions().get::<VerifiedStamp>().is_none() {
+        request.headers_mut().remove("x-wrkspc-peer");
+        request.headers_mut().remove("x-wrkspc-serial");
+    }
+    next.run(request).await
 }
 
 /// Extracts `CN` + DNS SANs from a DER certificate for LOG/display

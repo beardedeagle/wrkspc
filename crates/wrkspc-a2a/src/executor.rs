@@ -134,8 +134,14 @@ impl AgentExecutor for WrkspcExecutor {
         {
             history.push(current.clone());
         }
+        // A continuation preserves any non-terminal stored state —
+        // Working, InputRequired (awaiting approval), AuthRequired —
+        // instead of resetting a progressing task to Submitted. Fresh
+        // tasks fall back to Submitted; a terminal record re-emits its
+        // own terminal state idempotently through the SDK, never this
+        // acceptance leg.
         let state = match stored.as_ref().map(|t| &t.status.state) {
-            Some(state) if *state == TaskState::Working => TaskState::Working,
+            Some(state) if !state.is_terminal() => state.clone(),
             _ => TaskState::Submitted,
         };
         let task = Task {
@@ -184,10 +190,19 @@ impl AgentExecutor for WrkspcExecutor {
                 .ok_or_else(|| A2AError::task_not_found(&task_id))?;
             let mut snapshot: serde_json::Value = serde_json::from_str(&current.task_json)
                 .map_err(|error| A2AError::internal(error.to_string()))?;
-            snapshot["status"] = serde_json::json!({
-                "state": "TASK_STATE_CANCELED",
-                "timestamp": chrono::Utc::now(),
-            });
+            // A malformed stored blob (not an object) is a store
+            // invariant break — error out, never panic on index
+            // assignment into a non-object value.
+            let snapshot = snapshot
+                .as_object_mut()
+                .ok_or_else(|| A2AError::internal("task payload is not an object".to_string()))?;
+            snapshot.insert(
+                "status".to_string(),
+                serde_json::json!({
+                    "state": "TASK_STATE_CANCELED",
+                    "timestamp": chrono::Utc::now(),
+                }),
+            );
             let canceled_json = serde_json::to_string(&snapshot)
                 .map_err(|error| A2AError::internal(error.to_string()))?;
             match store

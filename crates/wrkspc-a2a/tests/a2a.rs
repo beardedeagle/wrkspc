@@ -640,3 +640,74 @@ async fn executor_continuation_preserves_the_stored_record() {
         "a progressing task keeps its state instead of resetting to Submitted"
     );
 }
+
+/// A continuation of a task awaiting approval (InputRequired) keeps
+/// that state — the acceptance leg must never reset a progressing task
+/// to Submitted (the dispatcher's approval gate owns that state).
+#[tokio::test]
+async fn executor_continuation_preserves_input_required_state() {
+    let store = wrkspc_core::Store::open_in_memory("a2a-executor-input-required")
+        .await
+        .unwrap();
+    let stored = task("t1", "ctx-a", TaskState::InputRequired, None);
+
+    let ctx = ExecutorContext {
+        message: Some(user_message("more input")),
+        task_id: "t1".into(),
+        stored_task: Some(stored),
+        context_id: "ctx-a".to_string(),
+        metadata: None,
+        user: None,
+        service_params: Default::default(),
+        tenant: None,
+    };
+    let stream = WrkspcExecutor::new(store.clone()).execute(ctx);
+    let events: Vec<_> = futures::StreamExt::collect(stream).await;
+    let event = events.into_iter().next().expect("one event").expect("ok");
+    let a2a::event::StreamResponse::Task(task) = event else {
+        panic!("the stream must begin with the Task object");
+    };
+    assert_eq!(
+        task.status.state,
+        TaskState::InputRequired,
+        "an awaiting-approval task must not be reset to Submitted"
+    );
+}
+
+/// A malformed stored payload (not a JSON object) makes the cancel
+/// path ERROR instead of panicking on index assignment.
+#[tokio::test]
+async fn executor_cancel_errors_on_malformed_stored_payload() {
+    let store = wrkspc_core::Store::open_in_memory("a2a-cancel-malformed")
+        .await
+        .unwrap();
+    store
+        .task_create(
+            "t1",
+            "ctx-a",
+            "TASK_STATE_WORKING",
+            false,
+            r#""not-an-object""#,
+        )
+        .await
+        .unwrap();
+
+    let ctx = ExecutorContext {
+        message: None,
+        task_id: "t1".into(),
+        stored_task: None,
+        context_id: "ctx-a".to_string(),
+        metadata: None,
+        user: None,
+        service_params: Default::default(),
+        tenant: None,
+    };
+    let stream = WrkspcExecutor::new(store.clone()).cancel(ctx);
+    let events: Vec<_> = futures::StreamExt::collect(stream).await;
+    let event = events.into_iter().next().expect("one event");
+    let error = event.expect_err("a malformed stored payload must error, not succeed");
+    assert!(
+        error.to_string().contains("not an object"),
+        "the error must name the malformed payload: {error}"
+    );
+}

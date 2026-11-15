@@ -342,8 +342,53 @@ where
                 }
             }
             Err(error) => {
-                tracing::error!(%error, task_id = %delivery.task_id, "local record failed");
-                outcome.failed += 1;
+                match &error {
+                    // Permanent rejection verdicts (mirrors the acceptance
+                    // translation's mapping): no poll retry can change the
+                    // local store's answer — the hub-side record conflicts
+                    // with committed local state, or policy refuses it.
+                    // Warn, write the local skip marker (the next poll's
+                    // dedup gate passes over the delivery), and leave the
+                    // hub delivery unacked so it stays visible for operator
+                    // reconciliation instead of failing every poll with
+                    // log noise.
+                    wrkspc_core::StoreError::IdempotencyConflict { .. }
+                    | wrkspc_core::StoreError::ExecutionAuthorityConflict { .. }
+                    | wrkspc_core::StoreError::PeerEjected { .. }
+                    | wrkspc_core::StoreError::TooManyRecipients { .. } => {
+                        tracing::warn!(
+                            %error,
+                            task_id = %delivery.task_id,
+                            "delivery rejected permanently; skipping without retry"
+                        );
+                        if let Err(marker_error) = store
+                            .task_create(
+                                &delivery.task_id,
+                                host_id,
+                                "rejected",
+                                true,
+                                &task.task_json,
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                %marker_error,
+                                task_id = %delivery.task_id,
+                                "permanent-rejection marker failed"
+                            );
+                        }
+                    }
+                    // Transient (NotFound races on the mirror leg, Db
+                    // failures, anything else): the delivery stays pollable
+                    // and retries on the next poll — the hub keeps it
+                    // visible as "not enforced".
+                    _ => {
+                        tracing::error!(%error, task_id = %delivery.task_id, "local record failed");
+                        outcome.failed += 1;
+                    }
+                }
+                // Neither rejection path reaches the ack leg: the hub
+                // delivery is not enforced.
                 continue;
             }
         }
@@ -377,4 +422,217 @@ where
         outcome.processed += 1;
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a hub-side delivery task row payload for tests.
+    fn hub_delivery_row(task_id: &str) -> TaskRow {
+        TaskRow {
+            task_id: task_id.to_string(),
+            context_id: "node-test-1".to_string(),
+            state: "submitted".to_string(),
+            terminal: false,
+            version: 1,
+            task_json: serde_json::json!({
+                "id": task_id,
+                "contextId": "node-test-1",
+                "status": {"state": "TASK_STATE_SUBMITTED"},
+                "metadata": {
+                    "delivery": {
+                        "kind": "delivery",
+                        "message_id": "hub-msg-conflict",
+                        "conversation_id": "hub-conv-conflict",
+                        "sender_peer": "operator",
+                        "sender_name": "operator",
+                        "sender_class": "human",
+                        "sender_host": "hub-real-host",
+                        "recipient_peer": "codex",
+                        "recipient_name": "codex",
+                        "recipient_class": "harness",
+                        "content": "hello from the hub",
+                        "execution_requested": true,
+                    },
+                },
+            })
+            .to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    /// A permanent acceptance verdict (idempotency conflict with
+    /// committed local state) skips WITHOUT retry: warn-level log, no
+    /// failed counter, no ack, and a local skip marker so the next
+    /// poll's dedup gate passes the delivery over.
+    #[tokio::test]
+    async fn permanent_acceptance_rejection_skips_without_retry() {
+        let store = Store::open_in_memory("poll-permanent").await.unwrap();
+        store
+            .ensure_peer("codex", "codex", "harness")
+            .await
+            .unwrap();
+        store
+            .ensure_peer("operator", "operator", "human")
+            .await
+            .unwrap();
+        // The delivery's idempotency key (`hub-msg-conflict`, the hub
+        // message id — there is no origin id) is already committed
+        // locally with DIFFERENT content: the hub-side record conflicts
+        // and no retry can change that.
+        assert!(
+            store
+                .ensure_conversation("hub-conv-conflict", &["operator"])
+                .await
+                .unwrap(),
+            "the delivery's conversation is created here"
+        );
+        store
+            .accept_message(
+                "hub-conv-conflict",
+                "operator",
+                "hub-msg-conflict",
+                "original local content",
+                false,
+                &[],
+            )
+            .await
+            .expect("seed conflict");
+
+        let row = hub_delivery_row("task-conflict");
+        let mut acked = Vec::new();
+        let outcome = process_deliveries(
+            &store,
+            "node-test-1",
+            std::slice::from_ref(&row),
+            |_| std::future::ready(ClaimOutcome::Claimed),
+            |task_id| {
+                acked.push(task_id.to_string());
+                std::future::ready(true)
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            PollOutcome {
+                processed: 0,
+                failed: 0,
+                gated: 0,
+            },
+            "a permanent rejection is not a retryable failure"
+        );
+        assert!(
+            acked.is_empty(),
+            "a rejected delivery is never acked as enforced"
+        );
+        // The local skip marker exists, so the next poll's dedup gate
+        // passes over the delivery — no claim, no mirror, no retry.
+        let marker = store
+            .task_get("task-conflict")
+            .await
+            .expect("marker read")
+            .expect("marker written");
+        assert!(marker.terminal);
+
+        let mut claims = 0;
+        let outcome = process_deliveries(
+            &store,
+            "node-test-1",
+            std::slice::from_ref(&row),
+            |_| {
+                claims += 1;
+                std::future::ready(ClaimOutcome::Claimed)
+            },
+            |_| std::future::ready(true),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            PollOutcome {
+                processed: 0,
+                failed: 0,
+                gated: 0,
+            }
+        );
+        assert_eq!(
+            claims, 0,
+            "the skip marker must short-circuit the next poll before the claim"
+        );
+    }
+
+    /// A transient acceptance failure (NotFound — the delivery's sender
+    /// is not a member of the already-existing local conversation) is
+    /// retryable: it counts as failed, is never acked, and no skip
+    /// marker is written, so the next poll re-runs it.
+    #[tokio::test]
+    async fn transient_acceptance_failure_retries_on_the_next_poll() {
+        let store = Store::open_in_memory("poll-transient").await.unwrap();
+        store
+            .ensure_peer("codex", "codex", "harness")
+            .await
+            .unwrap();
+        store
+            .ensure_peer("operator", "operator", "human")
+            .await
+            .unwrap();
+        // The conversation already exists locally WITHOUT the sender
+        // as a member; `ensure_conversation` enrols members on creation
+        // only, so acceptance finds a non-member and fails with
+        // NotFound — a transient shape the mirror leg cannot repair
+        // itself.
+        assert!(
+            store
+                .ensure_conversation("hub-conv-conflict", &["codex"])
+                .await
+                .unwrap(),
+            "the conversation is created here"
+        );
+
+        let row = hub_delivery_row("task-transient");
+        let mut acked = Vec::new();
+        let outcome = process_deliveries(
+            &store,
+            "node-test-1",
+            std::slice::from_ref(&row),
+            |_| std::future::ready(ClaimOutcome::Claimed),
+            |task_id| {
+                acked.push(task_id.to_string());
+                std::future::ready(true)
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            PollOutcome {
+                processed: 0,
+                failed: 1,
+                gated: 0,
+            },
+            "a transient acceptance failure stays retryable"
+        );
+        assert!(acked.is_empty(), "an unaccepted delivery is never acked");
+        assert!(
+            store.task_get("task-transient").await.unwrap().is_none(),
+            "no skip marker for a transient failure"
+        );
+
+        // The next poll retries it (the claim runs again): no marker
+        // short-circuits the pass.
+        let mut claims = 0;
+        let outcome = process_deliveries(
+            &store,
+            "node-test-1",
+            std::slice::from_ref(&row),
+            |_| {
+                claims += 1;
+                std::future::ready(ClaimOutcome::Claimed)
+            },
+            |_| std::future::ready(true),
+        )
+        .await;
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(claims, 1, "a transient failure is retried on the next poll");
+    }
 }

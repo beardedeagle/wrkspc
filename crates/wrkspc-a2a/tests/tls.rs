@@ -30,6 +30,7 @@ struct TestPki {
     server_cert_der: Vec<u8>,
     server_key_der: Vec<u8>,
     client_pem: Vec<u8>,
+    client_cert_der: Vec<u8>,
 }
 
 impl TestPki {
@@ -68,6 +69,7 @@ impl TestPki {
             server_cert_der: server_cert.der().to_vec(),
             server_key_der: server_key.serialize_der(),
             client_pem: format!("{}{}", client_cert.pem(), client_key.serialize_pem()).into_bytes(),
+            client_cert_der: client_cert.der().to_vec(),
         }
     }
 }
@@ -162,11 +164,20 @@ async fn serve_tls(
     + Sync
     + 'static,
 ) -> std::net::SocketAddr {
-    serve_with(store, pki, mtls_acceptor(pki), shutdown_tx, resolve_peer).await
+    serve_with(
+        store,
+        pki,
+        mtls_acceptor(pki),
+        shutdown_tx,
+        resolve_peer,
+        |router| router,
+    )
+    .await
 }
 
 /// Serves the surface over TLS with the given acceptor until
-/// `shutdown_tx` fires.
+/// `shutdown_tx` fires; `decorate` transforms the router before
+/// serving (extra routes for observing the stamped headers).
 async fn serve_with(
     store: Store,
     _pki: &TestPki,
@@ -176,6 +187,7 @@ async fn serve_with(
     + Send
     + Sync
     + 'static,
+    decorate: impl FnOnce(axum::Router) -> axum::Router + Send + 'static,
 ) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -190,7 +202,7 @@ async fn serve_with(
                     let _ = shutdown_tx.closed().await;
                 },
                 resolve_peer,
-                |router| router,
+                decorate,
             )
             .await;
     });
@@ -283,6 +295,7 @@ async fn optional_client_auth_serves_cert_less_connections_unstamped() {
                 .map(wrkspc_a2a::PeerDecision::Stamped)
                 .unwrap_or(wrkspc_a2a::PeerDecision::Unstamped)
         },
+        |router| router,
     )
     .await;
     let hub = format!("https://{addr}/jsonrpc");
@@ -363,5 +376,150 @@ async fn serial_hex_matches_revoke_record_format() {
         cert_serial_hex(&der).as_deref(),
         Some("bfedf51c"),
         "leading DER padding must be stripped to match revoke records"
+    );
+}
+
+// ── strip-then-stamp header contract (H-1) ───────────────────────────────
+
+/// Echoes the identity headers the handler observes: `peer=<value>,
+/// serial=<value>` (empty for absent headers).
+async fn echo_stamp(headers: axum::http::HeaderMap) -> String {
+    let peer = headers
+        .get("x-wrkspc-peer")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let serial = headers
+        .get("x-wrkspc-serial")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    format!("peer={peer},serial={serial}")
+}
+
+/// Builds a raw reqwest client for the given identity (or none).
+fn raw_client(pki: &TestPki, identity: Option<&[u8]>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Some(pem) = identity {
+        builder = builder.identity(reqwest::Identity::from_pem(pem).unwrap());
+    }
+    builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&pki.ca_pem).unwrap());
+    builder.build().unwrap()
+}
+
+/// H-1 (wire): a request carrying forged `x-wrkspc-peer` /
+/// `x-wrkspc-serial` headers never hands them to the handler — the
+/// transport strips what the client sent and re-stamps the
+/// certificate-derived identity and serial.
+#[tokio::test]
+async fn forged_identity_headers_are_replaced_by_certificate_derived_values() {
+    let pki = TestPki::generate();
+    let expected_serial = cert_serial_hex(&rustls_pki_types::CertificateDer::from(
+        pki.client_cert_der.clone(),
+    ))
+    .expect("client leaf serial");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let addr = serve_with(
+        test_store().await,
+        &pki,
+        mtls_acceptor(&pki),
+        shutdown_tx,
+        |certs| {
+            certs
+                .first()
+                .and_then(wrkspc_a2a::host_identity)
+                .map(wrkspc_a2a::PeerDecision::Stamped)
+                .unwrap_or(wrkspc_a2a::PeerDecision::Deny)
+        },
+        |router| router.route("/echo-stamp", axum::routing::get(echo_stamp)),
+    )
+    .await;
+
+    let client = raw_client(&pki, Some(&pki.client_pem));
+    let body = client
+        .get(format!("https://{addr}/echo-stamp"))
+        .header("x-wrkspc-peer", "forged-attacker")
+        .header("x-wrkspc-serial", "deadbeef")
+        .send()
+        .await
+        .expect("request")
+        .text()
+        .await
+        .expect("body");
+    assert_eq!(
+        body,
+        format!("peer=node-test-1,serial={expected_serial}"),
+        "the handler must observe the certificate-derived values, never the forged headers"
+    );
+
+    drop(shutdown_rx);
+}
+
+/// An Unstamped verdict carries NEITHER identity header — even when a
+/// CA-issued certificate was presented (the policy declined to stamp
+/// it) and the client asserted forged headers.
+#[tokio::test]
+async fn unstamped_verdict_carries_neither_identity_header() {
+    let pki = TestPki::generate();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    // The optional acceptor accepts the presented certificate at the
+    // TLS layer; the policy refuses to stamp it (the unenrolled-peer
+    // shape).
+    let addr = serve_with(
+        test_store().await,
+        &pki,
+        optional_acceptor(&pki),
+        shutdown_tx,
+        |_| wrkspc_a2a::PeerDecision::Unstamped,
+        |router| router.route("/echo-stamp", axum::routing::get(echo_stamp)),
+    )
+    .await;
+
+    let client = raw_client(&pki, Some(&pki.client_pem));
+    let body = client
+        .get(format!("https://{addr}/echo-stamp"))
+        .header("x-wrkspc-peer", "forged-attacker")
+        .header("x-wrkspc-serial", "deadbeef")
+        .send()
+        .await
+        .expect("request")
+        .text()
+        .await
+        .expect("body");
+    assert_eq!(
+        body, "peer=,serial=",
+        "an unstamped connection must carry neither identity header"
+    );
+
+    drop(shutdown_rx);
+}
+
+/// The router-level strip removes forged identity headers on
+/// transports that skip the TLS accept loop (plaintext serving,
+/// custom transports built over `into_router`).
+#[tokio::test]
+async fn router_level_strip_removes_forged_identity_headers() {
+    use tower::ServiceExt;
+    let echo = axum::Router::new()
+        .route("/echo-stamp", axum::routing::get(echo_stamp))
+        .layer(axum::middleware::from_fn(
+            wrkspc_a2a::server::strip_forged_identity_headers,
+        ));
+    let response = echo
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/echo-stamp")
+                .header("x-wrkspc-peer", "forged-attacker")
+                .header("x-wrkspc-serial", "deadbeef")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        "peer=,serial=",
+        "a request that did not pass the TLS accept loop must carry neither identity header"
     );
 }

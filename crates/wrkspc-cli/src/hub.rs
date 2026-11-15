@@ -173,7 +173,9 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
             .await
             .map_err(|e| format!("cannot write bound address to {}: {e}", path.display()))?;
     }
-    let surface = A2aSurface::new(store.clone()).with_mtls(tls.is_some());
+    // The mTLS declaration is decided by the transport: serve_tls
+    // always publishes it, the plaintext path never does.
+    let surface = A2aSurface::new(store.clone());
     let a2a_task = match tls {
         Some((cert, key, ca)) => {
             let acceptor = build_acceptor(cert, key, ca)?;
