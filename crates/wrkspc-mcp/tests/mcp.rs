@@ -521,3 +521,97 @@ async fn read_conversation_rejects_out_of_range_limits() {
         );
     }
 }
+
+/// A hub-connected node mirrors posts without raising local execution
+/// intents: the message is accepted, committed, and visible in the
+/// conversation, but nothing is locally claimable — execution happens
+/// only when the hub echoes a delivery this node claims.
+#[tokio::test]
+async fn hub_connected_post_mirrors_without_local_execution_intent() {
+    let (store, operator, agent, conversation, _server) = seeded().await;
+    let client = connect(McpServer::new(store.clone(), agent.clone(), true)).await;
+
+    let result = call(
+        &client,
+        "post-message",
+        serde_json::json!({
+            "conversation_id": conversation,
+            "idempotency_key": "key-hub",
+            "content": "mirrored until the hub accepts",
+            "execution_requested": true,
+            "recipients": [operator],
+        }),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a hub-connected post must be accepted (mirrored), not failed"
+    );
+    let text = text_of(&result);
+    let message_id = text
+        .trim_start_matches("accepted ")
+        .split(';')
+        .next()
+        .expect("message id")
+        .trim()
+        .to_string();
+
+    // The mirror is committed and visible through the normal read path.
+    let read = call(
+        &client,
+        "read-conversation",
+        serde_json::json!({ "conversation_id": conversation }),
+    )
+    .await;
+    let events: serde_json::Value = serde_json::from_str(&text_of(&read)).expect("valid json");
+    let events = events.as_array().expect("array");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["payload"]["message_id"] == message_id),
+        "the mirrored message must be visible via read-conversation: {events:?}"
+    );
+
+    // No local execution intent exists: claiming fails and nothing is due.
+    assert!(
+        store.claim_intent(&message_id, &operator).await.is_err(),
+        "a mirrored post must not raise a claimable execution intent"
+    );
+    assert!(
+        store.due_intents().await.expect("due intents").is_empty(),
+        "a mirrored post must not raise any local execution intent"
+    );
+}
+
+/// The directed-recipient ceiling surfaces as the MCP error envelope:
+/// 33 recipients are refused with the limit AND the actual count named
+/// (the harness learns the contract instead of guessing the bound).
+#[tokio::test]
+async fn post_message_rejects_more_than_32_recipients() {
+    let (_store, _operator, _agent, conversation, server) = seeded().await;
+    let client = connect(server).await;
+
+    let recipients: Vec<String> = (1..=33).map(|i| format!("peer-{i}")).collect();
+    let result = call_result(
+        &client,
+        "post-message",
+        serde_json::json!({
+            "conversation_id": conversation,
+            "idempotency_key": "key-fanout",
+            "content": "to everyone",
+            "recipients": recipients,
+        }),
+    )
+    .await
+    .expect("the refusal must arrive as an is_error envelope");
+    let text = error_text(&result, "recipient ceiling");
+    assert!(
+        text.contains("too many recipients"),
+        "the ceiling refusal must surface: {text}"
+    );
+    assert!(
+        text.contains("33") && text.contains("max 32"),
+        "the envelope must name the actual count and the limit: {text}"
+    );
+}

@@ -4361,7 +4361,6 @@ name = "wrkspc-acp"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
- "serde",
  "serde_json",
  "thiserror",
  "tokio",

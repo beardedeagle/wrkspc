@@ -7,19 +7,28 @@
 //! Speaks ACP over stdio (the phase 0 spike's agent mode, extended):
 //! - `session/new` → fresh id; with `--record FILE` it writes the
 //!   request's `mcpServers` as JSON (the injection runtime proof)
+//! - `session/set_config_option` → acknowledged (round-trip proof)
 //! - `session/prompt` → echo chunk + `EndTurn`; trailing content
 //!   `"slow"` delays 1.5 s; `"never"` holds the turn open until
 //!   `session/cancel`; a prompt containing the `--die-on` substring
 //!   kills the process without responding (a harness crash before any
-//!   ACP write). Dispatcher prompts carry a wrkspc addressing prefix,
-//!   so the control triggers match the TRAILING content.
+//!   ACP write); a prompt for an unknown session id is refused with
+//!   the SDK's session-not-found JSON-RPC error. Dispatcher prompts
+//!   carry a wrkspc addressing prefix, so the control triggers match
+//!   the TRAILING content.
+//! - with `--request-permission FILE`, every prompt also sends a
+//!   `session/request_permission` request to the client (from a
+//!   subtask, never awaited inside the dispatch loop) and records the
+//!   client's outcome in FILE
 //! - `session/cancel` → responds to the held prompt with `Cancelled`
 //!   (the HLD's confirmed cancellation carrier)
 
 use agent_client_protocol::v1::schema::{
     AgentCapabilities, ClientNotification, ContentBlock, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, SessionNotification, SessionUpdate, StopReason, TextContent,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
+    RequestPermissionRequest, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, TextContent, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::v1::{ConnectionTo, Responder};
 use agent_client_protocol::{Agent, Client, Stdio};
@@ -59,6 +68,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_prompts = args
         .windows(2)
         .find(|pair| pair[0] == "--log-prompts")
+        .map(|pair| pair[1].clone());
+    // --request-permission FILE: during every prompt, send a
+    // `session/request_permission` request to the client and record the
+    // client's outcome (its Debug form) in FILE — the integration test's
+    // proof that the client's permission policy ran.
+    let permission_probe = args
+        .windows(2)
+        .find(|pair| pair[0] == "--request-permission")
         .map(|pair| pair[1].clone());
     let state = Arc::new(Mutex::new(FakeState::default()));
 
@@ -118,17 +135,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
+            async move |req: SetSessionConfigOptionRequest,
+                        responder: Responder<SetSessionConfigOptionResponse>,
+                        _cx: ConnectionTo<Client>| {
+                // The ack is the whole contract: the fake holds no
+                // per-session config state, so the round trip (request
+                // received, response delivered) is what the test proves.
+                let _ = req;
+                responder.respond(SetSessionConfigOptionResponse::new(Vec::new()))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
             {
                 let state = state.clone();
                 let die_on = die_on.clone();
                 let touch = touch.clone();
                 let log_prompts = log_prompts.clone();
+                let permission_probe = permission_probe.clone();
                 async move |req: PromptRequest,
                             responder: Responder<PromptResponse>,
                             connection: ConnectionTo<Client>| {
                     let sid = req.session_id.to_string();
                     if !state.lock().unwrap().sessions.contains_key(&sid) {
-                        return Ok(());
+                        // An unknown session is a protocol refusal, not
+                        // silence: dropping the responder would leave the
+                        // client awaiting a response until the connection
+                        // closes. Answer with the SDK's session-not-found
+                        // JSON-RPC error.
+                        return responder.respond_with_error(
+                            agent_client_protocol::v1::schema::Error::session_not_found(sid).into(),
+                        );
                     }
                     if let Some(path) = &touch {
                         let _ = std::fs::write(path, b"prompted");
@@ -168,6 +205,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         && text.contains(substring)
                     {
                         std::process::exit(1);
+                    }
+
+                    // Permission-probe mode: ask the client for permission
+                    // on every prompt and record whatever the client
+                    // answers. The response is awaited in a SUBTASK — the
+                    // SDK's dispatch loop runs this handler, and awaiting a
+                    // response here would deadlock the connection.
+                    if let Some(path) = &permission_probe {
+                        let connection = connection.clone();
+                        let permission_sid = sid.clone();
+                        let path = path.clone();
+                        tokio::spawn(async move {
+                            let request = RequestPermissionRequest::new(
+                                permission_sid,
+                                ToolCallUpdate::new("perm-1", ToolCallUpdateFields::new()),
+                                vec![PermissionOption::new(
+                                    "allow-once",
+                                    "Allow once",
+                                    PermissionOptionKind::AllowOnce,
+                                )],
+                            );
+                            let outcome = connection
+                                .send_request(request)
+                                .block_task()
+                                .await
+                                .map(|response| response.outcome);
+                            let _ = std::fs::write(path, format!("{outcome:?}"));
+                        });
                     }
 
                     match text.trim_end() {

@@ -179,10 +179,23 @@ async fn routing_summary(
         let mut harness: Vec<String> = Vec::new();
         let mut other: Vec<String> = Vec::new();
         for peer in delivered {
-            match store.peer_class_of(peer).await.ok().flatten().as_deref() {
-                Some("harness") => harness.push(peer.clone()),
-                Some(class) => other.push(format!("{peer} ({class})")),
-                None => other.push(peer.clone()),
+            // A store failure on the class lookup must not turn a
+            // committed delivery into a mystery silently: log it, then
+            // keep the unclassified fallback so the reply still
+            // describes who the message reached.
+            match store.peer_class_of(peer).await {
+                Ok(Some(class)) if class == "harness" => harness.push(peer.clone()),
+                Ok(Some(class)) => other.push(format!("{peer} ({class})")),
+                Ok(None) => other.push(peer.clone()),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        peer = %peer,
+                        message_id,
+                        "peer class lookup failed; treating the peer as unclassified",
+                    );
+                    other.push(peer.clone());
+                }
             }
         }
         if !harness.is_empty() {
