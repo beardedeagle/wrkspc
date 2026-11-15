@@ -1972,3 +1972,74 @@ async fn replay_recipients_honor_the_resolution_filters() {
         "a replay naming a booted peer must be refused: {ejected:?}"
     );
 }
+
+/// `resolve_mentions` is the operator-side resolver: it returns the
+/// members a body's @tokens address, with the operator, human-class
+/// and ejected peers filtered out exactly as the acceptance path would,
+/// duplicates collapsed, and ambiguous tokens refused.
+#[tokio::test]
+async fn resolve_mentions_applies_the_operator_filters() {
+    let store = Store::open_in_memory("resolve-mentions-test")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("worker", "worker", "harness")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("human-1", "Human One", "human")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "codex", "worker", "human-1"])
+        .await
+        .unwrap();
+
+    // Only the harness peer survives the filters; the operator never
+    // wakes itself, human-class members never gain deliveries, and
+    // repeated tokens collapse to one recipient.
+    let resolved = store
+        .resolve_mentions(&conversation, "@codex @human-1 @operator @codex")
+        .await
+        .unwrap();
+    assert_eq!(resolved, vec!["codex".to_string()]);
+
+    // A booted peer is never woken by a mention.
+    store
+        .set_peer_status("codex", wrkspc_core::PeerStatus::Booted, "operator")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .resolve_mentions(&conversation, "@codex")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // An alias token matching two members is refused, not guessed.
+    store
+        .set_peer_alias("codex", Some("c"), "operator")
+        .await
+        .unwrap();
+    store
+        .set_peer_alias("worker", Some("c"), "operator")
+        .await
+        .unwrap();
+    let ambiguous = store.resolve_mentions(&conversation, "@c").await;
+    assert!(
+        matches!(
+            ambiguous,
+            Err(wrkspc_core::StoreError::AmbiguousPeerRef { .. })
+        ),
+        "an ambiguous token must be refused: {ambiguous:?}"
+    );
+}

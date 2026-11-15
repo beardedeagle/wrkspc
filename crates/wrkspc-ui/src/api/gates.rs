@@ -99,30 +99,48 @@ pub(crate) async fn post_message(
         None => None,
     };
     let mut recipients: Vec<wrkspc_core::RecipientRequest> = Vec::new();
-    for member in members
-        .iter()
-        .filter(|member| member.as_str() != "operator")
-    {
-        if directed
-            .as_ref()
-            .is_some_and(|targets| !targets.iter().any(|target| target == member))
-        {
-            continue;
-        }
-        let ejected = state
+    if directed.as_ref().is_some_and(Vec::is_empty) {
+        // An explicitly empty recipient list is authoritative: the
+        // operator addressed nobody directly, and @mentions in the
+        // body are resolved HERE, into the explicit list — the store
+        // never infers recipients on this path. No mentions, nobody.
+        for peer_id in state
             .store
-            .peer_status(member)
+            .resolve_mentions(&id, &body.content)
             .await
             .map_err(store_error)?
-            .is_some_and(|status| wrkspc_core::status_is_ejected(&status));
-        if ejected {
-            tracing::info!(peer = %member, conversation = %id, "ejected member skipped by operator post");
-            continue;
+        {
+            recipients.push(wrkspc_core::RecipientRequest {
+                peer_id,
+                execution_requested: true,
+            });
         }
-        recipients.push(wrkspc_core::RecipientRequest {
-            peer_id: member.clone(),
-            execution_requested: true,
-        });
+    } else {
+        for member in members
+            .iter()
+            .filter(|member| member.as_str() != "operator")
+        {
+            if directed
+                .as_ref()
+                .is_some_and(|targets| !targets.iter().any(|target| target == member))
+            {
+                continue;
+            }
+            let ejected = state
+                .store
+                .peer_status(member)
+                .await
+                .map_err(store_error)?
+                .is_some_and(|status| wrkspc_core::status_is_ejected(&status));
+            if ejected {
+                tracing::info!(peer = %member, conversation = %id, "ejected member skipped by operator post");
+                continue;
+            }
+            recipients.push(wrkspc_core::RecipientRequest {
+                peer_id: member.clone(),
+                execution_requested: true,
+            });
+        }
     }
     let outcome = if state.hub_connected && !state.hub_role {
         // Team mode: the operator post mirrors locally WITHOUT local
@@ -144,10 +162,13 @@ pub(crate) async fn post_message(
     } else {
         // Standalone node, or the hub itself: direct acceptance with
         // local execution intents (the hub never executes — its
-        // fan-out below queues remote deliveries instead).
+        // fan-out below queues remote deliveries instead). The
+        // recipient list is always explicit here — mentions resolved
+        // above, members or targets otherwise — so committed routing
+        // applies and the store never re-infers from the body.
         state
             .store
-            .accept_message(
+            .accept_message_committed_routing(
                 &id,
                 "operator",
                 &uuid::Uuid::new_v4().to_string(),
@@ -163,11 +184,9 @@ pub(crate) async fn post_message(
             // Hub mode: fan the operator's post out to recipients on
             // remote hosts as pollable delivery tasks.
             if state.queue_remote_deliveries {
-                // Fan out from the COMMITTED routing, not the
-                // pre-resolution vector: a mention-only post resolves
-                // its recipients inside the store, and the original
-                // vector would queue nothing while core committed a
-                // recipient with execution requested.
+                // Fan out from the COMMITTED routing: mention
+                // resolution happened in the gate above, and the
+                // committed recipient set is the authoritative one.
                 let recipient_peers = state
                     .store
                     .message_recipients(&message_id)

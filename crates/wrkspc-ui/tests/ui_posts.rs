@@ -561,3 +561,46 @@ async fn hub_mention_only_post_fans_out_from_committed_routing() {
     );
     let _ = ui.shutdown.send(());
 }
+
+/// An explicitly empty recipient list is authoritative on the operator
+/// surface: without @mentions in the body the message commits to
+/// nobody — the store must not infer a recipient set from the content.
+#[tokio::test]
+async fn explicit_empty_recipients_without_mentions_addresses_nobody() {
+    let ui = spawn_ui_hub().await;
+    ui.store
+        .ensure_peer_on_host("remote-agent", "Remote Agent", "harness", "remote-host-7")
+        .await
+        .unwrap();
+    let conversation_id = ui
+        .store
+        .create_conversation(&["operator", "remote-agent"])
+        .await
+        .unwrap();
+
+    let res = ui
+        .client()
+        .post(format!(
+            "{}/api/conversations/{conversation_id}/messages",
+            ui.base
+        ))
+        .bearer_auth(TOKEN)
+        .json(&serde_json::json!({
+            "content": "nobody in particular",
+            "recipients": []
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let message_id = res.json::<serde_json::Value>().await.unwrap()["message_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let recipients = ui.store.message_recipients(&message_id).await.unwrap();
+    assert!(
+        recipients.is_empty(),
+        "an explicit empty list with no mentions must address nobody: {recipients:?}"
+    );
+}

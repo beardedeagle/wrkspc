@@ -166,6 +166,68 @@ impl Store {
         .await
     }
 
+    /// Resolves the `@mention` tokens in `content` to the conversation
+    /// members they address.
+    ///
+    /// The operator surface calls this BEFORE acceptance and submits the
+    /// result as the explicit recipient list, so the committed routing is
+    /// always the routing the operator authored: an empty list stays
+    /// empty, and this store never infers recipients from message bodies
+    /// on that path. The resolution applies the same filters the
+    /// inference path once applied inside acceptance:
+    ///
+    /// * the operator never wakes itself,
+    /// * human-class members never receive deliveries,
+    /// * a mention never wakes a booted or banned peer,
+    /// * duplicate matches collapse to one recipient.
+    ///
+    /// # Args
+    ///
+    /// * `conversation_id` - The conversation the post belongs to.
+    /// * `content` - The message body to scan for mentions.
+    ///
+    /// # Returns
+    ///
+    /// The resolved peer ids in body order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::AmbiguousPeerRef`] when a token matches
+    /// more than one member, and [`StoreError::Db`] when the queries
+    /// fail.
+    pub async fn resolve_mentions(
+        &self,
+        conversation_id: &str,
+        content: &str,
+    ) -> Result<Vec<String>> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let matched = self
+            .mentioned_members(&mut tx, conversation_id, content)
+            .await?;
+        let mut resolved: Vec<String> = Vec::with_capacity(matched.len());
+        for peer_id in matched {
+            if peer_id == "operator"
+                || resolved.iter().any(|row| row == &peer_id)
+                || self.peer_class(&mut tx, &peer_id).await?.as_deref() == Some(HUMAN_CLASS)
+            {
+                continue;
+            }
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM peers WHERE id = ?")
+                    .bind(&peer_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if let Some(status) = status
+                && status != "enrolled"
+            {
+                // A mention never wakes a booted or banned peer.
+                continue;
+            }
+            resolved.push(peer_id);
+        }
+        Ok(resolved)
+    }
+
     /// Shared fence implementation; `mode` carries the two acceptance
     /// switches (see [`AcceptMode`]).
     async fn accept_message_with(

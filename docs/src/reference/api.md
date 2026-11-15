@@ -44,8 +44,10 @@ is a window onto the same committed records the feed carries.
 
 Post-message recipient resolution: an explicit `recipients` list is
 validated against conversation membership and capped at 32; an absent
-field addresses every non-operator member; an explicit empty list
-addresses nobody directly, and the hub infers recipients from
-`@mentions` in the content — a mention that matches more than one
-member is refused rather than guessed. Replays carry the committed
-routing, never a re-resolved one.
+field addresses every non-operator member; an explicit empty list is
+authoritative — the operator surface resolves `@mentions` in the
+content itself and submits them as the explicit list, so an empty list
+with no mentions addresses nobody, a mention that matches more than
+one member is refused rather than guessed, and the store never infers
+recipients from message bodies. Replays carry the committed routing,
+never a re-resolved one.
