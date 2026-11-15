@@ -34,7 +34,7 @@ fn node_restart_replays_nothing_and_resumes_delivery() {
     // reached the harness (receipt + a real turn, not one or the other).
     let prompts_log = dir.join("prompts.log");
     let command = format!(
-        "{} --log-prompts {}",
+        "{} --log-turn {}",
         fake_agent_path().display(),
         prompts_log.display()
     );
@@ -116,13 +116,14 @@ fn wait_attempt_terminal(
 }
 
 /// Asserts the fake harness received exactly `expected` prompts (its
-/// --log-prompts side channel, one line per prompt receipt).
+/// --log-turn side channel, one `start` line per prompt receipt).
 fn assert_prompt_count(path: &Path, expected: usize, why: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let lines = std::fs::read_to_string(path)
             .unwrap_or_default()
             .lines()
+            .filter(|line| line.starts_with("start\t"))
             .count();
         if lines == expected {
             return;
