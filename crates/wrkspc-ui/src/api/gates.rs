@@ -188,11 +188,23 @@ pub(crate) async fn post_message(
                     })
                     .await
                 {
-                    tracing::error!(%error, "remote delivery queueing failed");
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": "delivery queueing failed" })),
-                    ));
+                    // The message is ALREADY committed: a 500 here would
+                    // invite the operator to retry, and each retry mints
+                    // a fresh idempotency key and a duplicate post. Fail
+                    // visible instead — a feed event names the failure,
+                    // and startup repair re-queues the fan-out.
+                    tracing::error!(%error, %message_id, "remote delivery queueing failed");
+                    let _ = state
+                        .store
+                        .append_event(
+                            &id,
+                            "delivery.queueing_failed",
+                            &json!({
+                                "message_id": message_id,
+                                "error": error.to_string(),
+                            }),
+                        )
+                        .await;
                 }
             }
             message_id

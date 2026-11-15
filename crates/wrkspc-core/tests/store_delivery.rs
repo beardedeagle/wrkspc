@@ -1813,3 +1813,162 @@ async fn complete_attempt_commits_terminal_and_guidance_atomically() {
         "delivered guidance must never ride another turn"
     );
 }
+
+/// A non-terminal `Close` on the reconciliation path is a typed error,
+/// never a release-build panic: the debug-only assertion must not be
+/// the only guard between a caller bug and process death.
+#[tokio::test]
+async fn reconcile_close_refuses_non_terminal_states_without_panicking() {
+    let store = Store::open_in_memory("reconcile-guard-test").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+    let message_id = store
+        .accept_message(
+            &conversation,
+            "operator",
+            "key-reconcile-guard",
+            "please review",
+            false,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "codex".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap();
+    let message_id = match message_id {
+        wrkspc_core::AcceptOutcome::Accepted { message_id } => message_id,
+        other => panic!("expected accepted: {other:?}"),
+    };
+    let attempt_id = store.claim_intent(&message_id, "codex").await.unwrap();
+    store
+        .mark_unknown(&attempt_id, "test unknown")
+        .await
+        .unwrap();
+
+    let refused = store
+        .reconcile_unknown(
+            &attempt_id,
+            wrkspc_core::Reconciliation::Close {
+                state: wrkspc_core::AttemptState::Dispatched,
+            },
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(wrkspc_core::StoreError::TerminalState { .. })),
+        "a non-terminal Close must be a typed error: {refused:?}"
+    );
+    let unknown = store.unknown_attempts().await.unwrap();
+    assert_eq!(unknown.len(), 1, "the unknown attempt must stay open");
+
+    // A terminal Close still works after the refusal.
+    store
+        .reconcile_unknown(
+            &attempt_id,
+            wrkspc_core::Reconciliation::Close {
+                state: wrkspc_core::AttemptState::Completed,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(store.unknown_attempts().await.unwrap().is_empty());
+}
+
+/// A replay must honor the same recipient filters as first acceptance:
+/// human-class peers never gain recipients, and an ejected peer is
+/// refused loudly rather than smuggled past the resolution gate.
+#[tokio::test]
+async fn replay_recipients_honor_the_resolution_filters() {
+    let store = Store::open_in_memory("replay-filter-test").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("human-1", "Human One", "human")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "codex", "human-1"])
+        .await
+        .unwrap();
+
+    // First acceptance with a human recipient: the human is skipped.
+    let first = store
+        .accept_message(
+            &conversation,
+            "operator",
+            "key-replay-filter",
+            "please review",
+            true,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "codex".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap();
+    let message_id = match first {
+        wrkspc_core::AcceptOutcome::Accepted { message_id } => message_id,
+        other => panic!("expected accepted: {other:?}"),
+    };
+
+    // A replay naming the HUMAN member must not add a recipient.
+    let replay = store
+        .accept_message(
+            &conversation,
+            "operator",
+            "key-replay-filter",
+            "please review",
+            true,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "human-1".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(replay, wrkspc_core::AcceptOutcome::Replay { .. }));
+    assert_eq!(
+        store.message_recipients(&message_id).await.unwrap(),
+        vec!["codex".to_string()],
+        "a human-class peer must never gain a recipient via replay"
+    );
+
+    // A replay naming an EJECTED member is refused loudly.
+    store
+        .set_peer_status("codex", wrkspc_core::PeerStatus::Booted, "operator")
+        .await
+        .unwrap();
+    let ejected = store
+        .accept_message(
+            &conversation,
+            "operator",
+            "key-replay-filter",
+            "please review",
+            true,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "codex".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await;
+    assert!(
+        matches!(ejected, Err(wrkspc_core::StoreError::PeerEjected { .. })),
+        "a replay naming a booted peer must be refused: {ejected:?}"
+    );
+}

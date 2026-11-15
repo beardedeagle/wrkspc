@@ -277,8 +277,42 @@ impl Store {
                     .bind(&existing_id)
                     .fetch_all(&mut *tx)
                     .await?;
-            let mut new_unique_ids: Vec<&str> = Vec::new();
+            // A replay must honor the SAME recipient filters as first
+            // acceptance (resolve_recipients): the caller names its list
+            // explicitly, so an ejected peer is refused loudly, while
+            // self-addresses, duplicates, and human-class peers are
+            // skipped — a retry cannot smuggle a banned target or a
+            // human execution intent past the resolution gate.
+            let mut filtered: Vec<&RecipientRequest> = Vec::with_capacity(recipients.len());
             for recipient in recipients {
+                if recipient.peer_id == sender_id {
+                    continue;
+                }
+                if self
+                    .peer_class(&mut tx, &recipient.peer_id)
+                    .await?
+                    .as_deref()
+                    == Some(HUMAN_CLASS)
+                {
+                    continue;
+                }
+                let status: Option<String> =
+                    sqlx::query_scalar("SELECT status FROM peers WHERE id = ?")
+                        .bind(&recipient.peer_id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                if let Some(status) = status
+                    && status != "enrolled"
+                {
+                    return Err(StoreError::PeerEjected {
+                        peer_id: recipient.peer_id.clone(),
+                        status,
+                    });
+                }
+                filtered.push(recipient);
+            }
+            let mut new_unique_ids: Vec<&str> = Vec::new();
+            for recipient in &filtered {
                 if !committed_ids.iter().any(|id| id == &recipient.peer_id)
                     && !new_unique_ids.contains(&recipient.peer_id.as_str())
                 {
@@ -293,7 +327,7 @@ impl Store {
                     count: committed_ids.len() + new_unique_ids.len(),
                 });
             }
-            for recipient in recipients {
+            for recipient in &filtered {
                 self.assert_member(&mut tx, conversation_id, &recipient.peer_id)
                     .await?;
                 sqlx::query(
