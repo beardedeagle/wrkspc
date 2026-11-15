@@ -407,12 +407,21 @@ impl Dispatcher {
         let provider = Arc::clone(&self.provider);
         let state = Arc::clone(&self.state);
         let lookup_timeout = self.config.lookup_timeout;
+        let cancel_timeout = self.config.cancel_timeout;
         tasks.spawn(async move {
             // Panics inside the drive are attributed to the attempt and
             // reconciled as unknown inside `claim_and_drive` (E07): no
             // panicking drive task ever frees its session silently.
             let release_state = Arc::clone(&state);
-            let result = claim_and_drive(store, provider, state, intent, lookup_timeout).await;
+            let result = claim_and_drive(
+                store,
+                provider,
+                state,
+                intent,
+                lookup_timeout,
+                cancel_timeout,
+            )
+            .await;
             {
                 // Release the reservation on EVERY exit path (success,
                 // error, panic) so the intent can be swept again.
@@ -475,9 +484,13 @@ impl Dispatcher {
                                     ),
                                 }
                             });
-                        } else {
+                        } else if state_guard.active.contains(&attempt_id) {
                             // Pre-registration window: the drive consumes
                             // this entry and refuses to send the prompt.
+                            // Guarded by `active` (under the SAME lock
+                            // the drive's exit guard takes) so a late
+                            // cancel task cannot park an entry after the
+                            // drive already exited.
                             let (flag, _rx) = tokio::sync::watch::channel(true);
                             state_guard.pending_cancels.insert(attempt_id.clone(), flag);
                         }
@@ -500,6 +513,7 @@ async fn claim_and_drive(
     state: Arc<Mutex<DispatchState>>,
     intent: DueIntent,
     lookup_timeout: Duration,
+    cancel_timeout: Duration,
 ) -> (String, String, Result<(), String>) {
     let conversation_id = intent.conversation_id.clone();
     let ok = |attempt_id: String| (attempt_id, conversation_id.clone(), Ok(()));
@@ -607,6 +621,7 @@ async fn claim_and_drive(
             provider,
             state,
             lookup_timeout,
+            cancel_timeout,
         },
         intent,
         claim.clone(),

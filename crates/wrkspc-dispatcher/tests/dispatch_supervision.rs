@@ -24,7 +24,7 @@ fn config() -> DispatcherConfig {
     DispatcherConfig {
         tick: Duration::from_millis(10),
         lookup_timeout: Duration::from_millis(300),
-        ..Default::default()
+        cancel_timeout: Duration::from_millis(500),
     }
 }
 
@@ -472,7 +472,7 @@ async fn hung_adapter_cancel_never_blocks_the_dispatcher() {
 
     #[derive(Default)]
     struct Inner {
-        prompt_started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        prompt_starts: std::sync::Mutex<u32>,
     }
     #[derive(Clone, Default)]
     struct HungCancelDriver(Arc<Inner>);
@@ -485,11 +485,10 @@ async fn hung_adapter_cancel_never_blocks_the_dispatcher() {
             let inner = Arc::clone(&self.0);
             let session_id = session_id.to_string();
             Box::pin(async move {
-                let (tx, rx) = oneshot::channel();
-                *inner.prompt_started.lock().unwrap() = Some(tx);
-                // Park until released: the flag arm must close the turn
-                // WITHOUT the adapter ever confirming.
-                let _ = rx.await;
+                *inner.prompt_starts.lock().unwrap() += 1;
+                // Park forever: the adapter NEVER confirms the turn,
+                // and the interrupt below never resolves either.
+                std::future::pending::<()>().await;
                 tracing::debug!(%session_id, "prompt released");
                 Ok(StopReason::Cancelled)
             })
@@ -524,7 +523,7 @@ async fn hung_adapter_cancel_never_blocks_the_dispatcher() {
     // Wait for the turn to actually start (the prompt parks).
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if driver.0.prompt_started.lock().unwrap().is_some() {
+            if *driver.0.prompt_starts.lock().unwrap() == 1 {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -555,20 +554,59 @@ async fn hung_adapter_cancel_never_blocks_the_dispatcher() {
         "an in-flight turn cancels as an attempt: {outcome:?}"
     );
 
-    // The flag arm closes the turn deterministically: the attempt
-    // reaches Canceled without the adapter ever answering.
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // The deadline-bounded await expires (the adapter never confirms):
+    // the attempt must go UNKNOWN, never a synthetic Canceled — a
+    // synthetic terminal state would release the busy slot while the
+    // ACP request still streams, and the next turn would steal its
+    // chunks.
+    let unknown_attempt_id = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let open = store.open_attempts().await.unwrap();
-            let due = store.due_intents().await.unwrap();
-            if open.is_empty() && due.is_empty() {
-                return;
+            let unknown = store.unknown_attempts().await.unwrap();
+            if unknown.len() == 1 {
+                return unknown[0].attempt_id.clone();
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the turn must close as canceled without adapter confirmation");
+    .expect("the unconfirmed cancel must land the attempt in unknown");
+
+    // Quarantine: the peer's busy slot is retained, so a second
+    // executable message for the same peer must NOT start a second
+    // prompt on the still-running session.
+    store
+        .accept_message(
+            &conversation,
+            "operator",
+            "second-codex-message",
+            "another run please",
+            true,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "codex".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        *driver.0.prompt_starts.lock().unwrap(),
+        1,
+        "a quarantined peer must not re-dispatch while its old turn is unconfirmed"
+    );
+
+    // The operator can still reconcile the unknown attempt; the
+    // re-queued intent stays parked behind the busy gate.
+    store
+        .reconcile_unknown(&unknown_attempt_id, wrkspc_core::Reconciliation::Retry)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        *driver.0.prompt_starts.lock().unwrap(),
+        1,
+        "the quarantined session must not run even a reconciled retry"
+    );
 
     // Shutdown still completes: the parked cancel task rides the
     // process teardown, never the run loop.

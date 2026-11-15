@@ -3,7 +3,7 @@
 
 use super::{DispatchState, InFlight};
 use crate::driver::{SessionBinding, SessionProvider};
-use agent_client_protocol::v1::schema::{ContentBlock, StopReason, TextContent};
+use agent_client_protocol::v1::schema::{ContentBlock, TextContent};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -61,6 +61,9 @@ struct ActiveGuard {
     /// The busy slot this drive holds (`Some(peer_id)` when the busy
     /// insert succeeded) — keyed by peer id, like the set itself (E08).
     busy_peer: Option<String>,
+    /// Quarantine: an unconfirmed mid-turn cancel keeps the peer busy
+    /// so the session is not reused while the adapter's turn still runs.
+    keep_busy: std::cell::Cell<bool>,
     state: Arc<Mutex<DispatchState>>,
 }
 
@@ -69,7 +72,13 @@ impl Drop for ActiveGuard {
         let mut state = super::lock_state(&self.state);
         state.active.remove(&self.attempt_id);
         state.in_flight.remove(&self.attempt_id);
-        if let Some(peer_id) = &self.busy_peer {
+        // Every drive exit clears the attempt's parked cancel — an
+        // early return before registration must not strand a watch
+        // channel for the dispatcher's lifetime.
+        state.pending_cancels.remove(&self.attempt_id);
+        if !self.keep_busy.get()
+            && let Some(peer_id) = &self.busy_peer
+        {
             state.busy_peers.remove(peer_id);
         }
     }
@@ -86,6 +95,10 @@ pub(crate) struct DriveContext {
     pub state: Arc<Mutex<DispatchState>>,
     /// Deadline for the churn re-check lookup.
     pub lookup_timeout: Duration,
+    /// Deadline for awaiting the adapter's real outcome after an
+    /// operator cancel: beyond it the cancel is unconfirmed and the
+    /// attempt goes unknown (see the mid-turn cancel arm).
+    pub cancel_timeout: Duration,
 }
 
 /// Drives one claimed intent to its terminal state.
@@ -114,10 +127,12 @@ pub(crate) async fn drive_intent(
         provider,
         state,
         lookup_timeout,
+        cancel_timeout,
     } = ctx;
     let _guard = ActiveGuard {
         attempt_id: attempt_id.clone(),
         busy_peer,
+        keep_busy: std::cell::Cell::new(false),
         state: Arc::clone(&state),
     };
 
@@ -411,11 +426,13 @@ pub(crate) async fn drive_intent(
         if !guidance.is_empty()
             && let Err(claim_error) = store.release_guidance_claim(&attempt_id).await
         {
-            tracing::warn!(
-                %claim_error,
-                %attempt_id,
-                "guidance claim release failed after pre-send cancel",
-            );
+            // The claim must not stay pinned to an attempt about to be
+            // closed: propagate instead of writing Canceled, so the
+            // drive-failure reconciliation re-runs the release
+            // atomically with mark_unknown.
+            return Err(format!(
+                "guidance claim release failed after pre-send cancel: {claim_error}"
+            ));
         }
         store
             .mark_terminal(
@@ -447,6 +464,10 @@ pub(crate) async fn drive_intent(
     });
     blocks.splice(1..1, guidance_blocks);
 
+    // Quarantine: an unconfirmed mid-turn cancel retains the peer's
+    // busy slot (see the mid-turn cancel arm) so the session is not
+    // reused while the adapter's turn still runs.
+    let mut quarantine_busy = false;
     let outcome = {
         // Record the turn's streamed output while it runs: agent message
         // chunks become committed `turn.chunk` events attributed to this
@@ -462,10 +483,28 @@ pub(crate) async fn drive_intent(
                 changed = cancel_flag_rx.changed() => {
                     // An operator cancel flipped the flag mid-turn: the
                     // durable cancellation is recorded and the adapter
-                    // interrupt was attempted; closing deterministically
-                    // never waits on the adapter to confirm.
+                    // interrupt was attempted. The terminal state must
+                    // come from the adapter's REAL outcome — a
+                    // synthetic Cancelled would release the busy slot
+                    // while the ACP request still streams, letting the
+                    // next turn attribute the old turn's chunks to
+                    // itself. The cancel CALLER stays nonblocking; the
+                    // drive alone waits, deadline-bounded.
                     if changed.is_ok() && *cancel_flag_rx.borrow() {
-                        break Ok(StopReason::Cancelled);
+                        match tokio::time::timeout(cancel_timeout, &mut prompt_fut).await {
+                            Ok(outcome) => break outcome,
+                            Err(_elapsed) => {
+                                // The adapter ignored the interrupt:
+                                // record Unknown and quarantine the
+                                // peer (retain the busy slot) so the
+                                // session is not reused while the
+                                // unconfirmed turn still runs.
+                                quarantine_busy = true;
+                                break Err(format!(
+                                    "cancel unconfirmed after {cancel_timeout:?}: adapter kept the turn running"
+                                ));
+                            }
+                        }
                     }
                 }
                 event = events.recv(), if events_open => {
@@ -580,6 +619,7 @@ pub(crate) async fn drive_intent(
         }
         outcome
     };
+    _guard.keep_busy.set(quarantine_busy);
     // A partial capture is never reported as complete: committed chunk
     // write failures leave their own visible marker.
     if capture_write_failures > 0 {
@@ -623,14 +663,10 @@ pub(crate) async fn drive_intent(
                 .await;
         }
         Err(error) => {
-            // Guidance stays undelivered: release this attempt's claim so
-            // the next usable turn re-rides it rather than replaying it
-            // blindly after an undeterminable outcome (E09/C3).
-            if !guidance.is_empty()
-                && let Err(claim_error) = store.release_guidance_claim(&attempt_id).await
-            {
-                tracing::warn!(%claim_error, %attempt_id, "guidance claim release failed; guidance stays claimed until the attempt is reconciled");
-            }
+            // mark_unknown releases any guidance claim in the SAME
+            // transaction as the unknown write (C3): the next usable
+            // turn re-rides the guidance instead of a claimed-by-dead
+            // attempt row blocking every future claim.
             store
                 .mark_unknown(&attempt_id, &error)
                 .await

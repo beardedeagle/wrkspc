@@ -187,11 +187,29 @@ pub(crate) async fn post_message(
                 // Fan out from the COMMITTED routing: mention
                 // resolution happened in the gate above, and the
                 // committed recipient set is the authoritative one.
-                let recipient_peers = state
-                    .store
-                    .message_recipients(&message_id)
-                    .await
-                    .map_err(store_error)?;
+                let recipient_peers = match state.store.message_recipients(&message_id).await {
+                    Ok(recipient_peers) => recipient_peers,
+                    Err(error) => {
+                        // The message is ALREADY committed: a routing
+                        // read failure must not 500 and invite a
+                        // duplicate post. Fail visible through the same
+                        // post-commit event; startup repair re-queues
+                        // the fan-out from the committed routing.
+                        tracing::error!(%error, %message_id, "committed routing read failed");
+                        let _ = state
+                            .store
+                            .append_event(
+                                &id,
+                                "delivery.queueing_failed",
+                                &json!({
+                                    "message_id": message_id,
+                                    "error": error.to_string(),
+                                }),
+                            )
+                            .await;
+                        Vec::new()
+                    }
+                };
                 if let Err(error) = state
                     .store
                     .queue_remote_deliveries(wrkspc_core::RemoteFanoutRequest {
