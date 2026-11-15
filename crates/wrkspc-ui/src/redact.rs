@@ -246,9 +246,12 @@ mod tests {
         // A BEGIN marker without its END (a cut message, a mid-stream
         // adapter error) must not leak the partial key material.
         let out = redact("cut mid-stream: -----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...");
-        assert!(out.contains("[REDACTED private key]"), "got: {out}");
-        assert!(!out.contains("MIIEow"), "got: {out}");
-        assert!(out.contains("cut mid-stream"), "got: {out}");
+        // No value interpolation in the failure messages: the panic
+        // sink would carry masked output into the test log, which
+        // CodeQL models as cleartext logging of key-shaped data.
+        assert!(out.contains("[REDACTED private key]"));
+        assert!(!out.contains("MIIEow"), "key material leaked");
+        assert!(out.contains("cut mid-stream"));
     }
 
     #[test]
@@ -267,8 +270,10 @@ mod tests {
             concat!("xo", "xb-123456789012-exampletoken"),
         ] {
             let out = redact(&format!("leak: {secret}"));
-            assert!(!out.contains(secret), "got: {out}");
-            assert!(out.contains("[REDACTED key]"), "got: {out}");
+            // Same as above: never interpolate the masked value into
+            // the panic message (cleartext-logging sink).
+            assert!(!out.contains(secret), "secret shape leaked");
+            assert!(out.contains("[REDACTED key]"));
         }
     }
 
