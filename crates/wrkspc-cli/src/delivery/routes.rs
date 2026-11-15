@@ -42,8 +42,7 @@ pub(crate) async fn delivery_claim(
                 serde_json::from_str(&task.task_json).unwrap_or_default();
             if let Some(conversation_id) =
                 payload["metadata"]["delivery"]["conversation_id"].as_str()
-            {
-                let _ = state
+                && let Err(error) = state
                     .store
                     .append_event(
                         conversation_id,
@@ -60,7 +59,9 @@ pub(crate) async fn delivery_claim(
                                 .unwrap_or_default(),
                         }),
                     )
-                    .await;
+                    .await
+            {
+                tracing::warn!(%error, task_id = %body.task_id, "delivery.claimed feed event failed");
             }
             (
                 StatusCode::OK,
@@ -276,7 +277,7 @@ pub(crate) async fn delivery_ack(
     if let Err(error) = state.store.release_delivery_claim(&body.task_id).await {
         tracing::warn!(%error, task_id = %body.task_id, "claim cleanup failed");
     }
-    let _ = state
+    if let Err(error) = state
         .store
         .append_event(
             &conversation_id,
@@ -287,7 +288,10 @@ pub(crate) async fn delivery_ack(
                 "recipient_peer": recipient_peer,
             }),
         )
-        .await;
+        .await
+    {
+        tracing::warn!(%error, task_id = %body.task_id, "delivery.acked feed event failed");
+    }
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({"acked": true})),
@@ -454,11 +458,16 @@ pub(crate) async fn delivery_report(
     // A final terminal state completes the reconciliation loop: the
     // hub's mirrored unknown row (if any) is consumed — scoped to the
     // authorized (task, host) tuple, so a report can never erase
-    // another host's mirror.
-    let _ = state
+    // another host's mirror. A failed consumption is logged: the mirror
+    // would otherwise linger indefinitely with no operator-visible
+    // trace.
+    if let Err(error) = state
         .store
         .consume_hub_unknown(&body.attempt_id, &body.task_id, &host)
-        .await;
+        .await
+    {
+        tracing::warn!(%error, attempt_id = %body.attempt_id, "unknown mirror consumption failed");
+    }
     // Guidance consumption ack (hub→node propagation loop): the node
     // reports which authoritative rows rode a successful prompt; the
     // hub marks them delivered — scoped to THIS delivery's validated
@@ -475,7 +484,7 @@ pub(crate) async fn delivery_report(
             tracing::warn!(%error, "guidance consumption ack failed; rows stay pending and re-ride");
         }
     }
-    let _ = state
+    if let Err(error) = state
         .store
         .append_event(
             &conversation_id,
@@ -489,7 +498,10 @@ pub(crate) async fn delivery_report(
                 "instance_id": body.instance_id,
             }),
         )
-        .await;
+        .await
+    {
+        tracing::warn!(%error, attempt_id = %body.attempt_id, "delivery.attempt feed event failed");
+    }
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({"reported": true})),

@@ -220,14 +220,30 @@ pub(crate) async fn create_conversation(
             })),
         ));
     }
+    // Membership checks run in parallel: a 32-member room must not pay
+    // 32 serialized store round trips per creation.
+    let mut checks = tokio::task::JoinSet::new();
     for member in &body.members {
-        let enrolled = state
-            .store
-            .peer_details(member)
-            .await
-            .map_err(store_error)?
-            .is_some();
-        if !enrolled {
+        let store = state.store.clone();
+        let member = member.clone();
+        checks.spawn(async move {
+            let enrolled = store.peer_details(&member).await;
+            (member, enrolled)
+        });
+    }
+    while let Some(joined) = checks.join_next().await {
+        let (member, enrolled) = match joined {
+            Ok(pair) => pair,
+            // A panicked membership check is a server fault, never a
+            // silent enrolment.
+            Err(error) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("membership check failed: {error}") })),
+                ));
+            }
+        };
+        if enrolled.map_err(store_error)?.is_none() {
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({ "error": "member not enrolled", "member": member })),

@@ -4,11 +4,8 @@
 
 mod common;
 use common::*;
-use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
 use wrkspc_core::Store;
-use wrkspc_ui::{UiConfig, UiServer};
+use wrkspc_ui::UiConfig;
 
 /// The peers route returns the roster with peer id and live state.
 #[tokio::test]
@@ -18,35 +15,17 @@ async fn peers_route_returns_the_roster() {
         .upsert_roster_presence("codex", "codex", "harness", "node-test-1", "connected")
         .await
         .unwrap();
-    let cancel: Arc<FakeCancel> = Arc::new(FakeCancel {
-        calls: Mutex::new(Vec::new()),
-    });
-    let ui = UiServer::new(
+    let ui = spawn_ui_on(
         store,
-        cancel,
         UiConfig {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            cookie_secure: false,
             token: Some(TOKEN.to_string()),
-            queue_remote_deliveries: false,
-            hub_role: false,
-            hub_connected: false,
+            ..Default::default()
         },
-        None,
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(async move {
-        ui.serve_on(listener, async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .expect("ui serves");
-    });
+    )
+    .await;
 
     let res = reqwest::Client::new()
-        .get(format!("http://{addr}/api/peers"))
+        .get(format!("{}/api/peers", ui.base))
         .bearer_auth(TOKEN)
         .send()
         .await
@@ -57,8 +36,7 @@ async fn peers_route_returns_the_roster() {
     assert_eq!(peers[0]["peer_id"], "codex");
     assert_eq!(peers[0]["state"], "connected");
 
-    let _ = shutdown_tx.send(());
-    let _ = server.await;
+    let _ = ui.shutdown.send(());
 }
 
 /// The moderation surface renames, boots, forgets, and audits; the operator peer is protected.
@@ -184,6 +162,7 @@ async fn moderation_surface_renames_boots_forgets_and_audits() {
         .await
         .unwrap();
     assert_eq!(one.len(), 1);
+    let _ = ui.shutdown.send(());
 }
 
 /// Hub role creates conversations (201) and validates members (422 for unknown, no ghost peer).
@@ -198,37 +177,21 @@ async fn hub_role_creates_conversations_and_validates_members() {
         .ensure_peer_on_host("codex", "codex", "harness", "node-test-1")
         .await
         .unwrap();
-    let cancel: Arc<FakeCancel> = Arc::new(FakeCancel {
-        calls: Mutex::new(Vec::new()),
-    });
-    let ui = UiServer::new(
+    let ui = spawn_ui_on(
         store,
-        cancel,
         UiConfig {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            cookie_secure: false,
-            token: Some(TOKEN.to_string()),
             queue_remote_deliveries: true,
             hub_role: true,
-            hub_connected: false,
+            token: Some(TOKEN.to_string()),
+            ..Default::default()
         },
-        None,
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(async move {
-        ui.serve_on(listener, async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .expect("ui serves");
-    });
+    )
+    .await;
     let client = reqwest::Client::new();
 
     // Unknown member: 422, named member, no ghost peer created.
     let res = client
-        .post(format!("http://{addr}/api/conversations"))
+        .post(format!("{}/api/conversations", ui.base))
         .bearer_auth(TOKEN)
         .json(&serde_json::json!({ "members": ["operator", "ghost"] }))
         .send()
@@ -241,7 +204,7 @@ async fn hub_role_creates_conversations_and_validates_members() {
 
     // Enrolled members: 201 + id, conversation visible in the list.
     let res = client
-        .post(format!("http://{addr}/api/conversations"))
+        .post(format!("{}/api/conversations", ui.base))
         .bearer_auth(TOKEN)
         .json(&serde_json::json!({ "members": ["operator", "codex"] }))
         .send()
@@ -251,7 +214,7 @@ async fn hub_role_creates_conversations_and_validates_members() {
     let body: serde_json::Value = res.json().await.unwrap();
     let id = body["id"].as_str().unwrap().to_string();
     let res = client
-        .get(format!("http://{addr}/api/conversations"))
+        .get(format!("{}/api/conversations", ui.base))
         .bearer_auth(TOKEN)
         .send()
         .await
@@ -260,8 +223,7 @@ async fn hub_role_creates_conversations_and_validates_members() {
     assert_eq!(conversations.len(), 1);
     assert_eq!(conversations[0]["id"], id);
 
-    let _ = shutdown_tx.send(());
-    let _ = server.await;
+    let _ = ui.shutdown.send(());
 }
 
 /// Node role refuses conversation creation (404: no shared-store operator surface).
@@ -272,35 +234,17 @@ async fn node_role_refuses_conversation_creation() {
         .ensure_peer("operator", "operator", "human")
         .await
         .unwrap();
-    let cancel: Arc<FakeCancel> = Arc::new(FakeCancel {
-        calls: Mutex::new(Vec::new()),
-    });
-    let ui = UiServer::new(
+    let ui = spawn_ui_on(
         store,
-        cancel,
         UiConfig {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            cookie_secure: false,
             token: Some(TOKEN.to_string()),
-            queue_remote_deliveries: false,
-            hub_role: false,
-            hub_connected: false,
+            ..Default::default()
         },
-        None,
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(async move {
-        ui.serve_on(listener, async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .expect("ui serves");
-    });
+    )
+    .await;
 
     let res = reqwest::Client::new()
-        .post(format!("http://{addr}/api/conversations"))
+        .post(format!("{}/api/conversations", ui.base))
         .bearer_auth(TOKEN)
         .json(&serde_json::json!({ "members": ["operator"] }))
         .send()
@@ -310,6 +254,5 @@ async fn node_role_refuses_conversation_creation() {
     // conversation would never reach the hub).
     assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
 
-    let _ = shutdown_tx.send(());
-    let _ = server.await;
+    let _ = ui.shutdown.send(());
 }

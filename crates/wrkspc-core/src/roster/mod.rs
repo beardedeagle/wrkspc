@@ -164,7 +164,7 @@ pub enum PresenceOutcome {
 const PRESENCE_STALE_SECS: i64 = 30;
 
 /// Maps a roster query row onto its struct, ageing the state.
-pub(crate) fn roster_entry(row: sqlx::sqlite::SqliteRow) -> RosterEntry {
+pub(crate) fn roster_entry(row: &sqlx::sqlite::SqliteRow) -> RosterEntry {
     let updated_at: String = row.get("updated_at");
     let class: String = row.get("class");
     RosterEntry {

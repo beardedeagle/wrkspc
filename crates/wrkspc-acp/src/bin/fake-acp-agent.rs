@@ -7,7 +7,9 @@
 //! Speaks ACP over stdio (the phase 0 spike's agent mode, extended):
 //! - `session/new` → fresh id; with `--record FILE` it writes the
 //!   request's `mcpServers` as JSON (the injection runtime proof)
-//! - `session/set_config_option` → acknowledged (round-trip proof)
+//! - `session/set_config_option` → acknowledged; with
+//!   `--record-config FILE` the request is written as JSON (the typed
+//!   payload round-trip proof)
 //! - `session/prompt` → echo chunk + `EndTurn`; trailing content
 //!   `"slow"` delays 1.5 s; `"never"` holds the turn open until
 //!   `session/cancel`; a prompt containing the `--die-on` substring
@@ -19,7 +21,12 @@
 //! - with `--request-permission FILE`, every prompt also sends a
 //!   `session/request_permission` request to the client (from a
 //!   subtask, never awaited inside the dispatch loop) and records the
-//!   client's outcome in FILE
+//!   client's outcome as JSON in FILE
+//! - with `--log-turn FILE`, each turn appends `start\t<text>\t<millis>` on
+//!   receipt and `end\t<text>` on completion (serialization evidence:
+//!   a serialized loop never interleaves turns)
+//! - with `--exit-after-ms MS`, the process exits after MS idle
+//!   milliseconds (a real ACP adapter dying idle)
 //! - `session/cancel` → responds to the held prompt with `Cancelled`
 //!   (the HLD's confirmed cancellation carrier)
 
@@ -40,6 +47,25 @@ struct FakeState {
     sessions: HashMap<String, ()>,
     next_id: u64,
     held: HashMap<String, Responder<PromptResponse>>,
+}
+
+/// Appends one `event\t<text>\t<millis>` line to the turn log
+/// (newlines in the prompt text are flattened so each turn is exactly
+/// one line). The trailing millisecond timestamp lets serialization
+/// tests prove turns did not overlap without a second clock source.
+fn log_turn_event(path: &str, event: &str, text: &str) {
+    use std::io::Write as _;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    let line = format!("{event}\t{}\t{millis}\n", text.replace('\n', " "));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    let _ = file.write_all(line.as_bytes());
 }
 
 #[tokio::main]
@@ -63,21 +89,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .windows(2)
         .find(|pair| pair[0] == "--touch")
         .map(|pair| pair[1].clone());
-    // --log-prompts FILE: append `<millis>\t<text>` per prompt receipt
-    // (serialization evidence: the gaps prove turns never overlap).
-    let log_prompts = args
+    // --record-config FILE: write every session/set_config_option
+    // request here as JSON (the typed payload round-trip proof).
+    let record_config = args
         .windows(2)
-        .find(|pair| pair[0] == "--log-prompts")
+        .find(|pair| pair[0] == "--record-config")
+        .map(|pair| pair[1].clone());
+    // --log-turn FILE: append `start\t<text>` on prompt receipt and
+    // `end\t<text>` on turn completion (serialization evidence: the
+    // order of the lines proves turns never overlap).
+    let log_turn = args
+        .windows(2)
+        .find(|pair| pair[0] == "--log-turn")
         .map(|pair| pair[1].clone());
     // --request-permission FILE: during every prompt, send a
     // `session/request_permission` request to the client and record the
-    // client's outcome (its Debug form) in FILE — the integration test's
+    // client's outcome (its JSON form) in FILE — the integration test's
     // proof that the client's permission policy ran.
     let permission_probe = args
         .windows(2)
         .find(|pair| pair[0] == "--request-permission")
         .map(|pair| pair[1].clone());
+    // --exit-after-ms MS: exit the process after MS idle milliseconds —
+    // a real ACP adapter dying while its session is cached and idle.
+    let exit_after_ms = args
+        .windows(2)
+        .find(|pair| pair[0] == "--exit-after-ms")
+        .and_then(|pair| pair[1].parse::<u64>().ok());
     let state = Arc::new(Mutex::new(FakeState::default()));
+
+    if let Some(ms) = exit_after_ms {
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            std::process::exit(0);
+        });
+    }
 
     Agent
         .v1()
@@ -135,14 +181,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |req: SetSessionConfigOptionRequest,
-                        responder: Responder<SetSessionConfigOptionResponse>,
-                        _cx: ConnectionTo<Client>| {
-                // The ack is the whole contract: the fake holds no
-                // per-session config state, so the round trip (request
-                // received, response delivered) is what the test proves.
-                let _ = req;
-                responder.respond(SetSessionConfigOptionResponse::new(Vec::new()))
+            {
+                let record_config = record_config.clone();
+                async move |req: SetSessionConfigOptionRequest,
+                            responder: Responder<SetSessionConfigOptionResponse>,
+                            _cx: ConnectionTo<Client>| {
+                    // The ack is the whole contract: the fake holds no
+                    // per-session config state. With --record-config the
+                    // received request is written as JSON so the test can
+                    // assert the exact payload the wire carried.
+                    if let Some(path) = record_config.clone()
+                        && let Ok(json) = serde_json::to_string(&req)
+                    {
+                        let _ = std::fs::write(path, json);
+                    }
+                    responder.respond(SetSessionConfigOptionResponse::new(Vec::new()))
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -151,7 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let state = state.clone();
                 let die_on = die_on.clone();
                 let touch = touch.clone();
-                let log_prompts = log_prompts.clone();
+                let log_turn = log_turn.clone();
                 let permission_probe = permission_probe.clone();
                 async move |req: PromptRequest,
                             responder: Responder<PromptResponse>,
@@ -179,24 +233,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         })
                         .collect::<Vec<_>>()
                         .join(" ");
-                    if let Some(path) = &log_prompts {
-                        // One line per prompt; the dispatcher's addressing
-                        // prefix embeds newlines, so flatten them.
-                        let line = format!(
-                            "{}\t{}\n",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis(),
-                            text.replace('\n', " ")
-                        );
-                        use std::io::Write as _;
-                        let mut file = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(path)
-                            .unwrap();
-                        let _ = file.write_all(line.as_bytes());
+                    if let Some(path) = &log_turn {
+                        log_turn_event(path, "start", &text);
                     }
 
                     // Crash-before-write: die without responding so the
@@ -231,7 +269,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .block_task()
                                 .await
                                 .map(|response| response.outcome);
-                            let _ = std::fs::write(path, format!("{outcome:?}"));
+                            // JSON, not Debug text: the test parses the
+                            // outcome back into a typed value.
+                            let recorded = match outcome {
+                                Ok(outcome) => serde_json::to_string(&outcome)
+                                    .unwrap_or_else(|error| format!("serialize failed: {error}")),
+                                Err(error) => format!("request failed: {error}"),
+                            };
+                            let _ = std::fs::write(path, recorded);
                         });
                     }
 
@@ -258,6 +303,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         content if content.ends_with("slow") => {
                             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                            if let Some(path) = &log_turn {
+                                log_turn_event(path, "end", &text);
+                            }
                             responder.respond(PromptResponse::new(StopReason::EndTurn))?;
                             connection.send_notification(SessionNotification::new(
                                 sid,
@@ -271,6 +319,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ))?;
                         }
                         _ => {
+                            if let Some(path) = &log_turn {
+                                log_turn_event(path, "end", &text);
+                            }
                             responder.respond(PromptResponse::new(StopReason::EndTurn))?;
                             connection.send_notification(SessionNotification::new(
                                 sid,

@@ -9,7 +9,7 @@ use rmcp::{ServiceExt, service::RoleClient, service::RunningService};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 use wrkspc_core::Store;
 use wrkspc_mcp::{HttpListener, HttpListenerConfig, McpServer};
@@ -159,7 +159,7 @@ async fn post_message_accepts_and_replays_idempotently() {
 /// room-visible and dispatch nothing.
 #[tokio::test]
 async fn post_message_without_recipients_wakes_nobody() {
-    let (store, operator, _agent, conversation, server) = seeded().await;
+    let (store, _operator, agent, conversation, server) = seeded().await;
     let client = connect(server).await;
 
     let result = call(
@@ -187,8 +187,16 @@ async fn post_message_without_recipients_wakes_nobody() {
         .to_string();
 
     assert!(
-        store.claim_intent(&message_id, &operator).await.is_err(),
-        "an unaddressed post must not raise an intent for any member"
+        store.claim_intent(&message_id, &agent).await.is_err(),
+        "an unaddressed post must not raise an intent for the agent either"
+    );
+    assert!(
+        store
+            .message_recipients(&message_id)
+            .await
+            .expect("recipients")
+            .is_empty(),
+        "an unaddressed post must not fan out to any recipient"
     );
 }
 
@@ -259,12 +267,11 @@ async fn read_conversation_enforces_membership_and_cursor() {
     let client = connect(server).await;
 
     // Two messages committed by the operator, then the agent reads them.
-    for (i, key) in ["key-a", "key-b"].iter().enumerate() {
+    for key in ["key-a", "key-b"] {
         store
             .accept_message(&conversation, &operator, key, "ping", false, &[])
             .await
             .unwrap();
-        let _ = i;
     }
 
     let all = call(
@@ -337,6 +344,25 @@ fn http_packet(body: &str) -> serde_json::Value {
         .expect("HTTP response contains a JSON-RPC packet")
 }
 
+/// Waits (bounded) until the HTTP listener accepts a TCP connection.
+///
+/// The listener socket is already bound before `serve_on` is spawned, so
+/// a connect goes into the kernel backlog even while the accept loop is
+/// still starting. A fixed sleep guesses at that interleave and flakes
+/// under load; a bounded connect poll observes readiness directly.
+async fn wait_until_reachable(addr: SocketAddr) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(_stream) => return,
+            Err(error) if tokio::time::Instant::now() >= deadline => {
+                panic!("listener at {addr} never became reachable: {error}");
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+}
+
 /// The HTTP listener gates access and serves an authenticated MCP session.
 #[tokio::test]
 async fn http_listener_enforces_token_gate() {
@@ -360,8 +386,8 @@ async fn http_listener_enforces_token_gate() {
             .await
     });
 
-    // Give the listener a moment to start accepting.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait for the accept loop, not for a guessed wall-clock delay.
+    wait_until_reachable(addr).await;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -384,15 +410,30 @@ async fn http_listener_enforces_token_gate() {
         .unwrap();
     assert_eq!(wrong_token.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    // Valid token passes the gate (the transport answers; assert the
-    // gate opened rather than a specific transport status).
+    // Valid token passes the gate. Assert the concrete transport answer,
+    // not merely "not 401": a bare GET has no session to replay, so the
+    // streamable-HTTP transport answers 406 NOT_ACCEPTABLE — that exact
+    // status proves the request reached MCP and not some stray route.
     let good_token = client
         .get(format!("{base}/mcp"))
         .bearer_auth("good-token")
         .send()
         .await
         .unwrap();
-    assert_ne!(good_token.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(good_token.status(), reqwest::StatusCode::NOT_ACCEPTABLE);
+
+    // Auth-scheme is case-insensitive (RFC 9110 §11.1): a lowercase
+    // `bearer` header must pass the gate exactly like `Bearer`.
+    let lowercase_scheme = client
+        .get(format!("{base}/mcp"))
+        .header(reqwest::header::AUTHORIZATION, "bearer good-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        lowercase_scheme.status(),
+        reqwest::StatusCode::NOT_ACCEPTABLE
+    );
 
     // Exercise the transport, not only the gate: negotiate, acknowledge
     // initialization, then call a membership-scoped tool in the same session.
@@ -520,6 +561,31 @@ async fn read_conversation_rejects_out_of_range_limits() {
             "the limit contract must surface: {text}"
         );
     }
+}
+
+/// A negative cursor is rejected loudly instead of silently meaning
+/// "from the start": a harness computing a bad cursor must learn the
+/// contract, not get a full replay it did not ask for.
+#[tokio::test]
+async fn read_conversation_rejects_negative_cursor() {
+    let (_store, _operator, _agent, conversation, server) = seeded().await;
+    let client = connect(server).await;
+
+    let result = call_result(
+        &client,
+        "read-conversation",
+        serde_json::json!({
+            "conversation_id": conversation,
+            "after_seq": -1,
+        }),
+    )
+    .await
+    .expect("the rejection must arrive as an is_error envelope");
+    let text = error_text(&result, "negative cursor");
+    assert!(
+        text.contains("after_seq must be"),
+        "the cursor contract must surface: {text}"
+    );
 }
 
 /// A hub-connected node mirrors posts without raising local execution

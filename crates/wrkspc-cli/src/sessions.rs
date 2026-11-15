@@ -90,6 +90,13 @@ impl PeerSession {
 struct Inner {
     configs: HashMap<String, SessionConfig>,
     sessions: tokio::sync::Mutex<HashMap<String, Arc<PeerSession>>>,
+    /// Per-peer spawn serialization. A std mutex, DELIBERATELY: the map
+    /// is insert-only (entries are never mutated after creation — every
+    /// mutation happens under each entry's own tokio lock), so this
+    /// guard is never held across an await and a poisoned guard is safe
+    /// to recover. The sessions/backoff maps guard state that IS
+    /// mutated and must survive being held across awaits, so they stay
+    /// `tokio::sync::Mutex`.
     spawn_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-peer state: next allowed spawn attempt and consecutive
     /// failure count (exponential backoff, capped).
@@ -404,7 +411,11 @@ async fn spawn_session(
             http_task: Some(guard),
         });
     } else {
-        vec![bridge_injection(db, &config.peer_id, hub_connected)]
+        vec![
+            bridge_injection(db, &config.peer_id, hub_connected).map_err(|error| {
+                format!("cannot resolve the running binary for the MCP bridge: {error}")
+            })?,
+        ]
     };
     let session_id = handle
         .new_session_with_mcp(config.cwd.clone(), mcp)
@@ -507,10 +518,10 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// A lookup queued behind a failing spawn must re-check backoff
-    /// AFTER acquiring the per-peer spawn lock: the first holder fails
-    /// and sets the backoff deadline while the second waits, so the
-    /// pre-lock admission check was already stale (E10).
+    // A lookup queued behind a failing spawn must re-check backoff
+    // AFTER acquiring the per-peer spawn lock: the first holder fails
+    // and sets the backoff deadline while the second waits, so the
+    // pre-lock admission check was already stale (E10).
     #[tokio::test]
     async fn queued_lookup_rechecks_backoff_after_the_spawn_lock() {
         let dir = std::env::temp_dir().join(format!(
@@ -523,9 +534,16 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("spawns");
-        // Each spawn writes a marker line, then dies after a pause
-        // without an ACP handshake: a deterministic failing spawn.
-        let command = format!("sh -c 'echo x >> {}; sleep 1; exit 1'", marker.display());
+        let release = dir.join("release");
+        // Each spawn writes a marker line, then PARKS until the test
+        // creates the release file, then exits without an ACP
+        // handshake: a deterministic failing spawn whose failure
+        // timing the test owns (no wall-clock race).
+        let command = format!(
+            "sh -c 'echo x >> {}; while [ ! -f {} ]; do sleep 0.1; done; exit 1'",
+            marker.display(),
+            release.display()
+        );
         let store = Store::open_in_memory("registry-backoff-test")
             .await
             .unwrap();
@@ -545,8 +563,9 @@ mod tests {
             false,
         );
 
-        // First lookup: the spawn starts (marker line 1) and fails
-        // after ~1s, establishing backoff.
+        // First lookup: the spawn starts (marker line 1) and parks
+        // holding the per-peer spawn lock until the release file
+        // appears.
         let first = tokio::spawn({
             let registry = registry.clone();
             async move { registry.lookup("codex").await }
@@ -563,9 +582,32 @@ mod tests {
             let registry = registry.clone();
             async move { registry.lookup("codex").await }
         });
-        // Give the queued lookup time to reach the lock before the
-        // first spawn fails and sets the backoff deadline.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Deterministic queueing: a lookup clones the per-peer lock's
+        // Arc immediately before parking on it and keeps the clone
+        // while queued — wait until BOTH lookups hold the lock (map
+        // entry + test clone + two lookup clones) before releasing
+        // the first spawn to fail, so the second is guaranteed to be
+        // queued (not merely scheduled) at that moment.
+        let spawn_lock = registry
+            .inner
+            .spawn_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry("codex".to_string())
+            .or_default()
+            .clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&spawn_lock) < 4 {
+            assert!(
+                Instant::now() < deadline,
+                "the queued lookup never reached the spawn lock"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Release the first spawn: it fails and sets the backoff
+        // deadline while the second lookup is ALREADY queued, so the
+        // second must re-check backoff after acquiring the lock.
+        std::fs::write(&release, b"release").unwrap();
         assert!(first.await.unwrap().is_none());
         assert!(second.await.unwrap().is_none());
         assert_eq!(

@@ -104,6 +104,19 @@ pub(crate) async fn accept_translation(
             return (StatusCode::BAD_REQUEST, "invalid JSON-RPC body").into_response();
         }
     };
+    // JSON-RPC batch bodies are arrays: the method member reads below
+    // would yield `None` for every element, so a batch SendMessage
+    // would skip sender validation, task ownership, AND the store
+    // commit while still reaching the SDK handler. Fail closed —
+    // only single-object JSON-RPC requests are accepted on the
+    // stamped surface.
+    if !parsed.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "JSON-RPC batch requests are not accepted",
+        )
+            .into_response();
+    }
     let method = parsed
         .get("method")
         .and_then(|m| m.as_str())

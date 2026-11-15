@@ -60,15 +60,13 @@ impl Store {
     async fn claim_intent_inner(&self, message_id: &str, recipient_id: &str) -> Result<String> {
         // fresh_only=false: every non-error outcome is a fresh claim or
         // an existing open attempt, so Some always resolves.
-        match self
-            .claim_intent_inner_with(message_id, recipient_id, false)
+        self.claim_intent_inner_with(message_id, recipient_id, false)
             .await?
-        {
-            Some(attempt_id) => Ok(attempt_id),
-            None => Err(StoreError::Db(sqlx::Error::Protocol(
-                "claim_intent resolved without an attempt".to_string(),
-            ))),
-        }
+            .ok_or_else(|| {
+                StoreError::Db(sqlx::Error::Protocol(
+                    "claim_intent resolved without an attempt".to_string(),
+                ))
+            })
     }
 
     async fn claim_intent_inner_with(
@@ -113,16 +111,14 @@ impl Store {
                 "claimed" | "dispatched" => {
                     return Ok(if fresh_only { None } else { Some(open_id) });
                 }
-                "unknown" => {
+                // The query's IN filter admits only the three states
+                // above and below; the shared arm keeps this a
+                // defensive no-panic path should a future writer add
+                // one.
+                state => {
                     return Err(StoreError::BlockedByUnknown {
                         intent: intent_id,
-                        state: "unknown".to_string(),
-                    });
-                }
-                other => {
-                    return Err(StoreError::BlockedByUnknown {
-                        intent: intent_id,
-                        state: other.to_string(),
+                        state: state.to_string(),
                     });
                 }
             }
@@ -152,11 +148,11 @@ impl Store {
         }
 
         match intent_state.as_str() {
-            "queued" => {}
-            "claimed" => {
-                // Intent is claimed but no open attempt row exists — recover
-                // by re-attaching: treat as queued (crash between claim and
-                // commit can't happen; this closes the window defensively).
+            "queued" | "claimed" => {
+                // Claimed with no open attempt row means the claim's
+                // commit was interrupted: recover by re-attaching, as
+                // if queued (the crash window between claim and commit
+                // cannot happen; this closes it defensively).
             }
             "completed" | "failed" | "canceled" => {
                 return Err(StoreError::IntentTerminal {
@@ -258,10 +254,13 @@ impl Store {
     }
 
     async fn mark_delivered_inner(&self, message_id: &str, peer_id: &str) -> Result<()> {
+        // `dispatched` is an attempt/intent state, never a delivery
+        // state — the recipient CHECK admits only stored/held/eligible/
+        // delivered/blocked/expired — so naming it here was a dead arm.
         let result = sqlx::query(
             "UPDATE message_recipients SET delivery_state = 'delivered'
              WHERE message_id = ? AND peer_id = ?
-               AND delivery_state IN ('stored', 'eligible', 'dispatched')",
+               AND delivery_state IN ('stored', 'eligible')",
         )
         .bind(message_id)
         .bind(peer_id)

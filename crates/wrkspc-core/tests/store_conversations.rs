@@ -447,14 +447,16 @@ async fn delete_conversation_cleans_tasks_committed_while_it_holds_the_write_loc
     // A second writer takes the database write lock and holds it while
     // the deletion runs: the deletion blocks (at its first write — or,
     // with the fix, at the write-reserving begin) until the holder
-    // commits.
+    // commits. Zero busy timeout + two connections: the holder keeps
+    // one, and the probe below gets the other and must fail
+    // immediately.
     let side = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
+        .max_connections(2)
         .connect_with(
             sqlx::sqlite::SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
                 .unwrap()
                 .foreign_keys(true)
-                .busy_timeout(std::time::Duration::from_secs(5)),
+                .busy_timeout(std::time::Duration::ZERO),
         )
         .await
         .unwrap();
@@ -466,10 +468,20 @@ async fn delete_conversation_cleans_tasks_committed_while_it_holds_the_write_loc
         tokio::spawn(async move { store.delete_conversation(&room).await })
     };
 
-    // The deletion is now blocked on the held write lock. Commit a NEW
-    // message and its delivery task from the lock holder — the fan-out
-    // racing the deletion.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Deterministic interleaving proof: while the holder's write lock
+    // is held the deletion CANNOT have acquired it — a zero-timeout
+    // probe fails SQLITE_BUSY, pinning the deletion behind the rows
+    // about to be committed. (A fixed sleep only guessed at the
+    // scheduler; the probe asserts the lock ordering itself.) Commit a
+    // NEW message and its delivery task from the lock holder — the
+    // fan-out racing the deletion.
+    let probe = sqlx::query("UPDATE peers SET name = name || '!'")
+        .execute(&side)
+        .await;
+    assert!(
+        matches!(&probe, Err(sqlx::Error::Database(db)) if db.code().as_deref().is_some_and(|code| code.starts_with('5'))),
+        "the holder must pin the deletion while the late rows commit: {probe:?}"
+    );
     let message_late = uuid::Uuid::new_v4().to_string();
     let task_late = wrkspc_core::tasks::delivery_task_id(&message_late, "codex");
     let now = chrono::Utc::now().to_rfc3339();

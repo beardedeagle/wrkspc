@@ -47,8 +47,9 @@ pub struct NodeRunArgs {
     /// Client private key PEM (required with `--hub`).
     #[arg(long, requires = "hub")]
     pub tls_key: Option<PathBuf>,
-    /// Seconds between hub polls.
-    #[arg(long, default_value_t = 5)]
+    /// Seconds between hub polls. Zero is rejected at parse time: a
+    /// silently clamped zero would hammer the hub with no warning.
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
     pub poll_interval_secs: u64,
     /// This node's operator-identity name: the Keychain account key for
     /// its UI token (`wrkspc.<name>`). Defaults to the bare host name,
@@ -287,7 +288,7 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
             let hub_url = hub_url.trim_end_matches('/').to_string();
             let poll_store = store.clone();
             let shutdown = shutdown_rx.clone();
-            let interval = std::time::Duration::from_secs(args.poll_interval_secs.max(1));
+            let interval = std::time::Duration::from_secs(args.poll_interval_secs);
             let host = host_id.clone();
             let presence: Option<std::sync::Arc<dyn crate::poll::PresenceSource>> =
                 Some(provider.clone());
@@ -313,8 +314,24 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
     // Readiness marker: integration tests (and operators) wait for this
     // file instead of parsing logs or polling the UI port. It carries no
     // secret — the token lives in the platform store, never in a file on
-    // macOS.
-    tokio::fs::write(format!("{}.ready", db.display()), b"ready")
+    // macOS. A pre-planted symlink at the marker path must not redirect
+    // the truncating write at an arbitrary file: it is refused, exactly
+    // like the token-file policy (CU-02).
+    let ready_marker = format!("{}.ready", db.display());
+    match std::fs::symlink_metadata(&ready_marker) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "readiness marker {ready_marker} is a symlink — refusing to write through it"
+            )
+            .into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!("cannot stat readiness marker {ready_marker}: {error}").into());
+        }
+    }
+    tokio::fs::write(&ready_marker, b"ready")
         .await
         .map_err(|e| format!("cannot write readiness marker: {e}"))?;
 
@@ -340,7 +357,7 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
     if let Some(task) = a2a_task {
         let _ = task.await;
     }
-    if let Err(error) = tokio::fs::remove_file(format!("{}.ready", db.display())).await
+    if let Err(error) = tokio::fs::remove_file(&ready_marker).await
         && error.kind() != std::io::ErrorKind::NotFound
     {
         tracing::warn!(%error, "readiness marker removal failed");

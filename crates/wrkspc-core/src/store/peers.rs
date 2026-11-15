@@ -25,7 +25,8 @@ impl Store {
     ///
     /// * `peer_id` — the peer to enrol.
     /// * `name` — the peer's display name.
-    /// * `class` — the peer's [`crate::model::PeerClass`] string.
+    /// * `class` — the peer's class string (`human`/`harness`/
+    ///   `a2a_native`).
     /// * `host_id` — the host that owns the peer.
     ///
     /// # Errors

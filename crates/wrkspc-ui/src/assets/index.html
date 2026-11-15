@@ -2527,6 +2527,9 @@ async function connectWith(value) {
     if (res.status === 401) {
       el("boot").classList.remove("connecting");
       el("login-error").textContent = "rejected — check the token";
+      // The verification rejected this exact credential: it cannot be
+      // retried as-is, so the input is cleared.
+      el("login-token").value = "";
       connecting = false;
       return;
     }
@@ -2552,9 +2555,15 @@ async function connectWith(value) {
   // current-session rejection may discard it.
   try {
     await startApp();
+    // A verified credential now lives only in the HttpOnly cookie; the
+    // page never keeps the plaintext past a successful start.
+    el("login-token").value = "";
   } catch (error) {
     if (error.auth) {
       el("login-error").textContent = "rejected — check the token";
+      // The running session rejected this credential: clear it rather
+      // than retain a dead token in the input.
+      el("login-token").value = "";
     } else {
       el("boot").classList.remove("connecting");
       el("boot").hidden = false;

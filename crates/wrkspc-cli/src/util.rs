@@ -179,10 +179,33 @@ pub(crate) fn load_existing_token_settling(path: &Path) -> Result<Option<String>
     }
 }
 
+/// The async form of [`load_existing_token_settling`]: the sleep is a
+/// tokio sleep, so a caller on the runtime (node startup, the per-peer
+/// MCP token path) never blocks an executor worker thread for the
+/// publication window. Synchronous callers (the platform file store's
+/// trait methods, threaded tests) keep the thread-sleeping form above.
+pub(crate) async fn load_existing_token_settling_async(
+    path: &Path,
+) -> Result<Option<String>, String> {
+    let mut attempt: u32 = 0;
+    loop {
+        match read_token_file(path)? {
+            TokenFileRead::Empty if attempt < PUBLICATION_SETTLE_ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(PUBLICATION_SETTLE_SLEEP).await;
+            }
+            TokenFileRead::Empty => return Err(empty_token_error(path)),
+            TokenFileRead::Missing => return Ok(None),
+            TokenFileRead::Value(token) => return Ok(Some(token)),
+        }
+    }
+}
+
 /// Unix-only ownership and mode validation for an existing token file
 /// (CU-02): another owner is refused, and a permissive mode is
 /// tightened before the value is read.
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn validate_token_ownership(meta: &std::fs::Metadata, path: &Path) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let euid = unsafe { libc::geteuid() };
@@ -213,7 +236,9 @@ fn validate_token_ownership(meta: &std::fs::Metadata, path: &Path) -> Result<(),
 /// caller returns the SAME value. The write is synced to disk before
 /// the token is handed out. An existing empty file, a symlink, a
 /// foreign owner, or a read failure is an ERROR — the credential is
-/// never silently rotated (CU-02).
+/// never silently rotated (CU-02). The settling read sleeps with a
+/// tokio timer, so a runtime caller never blocks an executor worker
+/// during a concurrent creator's publication window.
 ///
 /// `db` is the database path (the token file derives from it); `tag` is
 /// the suffix after the database path.
@@ -226,26 +251,72 @@ fn validate_token_ownership(meta: &std::fs::Metadata, path: &Path) -> Result<(),
 ///
 /// Returns the validation or I/O failure.
 pub async fn stable_token(db: &Path, tag: &str) -> Result<String, String> {
-    stable_token_sync(db, tag)
-}
-
-/// The synchronous core of [`stable_token`].
-pub fn stable_token_sync(db: &Path, tag: &str) -> Result<String, String> {
     let path = PathBuf::from(format!("{}.{tag}", db.display()));
     // The settling read tolerates the publication window of a
     // concurrent creator (file exists, bytes not yet written); a
     // settled empty file still fails closed (CU-02).
+    if let Some(token) = load_existing_token_settling_async(&path).await? {
+        return Ok(token);
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    if create_token_file_exclusive(&path, &token)? {
+        return Ok(token);
+    }
+    // A concurrent creator won: the stable value is the one on
+    // disk, so every caller agrees. The settling read waits
+    // out the winner's write window instead of mistaking it
+    // for a settled empty file.
+    match load_existing_token_settling_async(&path).await? {
+        Some(token) => Ok(token),
+        None => Err(format!(
+            "token file {} appeared during creation — refusing to rotate it",
+            path.display()
+        )),
+    }
+}
+
+/// The synchronous core of [`stable_token`] — the platform file store
+/// (a synchronous trait) and threaded callers use this directly; the
+/// settling read sleeps on the calling thread, so it belongs on
+/// blocking threads, never on the runtime.
+pub fn stable_token_sync(db: &Path, tag: &str) -> Result<String, String> {
+    let path = PathBuf::from(format!("{}.{tag}", db.display()));
     if let Some(token) = load_existing_token_settling(&path)? {
         return Ok(token);
     }
     let token = uuid::Uuid::new_v4().to_string();
+    if create_token_file_exclusive(&path, &token)? {
+        return Ok(token);
+    }
+    match load_existing_token_settling(&path)? {
+        Some(token) => Ok(token),
+        None => Err(format!(
+            "token file {} appeared during creation — refusing to rotate it",
+            path.display()
+        )),
+    }
+}
+
+/// The exclusive-create half of the stable-token flow (CU-02), shared
+/// by the sync and async wrappers: a `create_new` open — plus
+/// `O_NOFOLLOW` and 0600 at open on Unix, the owner-only DACL applied
+/// before the first byte on Windows — then the write and sync. Returns
+/// `Ok(true)` when THIS caller created and published the token,
+/// `Ok(false)` when a concurrent creator won the race.
+///
+/// `path` is the token file; `token` is the value to publish.
+///
+/// # Errors
+///
+/// Returns the open, write, or sync failure.
+fn create_token_file_exclusive(path: &Path, token: &str) -> Result<bool, String> {
     // create_new + O_NOFOLLOW: an atomic exclusive create that can
     // never follow a link swapped into place by another process.
     // Windows opens with WRITE_DAC/WRITE_OWNER and applies the
     // owner-only DACL before the first byte lands; Unix
     // gets 0600 from the open itself.
     #[cfg(windows)]
-    let opened = win_acl::create_new_secured(&path);
+    let opened = win_acl::create_new_secured(path);
     #[cfg(not(windows))]
     let opened = {
         let mut options = std::fs::OpenOptions::new();
@@ -256,7 +327,7 @@ pub fn stable_token_sync(db: &Path, tag: &str) -> Result<String, String> {
             options.custom_flags(libc::O_NOFOLLOW);
         }
         options.write(true).create_new(true);
-        options.open(&path)
+        options.open(path)
     };
     match opened {
         Ok(mut file) => {
@@ -265,21 +336,9 @@ pub fn stable_token_sync(db: &Path, tag: &str) -> Result<String, String> {
                 .map_err(|e| format!("cannot write token to {}: {e}", path.display()))?;
             file.sync_all()
                 .map_err(|e| format!("cannot sync token file {}: {e}", path.display()))?;
-            Ok(token)
+            Ok(true)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // A concurrent creator won: the stable value is the one on
-            // disk, so every caller agrees. The settling read waits
-            // out the winner's write window instead of mistaking it
-            // for a settled empty file.
-            match load_existing_token_settling(&path)? {
-                Some(token) => Ok(token),
-                None => Err(format!(
-                    "token file {} appeared during creation — refusing to rotate it",
-                    path.display()
-                )),
-            }
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
         Err(e) => Err(format!("cannot create token file {}: {e}", path.display())),
     }
 }
@@ -301,6 +360,7 @@ pub fn stable_token_sync(db: &Path, tag: &str) -> Result<String, String> {
 pub use win_acl::token_acl_is_owner_only;
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 pub(crate) mod win_acl {
     use std::path::Path;
     use std::ptr;

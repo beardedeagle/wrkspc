@@ -35,6 +35,25 @@ async fn accept_commits_message_and_intents() {
         AcceptOutcome::Replay { .. } => panic!("expected Accepted"),
     };
 
+    // The committed transcript carries the content and sender, the
+    // committed routing names the intended recipient, and a queued
+    // intent exists BEFORE any claim — a claim returning some id alone
+    // proves nothing about what actually committed.
+    let transcript = store.list_messages(&conversation).await.unwrap();
+    assert_eq!(transcript.len(), 1, "one message committed");
+    assert_eq!(transcript[0].content, "hello agent");
+    assert_eq!(transcript[0].sender_id, operator);
+    assert!(transcript[0].execution_requested);
+    assert_eq!(
+        store.message_recipients(&message_id).await.unwrap(),
+        vec![agent.clone()],
+        "the intended peer is the committed recipient"
+    );
+    let due = store.due_intents().await.unwrap();
+    assert_eq!(due.len(), 1, "the intent is queued before the claim");
+    assert_eq!(due[0].recipient_id, agent);
+    assert_eq!(due[0].content, "hello agent");
+
     // An execution intent exists and is claimable.
     let attempt = store
         .claim_intent(&message_id, &agent)

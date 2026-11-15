@@ -67,16 +67,25 @@ impl Default for UiConfig {
     }
 }
 
-/// Constant-time equality for operator credentials: the comparison
-/// time does not depend on how many leading bytes match.
+/// Constant-time equality for operator credentials. Both sides are
+/// hashed first (a fixed-key SipHash — the std default hasher), so the
+/// compared material is fixed-width whatever the token lengths are;
+/// the digest comparison then runs a full-length XOR loop with no
+/// early exit. The comparison time does not depend on token length or
+/// on how many leading bytes match.
 fn ct_equals(a: &str, b: &str) -> bool {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
+    use std::hash::{Hash, Hasher};
+
+    fn digest(value: &str) -> u64 {
+        let mut hasher = std::hash::DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
     }
+
+    let a = digest(a).to_le_bytes();
+    let b = digest(b).to_le_bytes();
     let mut diff = 0u8;
-    for (left, right) in a.iter().zip(b) {
+    for (left, right) in a.iter().zip(b.iter()) {
         diff |= left ^ right;
     }
     diff == 0
@@ -95,7 +104,10 @@ fn set_cookie_value(token: &str, secure: bool) -> String {
 /// The presented login cookie value, if any.
 fn presented_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
     let header = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
-    for part in header.split("; ") {
+    // RFC 6265 makes the whitespace after ';' optional: split on ';'
+    // alone and trim each part before matching the cookie name.
+    for part in header.split(';') {
+        let part = part.trim();
         if let Some(value) = part.strip_prefix(COOKIE_NAME)
             && let Some(value) = value.strip_prefix('=')
         {
@@ -188,14 +200,7 @@ impl UiServer {
     ///
     /// The complete UI router.
     pub fn into_app(self, token: String) -> axum::Router {
-        let state = AppState::new(
-            self.store,
-            self.cancel,
-            self.config.queue_remote_deliveries,
-            self.config.hub_role,
-            self.config.hub_connected,
-            self.deny,
-        );
+        let state = AppState::new(self.store, self.cancel, &self.config, self.deny);
 
         let cookie_secure = self.config.cookie_secure;
         let middleware_token = token.clone();
@@ -235,7 +240,17 @@ impl UiServer {
                             }
                         };
                     }
-                    next.run(request).await
+                    // Authenticated API payloads (cookie-authed
+                    // transcripts, rosters) must not be heuristically
+                    // cached by a shared cache or the browser: the
+                    // static shell is no-store, and so is every API
+                    // response behind this gate.
+                    let mut response = next.run(request).await;
+                    response.headers_mut().insert(
+                        axum::http::header::CACHE_CONTROL,
+                        axum::http::HeaderValue::from_static("no-store"),
+                    );
+                    response
                 }
             },
         ));
@@ -325,5 +340,23 @@ async fn static_index() -> axum::response::Response {
         // Static headers and a static body cannot fail; this arm guards
         // against builder misuse.
         Err(error) => unreachable!("static index response failed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ct_equals_accepts_equal_tokens() {
+        assert!(ct_equals("test-token-1234", "test-token-1234"));
+    }
+
+    #[test]
+    fn ct_equals_rejects_different_tokens_of_any_length() {
+        assert!(!ct_equals("test-token-1234", "test-token-9999"));
+        assert!(!ct_equals("short", "a-much-longer-token"));
+        assert!(!ct_equals("", "x"));
+        assert!(!ct_equals("same-length-a", "same-length-b"));
     }
 }

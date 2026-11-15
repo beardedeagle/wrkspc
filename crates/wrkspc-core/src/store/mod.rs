@@ -118,15 +118,17 @@ impl Store {
                 Err(StoreError::Db(sqlx::Error::Database(db)))
                     if matches!(
                         db.code().as_deref(),
-                        // SQLITE_BUSY (5) and SQLITE_BUSY_SNAPSHOT
-                        // (517): the snapshot variant is the WAL
-                        // reader's contention form and must retry the
-                        // same way (C11).
-                        Some("5") | Some("517")
+                        // Every SQLITE_BUSY primary-5 form retries the
+                        // same way: BUSY (5), BUSY_RECOVERY (261),
+                        // BUSY_SNAPSHOT (517), and BUSY_TIMEOUT (773)
+                        // — the snapshot and recovery variants are the
+                        // WAL reader's contention forms and must not
+                        // leak to callers as hard errors (C11).
+                        Some("5" | "261" | "517" | "773")
                     ) && attempt < 10 =>
                 {
                     attempt += 1;
-                    let delay = std::time::Duration::from_millis(100 * attempt as u64);
+                    let delay = std::time::Duration::from_millis(100 * u64::from(attempt));
                     tracing::warn!(
                         %label,
                         attempt,

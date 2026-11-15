@@ -322,6 +322,61 @@ async fn optional_client_auth_serves_cert_less_connections_unstamped() {
     drop(shutdown_rx);
 }
 
+/// An untrusted chain (a rogue CA outside the acceptor's trust store)
+/// must fail the handshake even under the OPTIONAL verifier:
+/// request-but-not-require never degrades into accept-anything.
+#[tokio::test]
+async fn optional_verifier_rejects_untrusted_client_chains() {
+    let pki = TestPki::generate();
+    // A rogue CA the acceptor has never seen.
+    let rogue_ca_key = KeyPair::generate().unwrap();
+    let mut rogue_ca_params = CertificateParams::new(Vec::new()).unwrap();
+    rogue_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    rogue_ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "rogue-ca");
+    let rogue_ca = rcgen::CertifiedIssuer::self_signed(rogue_ca_params, &rogue_ca_key).unwrap();
+    let rogue_key = KeyPair::generate().unwrap();
+    let mut rogue_params = CertificateParams::new(vec!["rogue-node".to_string()]).unwrap();
+    rogue_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let rogue_cert = rogue_params.signed_by(&rogue_key, &rogue_ca).unwrap();
+    let rogue_identity = format!("{}{}", rogue_cert.pem(), rogue_key.serialize_pem()).into_bytes();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let addr = serve_with(
+        test_store().await,
+        &pki,
+        optional_acceptor(&pki),
+        shutdown_tx,
+        |certs| {
+            certs
+                .first()
+                .and_then(wrkspc_a2a::peer_identity)
+                .map(wrkspc_a2a::PeerDecision::Stamped)
+                .unwrap_or(wrkspc_a2a::PeerDecision::Unstamped)
+        },
+        |router| router,
+    )
+    .await;
+    let hub = format!("https://{addr}/jsonrpc");
+
+    let client = tls_client(&hub, &pki, Some(&rogue_identity));
+    let result = client
+        .send_message(&SendMessageRequest {
+            message: Message::new(Role::User, vec![Part::text("rogue".to_string())]),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "an untrusted chain must fail the handshake under the optional verifier"
+    );
+
+    drop(shutdown_rx);
+}
+
 /// The resolve-peer policy gate denies a listed identity (the ban deny-list shape) before any application traffic.
 #[tokio::test]
 async fn policy_gate_denies_the_listed_identity() {

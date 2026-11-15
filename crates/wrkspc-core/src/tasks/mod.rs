@@ -41,7 +41,8 @@ pub struct DeliveryTaskRequest<'a> {
     pub recipient_peer: &'a str,
     /// The recipient's display name (for the node-side mirror).
     pub recipient_name: &'a str,
-    /// The recipient's [`crate::model::PeerClass`] string (for the node-side mirror).
+    /// The recipient's peer class string (`human`/`harness`/
+    /// `a2a_native`, for the node-side mirror).
     pub recipient_class: &'a str,
     /// The hub-committed message this delivery belongs to.
     pub message_id: &'a str,
@@ -57,7 +58,8 @@ pub struct DeliveryTaskRequest<'a> {
     pub sender_peer: &'a str,
     /// The sender's display name (for the node-side mirror).
     pub sender_name: &'a str,
-    /// The sender's [`crate::model::PeerClass`] string (for the node-side mirror).
+    /// The sender's peer class string (`human`/`harness`/
+    /// `a2a_native`, for the node-side mirror).
     pub sender_class: &'a str,
     /// The sender's `host_id` (for the node-side mirror).
     pub sender_host: &'a str,
@@ -86,7 +88,7 @@ pub enum DeliveryClaimOutcome {
 }
 
 /// Builds a [`TaskRow`] from a sqlx row.
-pub(crate) fn task_row_from_sql(row: sqlx::sqlite::SqliteRow) -> TaskRow {
+pub(crate) fn task_row_from_sql(row: &sqlx::sqlite::SqliteRow) -> TaskRow {
     TaskRow {
         task_id: row.get("task_id"),
         context_id: row.get("context_id"),

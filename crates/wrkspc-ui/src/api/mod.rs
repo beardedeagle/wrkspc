@@ -26,6 +26,8 @@ use std::sync::Arc;
 use wrkspc_core::{CancelOutcome, Store, StoreError};
 use wrkspc_dispatcher::DispatcherHandle;
 
+use crate::UiConfig;
+
 pub(crate) mod attempts;
 pub(crate) mod conversations;
 pub(crate) mod gates;
@@ -102,29 +104,27 @@ impl AppState {
     /// Builds the state.
     ///
     /// `store` is the transactional store; `cancel` is the cancel seam
-    /// (the dispatcher handle in production). `queue_remote_deliveries`
-    /// is hub mode: operator posts queue delivery tasks for
-    /// remote-host recipients. `hub_role` is hub mode: the operator
-    /// surface that owns the shared store (conversation creation); the
-    /// node role returns 404 for it (a node-created conversation would
-    /// never reach the hub). `hub_connected` marks a connected node
-    /// that mirrors hub-owned state: hub-owned mutations refuse loudly.
-    /// `deny` is the hub's live certificate-serial revocation set, when
-    /// this surface can moderate TLS identity.
+    /// (the dispatcher handle in production). `config` carries the role
+    /// flags: `queue_remote_deliveries` is hub mode (operator posts
+    /// queue delivery tasks for remote-host recipients); `hub_role` is
+    /// the operator surface that owns the shared store (conversation
+    /// creation — the node role returns 404 for it, a node-created
+    /// conversation would never reach the hub); `hub_connected` marks a
+    /// connected node that mirrors hub-owned state (hub-owned mutations
+    /// refuse loudly). `deny` is the hub's live certificate-serial
+    /// revocation set, when this surface can moderate TLS identity.
     pub fn new(
         store: Store,
         cancel: Arc<dyn CancelRequester>,
-        queue_remote_deliveries: bool,
-        hub_role: bool,
-        hub_connected: bool,
+        config: &UiConfig,
         deny: Option<RevocationSet>,
     ) -> Self {
         Self {
             store,
             cancel,
-            queue_remote_deliveries,
-            hub_role,
-            hub_connected,
+            queue_remote_deliveries: config.queue_remote_deliveries,
+            hub_role: config.hub_role,
+            hub_connected: config.hub_connected,
             deny,
         }
     }

@@ -3,6 +3,7 @@
 
 use super::{PresenceOutcome, RosterEntry, roster_entry, status_is_ejected};
 use crate::Result;
+use crate::error::StoreError;
 use crate::store::Store;
 
 impl Store {
@@ -14,6 +15,16 @@ impl Store {
         host_id: &str,
         state: &str,
     ) -> Result<PresenceOutcome> {
+        // The core boundary validates the presence vocabulary: every
+        // caller writes through here, so an unknown state string can
+        // never be persisted into presence/roster (the vocabulary check
+        // must not live only in the one call site that happens to have
+        // it today).
+        if !crate::model::is_presence_state(state) {
+            return Err(StoreError::InvalidPresenceState {
+                state: state.to_string(),
+            });
+        }
         let now = chrono::Utc::now().to_rfc3339();
         // IMMEDIATE: presence upsert is a read-modify-write that races
         // operator moderation writes (ban/boot) on the same tables.
@@ -152,7 +163,7 @@ impl Store {
         )
         .fetch_all(self.pool())
         .await?;
-        Ok(rows.into_iter().map(roster_entry).collect())
+        Ok(rows.iter().map(roster_entry).collect())
     }
 
     /// Reads one roster row.
@@ -176,7 +187,7 @@ impl Store {
         .bind(peer_id)
         .fetch_optional(self.pool())
         .await?;
-        Ok(row.map(roster_entry))
+        Ok(row.as_ref().map(roster_entry))
     }
 
     /// Replaces the local roster mirror with the hub's rows.

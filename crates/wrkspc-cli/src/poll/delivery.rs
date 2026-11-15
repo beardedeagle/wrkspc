@@ -53,11 +53,33 @@ impl Delivery {
     /// The delivery, or `None` when the row is not a well-formed
     /// delivery payload.
     pub fn from_task_row(task: &TaskRow) -> Option<Self> {
-        let payload: serde_json::Value = serde_json::from_str(&task.task_json).ok()?;
+        let payload: serde_json::Value = match serde_json::from_str(&task.task_json) {
+            Ok(payload) => payload,
+            Err(error) => {
+                // Corrupt JSON must be visible to the operator, not
+                // silently skipped like a non-delivery row: a delivery
+                // this node should have mirrored is otherwise lost
+                // without a trace.
+                tracing::warn!(
+                    %error,
+                    task_id = %task.task_id,
+                    "delivery task payload is not valid JSON; skipping",
+                );
+                return None;
+            }
+        };
         let delivery = payload
             .get("metadata")
             .and_then(|metadata| metadata.get("delivery"))?;
         if delivery.get("kind").and_then(|k| k.as_str()) != Some("delivery") {
+            // A row in this host's delivery queue that does not parse
+            // as a delivery is malformed, never a different legitimate
+            // task type: log it so a wedged row is distinguishable
+            // from an empty queue.
+            tracing::warn!(
+                task_id = %task.task_id,
+                "delivery task payload carries no delivery kind; skipping",
+            );
             return None;
         }
         let field = |key: &str| {
@@ -229,19 +251,25 @@ where
         }
         // Replay the hub's host assignment when the local projection is
         // stale: the hub is authoritative for peer records (A2
-        // contract), and assignment is append-only history.
-        if store
-            .peer_host(&delivery.sender_peer)
-            .await
-            .ok()
-            .flatten()
-            .as_deref()
-            != Some(delivery.sender_host.as_str())
-            && let Err(error) = store
-                .assign_peer_host(&delivery.sender_peer, &delivery.sender_host)
-                .await
-        {
-            tracing::warn!(%error, task_id = %delivery.task_id, "sender host assignment replay failed");
+        // contract), and assignment is append-only history. A store
+        // ERROR is not a stale projection — folding it into "mismatch"
+        // would trigger a spurious assignment replay; it fails the
+        // delivery instead (retried next poll).
+        match store.peer_host(&delivery.sender_peer).await {
+            Ok(Some(host)) if host == delivery.sender_host.as_str() => {}
+            Ok(_) => {
+                if let Err(error) = store
+                    .assign_peer_host(&delivery.sender_peer, &delivery.sender_host)
+                    .await
+                {
+                    tracing::warn!(%error, task_id = %delivery.task_id, "sender host assignment replay failed");
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, task_id = %delivery.task_id, "sender host lookup failed");
+                outcome.failed += 1;
+                continue;
+            }
         }
         if let Err(error) = store
             .ensure_peer_on_host(
@@ -256,18 +284,24 @@ where
             outcome.failed += 1;
             continue;
         }
-        if store
-            .peer_host(&delivery.recipient_peer)
-            .await
-            .ok()
-            .flatten()
-            .as_deref()
-            != Some(host_id)
-            && let Err(error) = store
-                .assign_peer_host(&delivery.recipient_peer, host_id)
-                .await
-        {
-            tracing::warn!(%error, task_id = %delivery.task_id, "recipient host assignment replay failed");
+        // The recipient's host projection is replayed the same way: a
+        // store ERROR fails the delivery instead of pretending the
+        // projection is stale (see the sender arm above).
+        match store.peer_host(&delivery.recipient_peer).await {
+            Ok(Some(host)) if host == host_id => {}
+            Ok(_) => {
+                if let Err(error) = store
+                    .assign_peer_host(&delivery.recipient_peer, host_id)
+                    .await
+                {
+                    tracing::warn!(%error, task_id = %delivery.task_id, "recipient host assignment replay failed");
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, task_id = %delivery.task_id, "recipient host lookup failed");
+                outcome.failed += 1;
+                continue;
+            }
         }
         if let Err(error) = store
             .ensure_conversation(

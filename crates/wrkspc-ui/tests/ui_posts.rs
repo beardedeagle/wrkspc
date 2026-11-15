@@ -4,11 +4,8 @@
 
 mod common;
 use common::*;
-use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
 use wrkspc_core::Store;
-use wrkspc_ui::{UiConfig, UiServer};
+use wrkspc_ui::UiConfig;
 
 /// The operator post commits with an execution intent for the other member.
 #[tokio::test]
@@ -342,37 +339,22 @@ async fn hub_mode_operator_post_queues_remote_deliveries() {
         .create_conversation(&["operator", "codex"])
         .await
         .unwrap();
-
-    let cancel: Arc<FakeCancel> = Arc::new(FakeCancel {
-        calls: Mutex::new(Vec::new()),
-    });
-    let ui = UiServer::new(
+    let ui = spawn_ui_on(
         store.clone(),
-        cancel,
         UiConfig {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            cookie_secure: false,
-            token: Some(TOKEN.to_string()),
             queue_remote_deliveries: true,
             hub_role: true,
-            hub_connected: false,
+            token: Some(TOKEN.to_string()),
+            ..Default::default()
         },
-        None,
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(async move {
-        ui.serve_on(listener, async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .expect("ui serves");
-    });
+    )
+    .await;
 
-    let res = reqwest::Client::new()
+    let res = ui
+        .client()
         .post(format!(
-            "http://{addr}/api/conversations/{conversation}/messages"
+            "{}/api/conversations/{conversation}/messages",
+            ui.base
         ))
         .bearer_auth(TOKEN)
         .json(&serde_json::json!({ "content": "hello team" }))
@@ -391,8 +373,7 @@ async fn hub_mode_operator_post_queues_remote_deliveries() {
     assert_eq!(payload["metadata"]["delivery"]["recipient_peer"], "codex");
     assert_eq!(payload["metadata"]["delivery"]["sender_peer"], "operator");
 
-    let _ = shutdown_tx.send(());
-    let _ = server.await;
+    let _ = ui.shutdown.send(());
 }
 
 /// Node-mode operator posts queue no delivery tasks (the hub never sees them).
@@ -411,37 +392,22 @@ async fn node_mode_operator_post_queues_nothing() {
         .create_conversation(&["operator", "codex"])
         .await
         .unwrap();
-
-    let cancel: Arc<FakeCancel> = Arc::new(FakeCancel {
-        calls: Mutex::new(Vec::new()),
-    });
-    let ui = UiServer::new(
+    let ui = spawn_ui_on(
         store.clone(),
-        cancel,
         UiConfig {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            cookie_secure: false,
-            token: Some(TOKEN.to_string()),
             queue_remote_deliveries: false,
             hub_role: false,
-            hub_connected: false,
+            token: Some(TOKEN.to_string()),
+            ..Default::default()
         },
-        None,
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(async move {
-        ui.serve_on(listener, async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .expect("ui serves");
-    });
+    )
+    .await;
 
-    let res = reqwest::Client::new()
+    let res = ui
+        .client()
         .post(format!(
-            "http://{addr}/api/conversations/{conversation}/messages"
+            "{}/api/conversations/{conversation}/messages",
+            ui.base
         ))
         .bearer_auth(TOKEN)
         .json(&serde_json::json!({ "content": "hello team" }))
@@ -458,8 +424,7 @@ async fn node_mode_operator_post_queues_nothing() {
         .unwrap();
     assert_eq!(total, 0);
 
-    let _ = shutdown_tx.send(());
-    let _ = server.await;
+    let _ = ui.shutdown.send(());
 }
 
 /// An operator post with no recipient list fans out to every eligible
@@ -603,4 +568,5 @@ async fn explicit_empty_recipients_without_mentions_addresses_nobody() {
         recipients.is_empty(),
         "an explicit empty list with no mentions must address nobody: {recipients:?}"
     );
+    let _ = ui.shutdown.send(());
 }

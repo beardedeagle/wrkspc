@@ -247,7 +247,10 @@ fn status_reports_unreadable_instead_of_missing() {
     std::fs::create_dir_all(skill_file.parent().unwrap()).unwrap();
     std::fs::create_dir_all(&skill_file).unwrap(); // a DIRECTORY where the file goes
     let error = skill::status(&home, entry("claude-code")).unwrap_err();
-    assert!(!error.is_empty());
+    assert!(
+        error.contains("cannot read"),
+        "a directory in place of the skill file must report the read failure distinctly (never collapse into Missing): {error}"
+    );
 }
 
 /// CU-04: installing through a symlinked SKILL leaf is refused and

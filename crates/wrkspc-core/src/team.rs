@@ -153,6 +153,15 @@ impl Store {
             if peer_host == request.local_host {
                 continue;
             }
+            // A pre-existing deterministic row means this is a
+            // replay/repair re-queue: INSERT OR IGNORE keeps the
+            // original blob, so it is not a creation and must not
+            // count as one (the documented return is the number of
+            // delivery tasks created).
+            let task_id = crate::tasks::delivery_task_id(request.message_id, peer_id);
+            if self.task_get(&task_id).await?.is_some() {
+                continue;
+            }
             self.task_create_delivery(DeliveryTaskRequest {
                 recipient_host: &peer_host,
                 recipient_peer: peer_id,
@@ -340,16 +349,22 @@ impl Store {
         for row in marker_rows {
             let task_id: String = row.get("task_id");
             let task_json: String = row.get("task_json");
+            // A corrupt marker is a wedged outcome queue, not an empty
+            // one: warn with the task id so the operator can tell the
+            // difference (neighboring poll legs already warn).
             let Ok(payload) = serde_json::from_str::<serde_json::Value>(&task_json) else {
+                tracing::warn!(%task_id, "hub_pending_outcomes: marker payload is corrupt; outcome queue may wedge");
                 continue;
             };
             let Some(delivery) = payload
                 .get("metadata")
                 .and_then(|metadata| metadata.get("delivery"))
             else {
+                tracing::warn!(%task_id, "hub_pending_outcomes: marker payload lacks metadata.delivery");
                 continue;
             };
             if delivery.get("kind").and_then(|kind| kind.as_str()) != Some("delivery") {
+                tracing::warn!(%task_id, "hub_pending_outcomes: marker payload is not a delivery envelope");
                 continue;
             }
             let (Some(hub_message_id), Some(recipient_peer), Some(conversation_id)) = (
@@ -357,6 +372,7 @@ impl Store {
                 delivery.get("recipient_peer").and_then(|v| v.as_str()),
                 delivery.get("conversation_id").and_then(|v| v.as_str()),
             ) else {
+                tracing::warn!(%task_id, "hub_pending_outcomes: delivery envelope missing identity keys");
                 continue;
             };
             let accept_key = delivery
@@ -509,26 +525,7 @@ impl Store {
     ///
     /// Returns [`StoreError::Db`] on failure.
     pub async fn hub_unknowns(&self) -> Result<Vec<HubUnknownView>> {
-        let rows = sqlx::query(
-            "SELECT attempt_id, task_id, host_id, recipient_id, conversation_id,
-                    stop_reason, decision, created_at
-             FROM hub_unknown_attempts
-             ORDER BY created_at ASC",
-        )
-        .fetch_all(self.pool())
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| HubUnknownView {
-                attempt_id: row.get("attempt_id"),
-                task_id: row.get("task_id"),
-                host_id: row.get("host_id"),
-                recipient_id: row.get("recipient_id"),
-                conversation_id: row.get("conversation_id"),
-                stop_reason: row.get("stop_reason"),
-                decision: row.get("decision"),
-            })
-            .collect())
+        self.hub_unknown_rows(None).await
     }
 
     /// Mirrored unknowns carrying an operator decision, for one host's
@@ -538,28 +535,39 @@ impl Store {
     ///
     /// Returns [`StoreError::Db`] on failure.
     pub async fn hub_pending_reconciliations(&self, host_id: &str) -> Result<Vec<HubUnknownView>> {
-        let rows = sqlx::query(
+        self.hub_unknown_rows(Some(host_id)).await
+    }
+
+    /// The shared mirror read behind
+    /// [`hub_unknowns`](Store::hub_unknowns) and
+    /// [`hub_pending_reconciliations`](Store::hub_pending_reconciliations):
+    /// every mirrored row, or (with a host filter) the rows that host's
+    /// poll loop applies — both read the same eight columns and map
+    /// through the same row mapper, so the two views can never drift.
+    ///
+    /// * `host` — the owning host filter (`None` lists everything).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`] on failure.
+    async fn hub_unknown_rows(&self, host: Option<&str>) -> Result<Vec<HubUnknownView>> {
+        let mut sql = String::from(
             "SELECT attempt_id, task_id, host_id, recipient_id, conversation_id,
                     stop_reason, decision, created_at
-             FROM hub_unknown_attempts
-             WHERE host_id = ? AND decision IS NOT NULL
-             ORDER BY created_at ASC",
-        )
-        .bind(host_id)
-        .fetch_all(self.pool())
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| HubUnknownView {
-                attempt_id: row.get("attempt_id"),
-                task_id: row.get("task_id"),
-                host_id: row.get("host_id"),
-                recipient_id: row.get("recipient_id"),
-                conversation_id: row.get("conversation_id"),
-                stop_reason: row.get("stop_reason"),
-                decision: row.get("decision"),
-            })
-            .collect())
+             FROM hub_unknown_attempts",
+        );
+        if host.is_some() {
+            sql.push_str(" WHERE host_id = ? AND decision IS NOT NULL");
+        }
+        sql.push_str(" ORDER BY created_at ASC");
+        // Only the WHERE clause's presence varies with the filter; the
+        // fragments are literals and the host id stays bound.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        if let Some(host) = host {
+            query = query.bind(host);
+        }
+        let rows = query.fetch_all(self.pool()).await?;
+        Ok(rows.into_iter().map(hub_unknown_view).collect())
     }
 
     /// Queues the operator's reconciliation decision on a mirrored
@@ -682,6 +690,20 @@ pub struct HubUnknownView {
     pub stop_reason: String,
     /// The queued operator decision, when one exists.
     pub decision: Option<String>,
+}
+
+/// Maps a `hub_unknown_attempts` row onto its view struct — the single
+/// mapper every mirror read shares.
+fn hub_unknown_view(row: sqlx::sqlite::SqliteRow) -> HubUnknownView {
+    HubUnknownView {
+        attempt_id: row.get("attempt_id"),
+        task_id: row.get("task_id"),
+        host_id: row.get("host_id"),
+        recipient_id: row.get("recipient_id"),
+        conversation_id: row.get("conversation_id"),
+        stop_reason: row.get("stop_reason"),
+        decision: row.get("decision"),
+    }
 }
 
 /// A delivery fan-out request: the committed message plus the

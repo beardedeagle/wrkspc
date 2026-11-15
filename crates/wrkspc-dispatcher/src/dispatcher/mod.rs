@@ -17,9 +17,9 @@
 //! Reviewed invariant-panic policy (T05): `lock_state` panics ONLY when
 //! the dispatch-state mutex is poisoned (a task panicked mid-mutation);
 //! recovering possibly torn state would corrupt the busy gate and the
-//! in-flight tracking, so the panic is deliberate and this module is the
-//! single site where `clippy::panic` is allowed.
-#![allow(clippy::panic)]
+//! in-flight tracking, so the panic is deliberate and scoped to that
+//! single site via `#[expect(clippy::panic)]` — any future panic or
+//! unwrap in this module re-triggers the lint.
 
 use crate::driver::SessionProvider;
 use drive::drive_intent;
@@ -92,8 +92,14 @@ struct InFlight {
 }
 
 /// A finished claim-and-drive task's output: the attempt id, its
-/// conversation, and the drive result.
-type DriveOutput = (String, String, Result<(), String>);
+/// conversation, and the drive result. Named fields instead of a
+/// positional tuple so the destructuring at reap time cannot mix the
+/// two ids up.
+struct DriveOutput {
+    attempt_id: String,
+    conversation_id: String,
+    result: Result<(), String>,
+}
 
 /// A joined task: the output, or a `JoinError` when the task was aborted
 /// (shutdown) or panicked outside the drive's own catch.
@@ -114,6 +120,12 @@ struct DispatchState {
     busy_peers: HashSet<String>,
     /// In-flight turns by attempt id.
     in_flight: HashMap<String, InFlight>,
+    /// Quarantined peers: the busy slot an unconfirmed mid-turn cancel
+    /// retains, with the session it protects. A later claim releases
+    /// the slot once the peer binds a DIFFERENT session (the old
+    /// transport is provably gone), so a quarantined peer is never
+    /// wedged until restart when the adapter moves on.
+    quarantined: HashMap<String, String>,
     /// Lookups currently running for an intent, keyed
     /// `"message_id/recipient_id"`: one claim-and-drive task per intent
     /// at a time, covering the lookup itself. Without it, a lookup
@@ -139,7 +151,11 @@ pub struct DispatcherHandle {
 /// panicked while mid-mutation of the busy gate / in-flight tracking
 /// — so the lock panics deliberately instead of recovering possibly
 /// torn state. This is the dispatcher's single reviewed invariant-
-/// panic site (see the module-level `clippy::panic` allowance).
+/// panic site (see the module docs).
+#[expect(
+    clippy::panic,
+    reason = "invariant panic: poisoned dispatch-state mutex"
+)]
 fn lock_state(state: &std::sync::Mutex<DispatchState>) -> std::sync::MutexGuard<'_, DispatchState> {
     match state.lock() {
         Ok(guard) => guard,
@@ -335,8 +351,12 @@ impl Dispatcher {
     async fn reap_drive(&self, joined: Option<JoinedDrive>) {
         let Some(joined) = joined else { return };
         match joined {
-            Ok((_attempt_id, _conversation_id, Ok(()))) => {}
-            Ok((attempt_id, conversation_id, Err(reason))) => {
+            Ok(DriveOutput { result: Ok(()), .. }) => {}
+            Ok(DriveOutput {
+                attempt_id,
+                conversation_id,
+                result: Err(reason),
+            }) => {
                 self.reconcile_drive_failure(&attempt_id, &conversation_id, &reason)
                     .await;
             }
@@ -377,15 +397,25 @@ impl Dispatcher {
     /// One claim sweep: enumerates due intents and spawns a claim-and-
     /// drive task for each. The central loop never awaits adapter work —
     /// each task performs its own deadline-bounded lookup (E03/H-14).
-    async fn claim_due(&mut self, tasks: &mut JoinSet<(String, String, Result<(), String>)>) {
-        let due = match self.store.due_intents().await {
-            Ok(due) => due,
-            Err(error) => {
-                tracing::warn!(%error, "due_intents failed");
-                return;
-            }
+    async fn claim_due(&mut self, tasks: &mut JoinSet<DriveOutput>) {
+        let Ok(due) = self
+            .store
+            .due_intents()
+            .await
+            .inspect_err(|error| tracing::warn!(%error, "due_intents failed"))
+        else {
+            return;
         };
+        // Due order per peer: at most ONE claim task per recipient per
+        // sweep. Due intents come back oldest-first, and the busy slot
+        // is claimed inside the spawned task — without this pre-filter
+        // a newer intent whose lookup wins the race would take the
+        // peer's slot and dispatch siblings out of order.
+        let mut swept_peers = HashSet::new();
         for intent in due {
+            if !swept_peers.insert(intent.recipient_id.clone()) {
+                continue;
+            }
             let key = format!("{}/{}", intent.message_id, intent.recipient_id);
             {
                 // One lookup per intent at a time: reserve BEFORE the
@@ -514,9 +544,13 @@ async fn claim_and_drive(
     intent: DueIntent,
     lookup_timeout: Duration,
     cancel_timeout: Duration,
-) -> (String, String, Result<(), String>) {
+) -> DriveOutput {
     let conversation_id = intent.conversation_id.clone();
-    let ok = |attempt_id: String| (attempt_id, conversation_id.clone(), Ok(()));
+    let ok = |attempt_id: String| DriveOutput {
+        attempt_id,
+        conversation_id: conversation_id.clone(),
+        result: Ok(()),
+    };
 
     // Busy gate BEFORE claim: one turn in flight per session. An intent
     // whose session is busy stays queued (retried next tick) — claimed
@@ -528,7 +562,19 @@ async fn claim_and_drive(
     let binding = match tokio::time::timeout(lookup_timeout, provider.lookup(&intent.recipient_id))
         .await
     {
-        Ok(Some(binding)) => Some(binding),
+        // A provider that returns another peer's binding (a racing
+        // registry) must never prompt the wrong session: the mismatch
+        // is rejected as unbound, which the drive records as unknown
+        // with a visible feed event.
+        Ok(Some(binding)) if binding.peer_id == intent.recipient_id => Some(binding),
+        Ok(Some(binding)) => {
+            tracing::warn!(
+                peer_id = %binding.peer_id,
+                recipient_id = %intent.recipient_id,
+                "provider returned a binding for another peer; treating the recipient as unbound"
+            );
+            None
+        }
         Ok(None) => None,
         Err(_) => {
             let reason = "session lookup timed out (adapter nonresponsive)";
@@ -576,7 +622,30 @@ async fn claim_and_drive(
             Some(binding) => {
                 // Keyed by peer id: adapter session ids are not
                 // collision-proof across independent adapters (E08).
-                if state_guard.busy_peers.insert(intent.recipient_id.clone()) {
+                let recipient = intent.recipient_id.clone();
+                let session_id = binding.session_id.clone();
+                if state_guard.busy_peers.insert(recipient.clone()) {
+                    Some(binding)
+                } else if let Some(quarantined_session) = state_guard.quarantined.get(&recipient)
+                    && *quarantined_session != session_id
+                {
+                    // Quarantine release: the peer now binds a
+                    // DIFFERENT session than the one the unconfirmed
+                    // turn was left running on. The registry replaces
+                    // a session only when the old one closes, so the
+                    // old turn's transport is provably gone — and
+                    // chunk recording is session-scoped, so nothing
+                    // can be misattributed. The slot is released and
+                    // the new session proceeds.
+                    tracing::warn!(
+                        peer_id = %recipient,
+                        %session_id,
+                        %quarantined_session,
+                        "quarantine released: the peer bound a new session"
+                    );
+                    state_guard.busy_peers.remove(&recipient);
+                    state_guard.quarantined.remove(&recipient);
+                    state_guard.busy_peers.insert(recipient);
                     Some(binding)
                 } else {
                     return ok(format!("{}/{}", intent.message_id, intent.recipient_id));
@@ -634,8 +703,12 @@ async fn claim_and_drive(
     .await;
     match result {
         // The drive reports its own reconciliation failures; they ride
-        // the tuple so the run loop can retry the unknown write.
-        Ok(inner) => (claim.clone(), conversation_id.clone(), inner),
+        // the output so the run loop can retry the unknown write.
+        Ok(inner) => DriveOutput {
+            attempt_id: claim.clone(),
+            conversation_id: conversation_id.clone(),
+            result: inner,
+        },
         Err(payload) => {
             let reason = payload
                 .downcast_ref::<&str>()
@@ -658,11 +731,11 @@ async fn claim_and_drive(
                     }),
                 )
                 .await;
-            (
-                claim,
+            DriveOutput {
+                attempt_id: claim,
                 conversation_id,
-                Err(format!("drive task panicked: {reason}")),
-            )
+                result: Err(format!("drive task panicked: {reason}")),
+            }
         }
     }
 }

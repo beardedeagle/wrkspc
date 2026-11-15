@@ -1,7 +1,7 @@
 //! Conversation creation, enrolment, and membership.
 
 use super::Store;
-use crate::error::Result;
+use crate::error::{Result, StoreError};
 use chrono::Utc;
 use sqlx::Row;
 use uuid::Uuid;
@@ -11,17 +11,40 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::StoreError::Db`] on failure.
+    /// Returns [`StoreError::NotFound`] when a member peer does not
+    /// exist (a typed error instead of a raw FK violation), and
+    /// [`crate::error::StoreError::Db`] on failure.
     pub async fn create_conversation(&self, members: &[&str]) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin().await?;
+        // Set semantics: a duplicate input member must not hit the
+        // membership primary key, and an unknown member is refused up
+        // front as a typed NotFound.
+        let mut unique: Vec<&str> = Vec::with_capacity(members.len());
+        for member in members {
+            if !unique.contains(member) {
+                unique.push(member);
+            }
+        }
+        for member in &unique {
+            let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM peers WHERE id = ?")
+                .bind(member)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if exists.is_none() {
+                return Err(StoreError::NotFound {
+                    entity: "peer",
+                    id: (*member).to_string(),
+                });
+            }
+        }
         sqlx::query("INSERT INTO conversations (id, created_at) VALUES (?, ?)")
             .bind(&id)
             .bind(&now)
             .execute(&mut *tx)
             .await?;
-        for member in members {
+        for member in &unique {
             sqlx::query(
                 "INSERT INTO conversation_members (conversation_id, peer_id, role, joined_at)
                  VALUES (?, ?, 'member', ?)",
@@ -66,17 +89,19 @@ impl Store {
     ) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT 1 FROM conversations WHERE id = ?")
-            .bind(conversation_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let created = row.is_none();
-        if created {
-            sqlx::query("INSERT INTO conversations (id, created_at) VALUES (?, ?)")
+        // INSERT OR IGNORE is the race-free form of the existence
+        // check: two concurrent ensures for one id both execute the
+        // insert, SQLite serializes them, and exactly one row is
+        // affected — the loser sees rows_affected()==0 and never
+        // touches membership (the hub snapshot is the authority).
+        let result =
+            sqlx::query("INSERT OR IGNORE INTO conversations (id, created_at) VALUES (?, ?)")
                 .bind(conversation_id)
                 .bind(&now)
                 .execute(&mut *tx)
                 .await?;
+        let created = result.rows_affected() == 1;
+        if created {
             for member in members {
                 sqlx::query(
                     "INSERT OR IGNORE INTO conversation_members (conversation_id, peer_id, role, joined_at)
@@ -284,6 +309,14 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         sqlx::query("DELETE FROM guidance WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        // Unknown-attempt mirrors carry no conversation foreign key (the
+        // reconciliation list must outlive deleted attempts), so the
+        // room's mirrors are purged explicitly — otherwise dead attempt
+        // ids keep surfacing in the operator list forever.
+        sqlx::query("DELETE FROM hub_unknown_attempts WHERE conversation_id = ?")
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;

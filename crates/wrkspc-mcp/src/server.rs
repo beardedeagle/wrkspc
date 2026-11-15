@@ -17,12 +17,14 @@
 //! host allowlist accepts loopback only, in addition to this listener's
 //! bearer-token gate.
 
+use axum::response::IntoResponse;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use wrkspc_core::{AcceptOutcome, Store, StoreError};
 
 /// Parameters for the `post-message` tool.
@@ -51,9 +53,11 @@ pub struct ReadConversationParams {
     /// Conversation to read.
     pub conversation_id: String,
     /// Cursor: return events after this sequence number (exclusive).
+    /// Must be non-negative; a negative cursor is rejected loudly.
     #[serde(default)]
     pub after_seq: i64,
-    /// Maximum events to return. Defaults to 100.
+    /// Maximum events to return. Defaults to 100; the tool ceiling is
+    /// [`MAX_EVENTS_PER_READ`].
     #[serde(default = "default_limit")]
     pub limit: i64,
 }
@@ -62,6 +66,14 @@ pub struct ReadConversationParams {
 const fn default_limit() -> i64 {
     100
 }
+
+/// Hard ceiling for a single `read-conversation` page.
+///
+/// One constant owns the tool contract. The store's own clamp (1000)
+/// stays as wrkspc-core's defense-in-depth; this crate rejects values
+/// above its ceiling loudly so a harness learns the contract instead
+/// of silently receiving a clamped page.
+const MAX_EVENTS_PER_READ: i64 = 500;
 
 /// Parameters for the `report-work` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -298,10 +310,19 @@ impl McpServer {
         // Bounded reads (P07): the store clamps defensively, but the
         // tool rejects out-of-range values loudly so a harness learns
         // the contract instead of silently getting a clamped page.
-        if !(1..=500).contains(&params.limit) {
+        if !(1..=MAX_EVENTS_PER_READ).contains(&params.limit) {
             return Err(format!(
-                "limit must be between 1 and 500 (got {})",
+                "limit must be between 1 and {MAX_EVENTS_PER_READ} (got {})",
                 params.limit
+            ));
+        }
+        // A negative cursor must not silently mean "from the start":
+        // reject it with the same loud style so a harness computing a
+        // bad cursor learns the contract instead of getting a replay.
+        if params.after_seq < 0 {
+            return Err(format!(
+                "after_seq must be a non-negative sequence number (got {})",
+                params.after_seq
             ));
         }
         self.require_member(&params.conversation_id).await?;
@@ -316,6 +337,12 @@ impl McpServer {
     /// Lists the connected cohort (HLD rev0.9): the hub's roster
     /// mirrored onto this node — peer id, name, class, host, and last
     /// reported live state. Global and lean; no membership gate.
+    ///
+    /// Contract: this returns the full roster in a single content
+    /// block — one block, no cap, no pagination. Capping or paginating
+    /// would change the tool contract, so the bound is the cohort
+    /// itself (node peers, not unbounded history); a harness must
+    /// expect the whole roster in one reply.
     #[tool(
         name = "list-peers",
         description = "List the connected wrkspc cohort: peer id, display name, class, host, and last reported live state. Global roster, no membership required."
@@ -347,13 +374,24 @@ impl McpServer {
 }
 
 /// Configuration for the HTTP listener.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpListenerConfig {
     /// Bind address. Defaults to loopback — the origin check is the
     /// listener itself: only local connections may present tokens.
     pub bind: SocketAddr,
     /// Accepted bearer tokens. A connection must present one of these.
     pub tokens: HashSet<String>,
+}
+
+impl std::fmt::Debug for HttpListenerConfig {
+    /// Redacts the bearer allowlist: a Debug or log replay must never
+    /// print the tokens themselves — only the count is shown.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpListenerConfig")
+            .field("bind", &self.bind)
+            .field("tokens", &self.tokens.len())
+            .finish()
+    }
 }
 
 impl Default for HttpListenerConfig {
@@ -436,7 +474,9 @@ impl HttpListener {
             http_config,
         );
         let router = axum::Router::new().nest_service("/mcp", service);
-        let tokens = self.config.tokens.clone();
+        // Wrap the token set once: the per-request middleware clones
+        // only the Arc, never the whole set.
+        let tokens: Arc<HashSet<String>> = Arc::new(self.config.tokens.clone());
         let router = router.layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
                 let tokens = tokens.clone();
@@ -445,21 +485,23 @@ impl HttpListener {
                         .headers()
                         .get(axum::http::header::AUTHORIZATION)
                         .and_then(|value| value.to_str().ok())
-                        .and_then(|value| value.strip_prefix("Bearer "))
+                        .and_then(|value| {
+                            // RFC 9110 §11.1: the auth-scheme is
+                            // case-insensitive and separated from the
+                            // credentials by the first whitespace run.
+                            let (scheme, token) = value.split_once(char::is_whitespace)?;
+                            scheme
+                                .eq_ignore_ascii_case("bearer")
+                                .then_some(token.trim())
+                        })
                         .map(|token| tokens.contains(token))
                         .unwrap_or(false);
                     if !authorized {
-                        let response = axum::response::Response::builder()
-                            .status(axum::http::StatusCode::UNAUTHORIZED)
-                            .body(axum::body::Body::from("unauthorized"));
-                        return match response {
-                            Ok(response) => response,
-                            // A static status and static body cannot fail;
-                            // this arm guards against builder misuse.
-                            Err(error) => {
-                                unreachable!("static unauthorized response failed: {error}")
-                            }
-                        };
+                        // A static status with a static body is an
+                        // infallible response: the tuple impl cannot
+                        // fail, so there is no panic path here.
+                        return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized")
+                            .into_response();
                     }
                     next.run(request).await
                 }

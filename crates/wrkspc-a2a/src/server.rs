@@ -16,6 +16,48 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use wrkspc_core::Store;
 
+/// The security-schemes map a card declares.
+type SecuritySchemes = std::collections::HashMap<String, a2a::SecurityScheme>;
+/// The security-requirements list a card declares (each entry maps the
+/// scheme id to its required scopes — empty for mTLS).
+type SecurityRequirements = Vec<std::collections::HashMap<String, Vec<String>>>;
+
+/// The mTLS security-scheme pair the cards declare: the scheme object
+/// and its (empty-scope) requirement, or neither when the transport is
+/// plaintext. Shared by every card builder so the declaration cannot
+/// drift apart between the hub card and the peer cards.
+fn security_declaration(mtls: bool) -> (Option<SecuritySchemes>, Option<SecurityRequirements>) {
+    if mtls {
+        let schemes = std::collections::HashMap::from([(
+            "mtlsSecurityScheme".to_string(),
+            a2a::SecurityScheme::MutualTls(a2a::MutualTlsSecurityScheme { description: None }),
+        )]);
+        let requirements = vec![std::collections::HashMap::from([(
+            "mtlsSecurityScheme".to_string(),
+            Vec::<String>::new(),
+        )])];
+        (Some(schemes), Some(requirements))
+    } else {
+        (None, None)
+    }
+}
+
+/// The interface pair every served card advertises: JSON-RPC and
+/// HTTP+JSON at the standard paths under `base_url`. Shared by every
+/// card builder for the same reason as the security declaration.
+fn supported_interfaces(base_url: &str) -> Vec<AgentInterface> {
+    vec![
+        AgentInterface::new(
+            format!("{base_url}/jsonrpc"),
+            a2a::TRANSPORT_PROTOCOL_JSONRPC,
+        ),
+        AgentInterface::new(
+            format!("{base_url}/rest"),
+            a2a::TRANSPORT_PROTOCOL_HTTP_JSON,
+        ),
+    ]
+}
+
 /// Builds the pilot's v1.0 agent card.
 ///
 /// * `base_url` — the externally reachable base URL (scheme + host + port),
@@ -31,19 +73,7 @@ use wrkspc_core::Store;
 /// inside `capabilities`), JSON-RPC + HTTP+JSON interfaces, and the
 /// mTLS declaration only when `mtls`.
 pub fn build_agent_card(base_url: &str, mtls: bool) -> AgentCard {
-    let (security_schemes, security_requirements) = if mtls {
-        let schemes = std::collections::HashMap::from([(
-            "mtlsSecurityScheme".to_string(),
-            a2a::SecurityScheme::MutualTls(a2a::MutualTlsSecurityScheme { description: None }),
-        )]);
-        let requirements = vec![std::collections::HashMap::from([(
-            "mtlsSecurityScheme".to_string(),
-            Vec::<String>::new(),
-        )])];
-        (Some(schemes), Some(requirements))
-    } else {
-        (None, None)
-    };
+    let (security_schemes, security_requirements) = security_declaration(mtls);
     AgentCard {
         name: "wrkspc".to_string(),
         description:
@@ -72,16 +102,7 @@ pub fn build_agent_card(base_url: &str, mtls: bool) -> AgentCard {
         }],
         default_input_modes: vec!["text/plain".to_string()],
         default_output_modes: vec!["text/plain".to_string()],
-        supported_interfaces: vec![
-            AgentInterface::new(
-                format!("{base_url}/jsonrpc"),
-                a2a::TRANSPORT_PROTOCOL_JSONRPC,
-            ),
-            AgentInterface::new(
-                format!("{base_url}/rest"),
-                a2a::TRANSPORT_PROTOCOL_HTTP_JSON,
-            ),
-        ],
+        supported_interfaces: supported_interfaces(base_url),
         security_schemes,
         security_requirements,
         documentation_url: None,
@@ -99,29 +120,19 @@ pub fn build_agent_card(base_url: &str, mtls: bool) -> AgentCard {
 /// declaration follows the hub card's `mtls` flag). Read-only
 /// discovery; capability claims stay minimal.
 ///
+/// Live presence state is deliberately NOT embedded: the card is a
+/// cacheable discovery document, and volatile presence (which changes
+/// on every presence write) stays on the roster surface, which already
+/// carries it for authenticated reads.
+///
 /// * `base_url` — the hub's base URL (the card's interface target).
 /// * `entry` — the roster row for the peer.
 /// * `mtls` — whether the hub's TLS surface serves the card.
 pub fn build_peer_card(base_url: &str, entry: &wrkspc_core::RosterEntry, mtls: bool) -> AgentCard {
-    let (security_schemes, security_requirements) = if mtls {
-        let schemes = std::collections::HashMap::from([(
-            "mtlsSecurityScheme".to_string(),
-            a2a::SecurityScheme::MutualTls(a2a::MutualTlsSecurityScheme { description: None }),
-        )]);
-        let requirements = vec![std::collections::HashMap::from([(
-            "mtlsSecurityScheme".to_string(),
-            Vec::<String>::new(),
-        )])];
-        (Some(schemes), Some(requirements))
-    } else {
-        (None, None)
-    };
+    let (security_schemes, security_requirements) = security_declaration(mtls);
     AgentCard {
         name: entry.peer_id.clone(),
-        description: format!(
-            "wrkspc-enrolled {} peer (hub-held identity; live state: {})",
-            entry.class, entry.state
-        ),
+        description: format!("wrkspc-enrolled {} peer (hub-held identity)", entry.class),
         version: "0.1.0".to_string(),
         provider: Some(AgentProvider {
             organization: "wrkspc".to_string(),
@@ -136,10 +147,7 @@ pub fn build_peer_card(base_url: &str, entry: &wrkspc_core::RosterEntry, mtls: b
         skills: vec![AgentSkill {
             id: format!("peer-{}", entry.class),
             name: entry.name.clone(),
-            description: format!(
-                "Enrolled {} peer hosted on {} (state: {})",
-                entry.class, entry.host_id, entry.state
-            ),
+            description: format!("Enrolled {} peer hosted on {}", entry.class, entry.host_id),
             tags: vec!["peer".to_string(), entry.class.clone()],
             examples: None,
             input_modes: None,
@@ -148,16 +156,7 @@ pub fn build_peer_card(base_url: &str, entry: &wrkspc_core::RosterEntry, mtls: b
         }],
         default_input_modes: vec!["text/plain".to_string()],
         default_output_modes: vec!["text/plain".to_string()],
-        supported_interfaces: vec![
-            AgentInterface::new(
-                format!("{base_url}/jsonrpc"),
-                a2a::TRANSPORT_PROTOCOL_JSONRPC,
-            ),
-            AgentInterface::new(
-                format!("{base_url}/rest"),
-                a2a::TRANSPORT_PROTOCOL_HTTP_JSON,
-            ),
-        ],
+        supported_interfaces: supported_interfaces(base_url),
         security_schemes,
         security_requirements,
         documentation_url: None,
@@ -211,7 +210,11 @@ impl A2aSurface {
     {
         let addr = listener.local_addr()?;
         let base_url = format!("http://{addr}");
-        let app = self.into_router(&base_url);
+        // Plaintext serving must never advertise an mTLS card: force
+        // the flag off so `with_mtls(true).serve(...)` cannot serve
+        // `mtlsSecurityScheme` over `http://`. (`serve_tls` is the
+        // symmetric force-true counterpart.)
+        let app = self.with_mtls(false).into_router(&base_url);
 
         tracing::info!(%addr, "wrkspc A2A surface bound");
         tokio::select! {
@@ -294,7 +297,18 @@ impl A2aSurface {
             tokio::select! {
                 _ = &mut shutdown => break,
                 accepted = listener.accept() => {
-                    let Ok((tcp, peer_addr)) = accepted else { continue };
+                    let (tcp, peer_addr) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            // A failed accept must not spin: log it and
+                            // back off so fd exhaustion (EMFILE) or
+                            // similar transient failures surface instead
+                            // of burning CPU in a silent tight loop.
+                            tracing::warn!(%error, "accept failed; backing off before retrying");
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            continue;
+                        }
+                    };
                     let acceptor = acceptor.clone();
                     let app = app.clone();
                     let resolve_peer = resolve_peer.clone();
@@ -519,41 +533,50 @@ pub fn peer_identity(cert: &rustls_pki_types::CertificateDer<'_>) -> Option<Stri
 }
 
 /// Extracts the authorization identity (the host id) from a client
-/// certificate: the FIRST DNS SAN of the parsed SAN extension, never
+/// certificate: the SINGLE DNS SAN of the parsed SAN extension, never
 /// anything parsed out of human-readable subject text.
 ///
 /// The TLS accept loop stamps this value alone as `x-wrkspc-peer`;
 /// downstream handlers treat the header as the authenticated host.
-/// A certificate without a DNS SAN yields `None` — the connection is
-/// served unstamped and the stamp gate keeps it off the A2A routes
-/// (fail-closed: the CN alone is never an identity).
+/// A certificate without a DNS SAN — or with MORE than one, which is
+/// ambiguous (a CA-issued leaf can list several hosts) — yields
+/// `None`: the connection is served unstamped and the stamp gate
+/// keeps it off the A2A routes (fail-closed: the CN alone is never
+/// an identity, and neither is whichever SAN the CA happened to list
+/// first).
 ///
 /// * `cert` — a leaf certificate in DER form.
 ///
 /// # Returns
 ///
-/// The first DNS SAN, or `None` when the certificate cannot be parsed
-/// or carries no DNS SAN.
+/// The single DNS SAN, or `None` when the certificate cannot be
+/// parsed or carries zero or multiple DNS SANs.
 pub fn host_identity(cert: &rustls_pki_types::CertificateDer<'_>) -> Option<String> {
     let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref()).ok()?;
-    parsed
-        .subject_alternative_name()
-        .ok()
-        .flatten()
-        .and_then(|ext| {
-            ext.value.general_names.iter().find_map(|name| match name {
-                x509_parser::extensions::GeneralName::DNSName(d) => {
-                    let host = d.to_string();
-                    (!host.is_empty()).then_some(host)
-                }
-                _ => None,
-            })
-        })
+    let ext = parsed.subject_alternative_name().ok().flatten()?;
+    let mut hosts = ext
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            x509_parser::extensions::GeneralName::DNSName(d) => {
+                let host = d.to_string();
+                (!host.is_empty()).then_some(host)
+            }
+            _ => None,
+        });
+    let host = hosts.next()?;
+    // A second SAN means the identity is ambiguous: fail closed
+    // rather than stamping an order-dependent pick.
+    hosts.next().is_none().then_some(host)
 }
 
 /// Reads the leaf serial as lowercase hex, normalized to match revoke
 /// records: DER INTEGER serials with the high bit set carry a leading
-/// `0x00` that `step`/`openssl` omit, so leading zeros are stripped.
+/// `0x00` that `step`/`openssl` omit, so whole leading zero BYTES are
+/// stripped — never nibbles. The result stays even-length, so a
+/// serial like `0x0A` exports as `"0a"`, the exact form an
+/// openssl-style `serial=0A` deny record string-matches.
 ///
 /// * `cert` — a leaf certificate in DER form.
 ///
@@ -568,7 +591,7 @@ pub fn cert_serial_hex(cert: &rustls_pki_types::CertificateDer<'_>) -> Option<St
         use std::fmt::Write;
         let _ = write!(hex, "{byte:02x}");
     }
-    let trimmed = hex.trim_start_matches('0');
+    let trimmed = hex.trim_start_matches("00");
     Some(if trimmed.is_empty() {
         "0".to_string()
     } else {
@@ -642,5 +665,43 @@ mod tests {
             .push(rcgen::DnType::CommonName, "cn-only");
         let cert = sign(params);
         assert_eq!(host_identity(&cert), None);
+    }
+
+    /// A leaf carrying MORE than one DNS SAN has no unambiguous
+    /// identity: the surface fails closed (`None`) instead of stamping
+    /// whichever SAN the CA happened to list first.
+    #[test]
+    fn cert_with_multiple_dns_sans_has_no_host_identity() {
+        let mut params =
+            CertificateParams::new(vec!["node-a".to_string(), "node-b".to_string()]).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let cert = sign(params);
+        assert_eq!(
+            host_identity(&cert),
+            None,
+            "an ambiguous multi-SAN leaf must not stamp an identity"
+        );
+    }
+
+    /// A serial whose first byte is below `0x10` keeps an even-length
+    /// form: `0x0A` exports as `"0a"`, the exact shape an openssl-style
+    /// `serial=0A` deny record string-matches (only whole leading zero
+    /// BYTES are stripped, never nibbles).
+    #[test]
+    fn serial_hex_keeps_even_length_for_small_first_byte() {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::new()).unwrap();
+        params.serial_number = Some(rcgen::SerialNumber::from_slice(&[0x0A]));
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "small-serial");
+        let cert = params.self_signed(&key).unwrap();
+
+        let der = CertificateDer::from(cert.der().to_vec());
+        assert_eq!(
+            cert_serial_hex(&der).as_deref(),
+            Some("0a"),
+            "the leading zero NIBBLE must not be stripped"
+        );
     }
 }

@@ -123,6 +123,7 @@ pub(crate) async fn reconcile_attempt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UiConfig;
     use crate::api::AppState;
     use std::future::Future;
     use std::pin::Pin;
@@ -187,7 +188,11 @@ mod tests {
             .await
             .unwrap();
 
-        let state = AppState::new(store, Arc::new(NoCancel), false, true, false, None);
+        let config = UiConfig {
+            hub_role: true,
+            ..Default::default()
+        };
+        let state = AppState::new(store, Arc::new(NoCancel), &config, None);
         let Json(views) = unknown_attempts(State(state)).await.unwrap();
         let views = views.as_array().expect("array response");
         assert_eq!(views.len(), 1);

@@ -25,7 +25,11 @@ impl Store {
         decision: Reconciliation,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        // IMMEDIATE: the reconcile is a read-modify-write over attempts
+        // and intents — the snapshot must not be promotable under a
+        // concurrent writer (deferred reads surface SQLITE_BUSY_SNAPSHOT
+        // on the write upgrade).
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let row = sqlx::query(
             "SELECT a.intent_id, a.state, m.conversation_id

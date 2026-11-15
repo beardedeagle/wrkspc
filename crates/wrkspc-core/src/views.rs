@@ -80,29 +80,43 @@ impl Store {
     pub async fn list_conversations(&self) -> Result<Vec<ConversationView>> {
         let rows = sqlx::query(
             "SELECT c.id AS id, c.name AS name, c.created_at AS created_at,
-                    GROUP_CONCAT(cm.peer_id) AS members
+                    cm.peer_id AS member_id
              FROM conversations c
-             JOIN conversation_members cm ON cm.conversation_id = c.id
-             GROUP BY c.id
-             ORDER BY c.created_at ASC",
+             LEFT JOIN conversation_members cm ON cm.conversation_id = c.id
+             ORDER BY c.created_at ASC, cm.joined_at ASC",
         )
         .fetch_all(self.pool())
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| ConversationView {
-                id: r.get("id"),
-                name: r.get::<Option<String>, _>("name"),
-                created_at: r.get("created_at"),
-                members: r
-                    .get::<Option<String>, _>("members")
-                    .unwrap_or_default()
-                    .split(',')
-                    .filter(|m| !m.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-            })
-            .collect())
+        // Members are assembled in Rust in enrolment (joined_at) order:
+        // GROUP_CONCAT's member order is unspecified, so the same room
+        // serialized differently run to run — and the LEFT JOIN keeps
+        // zero-member rooms (freshly created, or fully removed by the
+        // authoritative mirror) visible in the operator list.
+        let mut conversations: Vec<ConversationView> = Vec::new();
+        let mut current: Option<ConversationView> = None;
+        for row in rows {
+            let id: String = row.get("id");
+            if current.as_ref().is_none_or(|view| view.id != id) {
+                if let Some(done) = current.take() {
+                    conversations.push(done);
+                }
+                current = Some(ConversationView {
+                    id,
+                    name: row.get("name"),
+                    created_at: row.get("created_at"),
+                    members: Vec::new(),
+                });
+            }
+            if let Some(member) = row.get::<Option<String>, _>("member_id")
+                && let Some(view) = current.as_mut()
+            {
+                view.members.push(member);
+            }
+        }
+        if let Some(done) = current {
+            conversations.push(done);
+        }
+        Ok(conversations)
     }
 
     /// Lists a conversation's transcript, oldest first, with per-recipient
@@ -137,7 +151,7 @@ impl Store {
         .fetch_all(self.pool())
         .await?;
 
-        self.assemble_messages(messages, deliveries).await
+        self.assemble_messages(messages, deliveries)
     }
 
     /// The latest `window` messages of a conversation, oldest first,
@@ -196,7 +210,7 @@ impl Store {
             deliveries.extend(query.fetch_all(self.pool()).await?);
         }
 
-        self.assemble_messages(messages, deliveries).await
+        self.assemble_messages(messages, deliveries)
     }
 
     /// Joins delivery rows onto fetched message rows. The CALLER decides
@@ -204,7 +218,7 @@ impl Store {
     /// conversation-wide rows, the bounded window passes only the rows
     /// for its selected ids — so no delivery row outside the caller's
     /// message set is ever materialized here.
-    async fn assemble_messages(
+    fn assemble_messages(
         &self,
         messages: Vec<sqlx::sqlite::SqliteRow>,
         deliveries: Vec<sqlx::sqlite::SqliteRow>,

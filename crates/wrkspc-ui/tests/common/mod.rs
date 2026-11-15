@@ -85,13 +85,8 @@ async fn spawn_ui_full(
         .create_conversation(&["operator", "agent"])
         .await
         .unwrap();
-
-    let cancel = Arc::new(FakeCancel {
-        calls: Mutex::new(Vec::new()),
-    });
-    let ui = UiServer::new(
-        store.clone(),
-        cancel.clone(),
+    spawn_ui_on(
+        store,
         UiConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             cookie_secure,
@@ -100,8 +95,19 @@ async fn spawn_ui_full(
             hub_role,
             hub_connected,
         },
-        None,
-    );
+    )
+    .await
+}
+
+/// Spawns the UI on a caller-provided store and config: the shared boot
+/// wiring for tests whose fixture needs a custom store or role flags
+/// beyond the standard seed. The store is NOT seeded — the caller owns
+/// its peers and conversations.
+pub async fn spawn_ui_on(store: Store, config: UiConfig) -> TestUi {
+    let cancel = Arc::new(FakeCancel {
+        calls: Mutex::new(Vec::new()),
+    });
+    let ui = UiServer::new(store.clone(), cancel.clone(), config, None);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();

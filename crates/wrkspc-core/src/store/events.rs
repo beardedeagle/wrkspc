@@ -89,18 +89,24 @@ impl Store {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| Event {
+        let mut events: Vec<Event> = Vec::with_capacity(rows.len());
+        for r in rows {
+            let payload: String = r.get("payload");
+            // A corrupt payload must surface as a decode error, never
+            // as a genuine-Null feed event — silent Null makes
+            // corruption indistinguishable from a real null payload
+            // downstream.
+            let payload: serde_json::Value = payload
+                .parse()
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+            events.push(Event {
                 seq: r.get("seq"),
                 conversation_id: r.get("conversation_id"),
                 kind: r.get("kind"),
-                payload: r
-                    .get::<String, _>("payload")
-                    .parse()
-                    .unwrap_or(serde_json::Value::Null),
+                payload,
                 created_at: r.get("created_at"),
-            })
-            .collect())
+            });
+        }
+        Ok(events)
     }
 }

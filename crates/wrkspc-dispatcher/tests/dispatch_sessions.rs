@@ -153,7 +153,7 @@ async fn one_session_serializes_turns_and_attributes_chunks_per_conversation() {
             driver: Arc::new(driver.clone()),
         },
     );
-    let provider = Arc::new(FakeProvider { bindings });
+    let provider = Arc::new(FakeProvider::new(bindings));
     let (dispatcher, _handle) = Dispatcher::new(
         store.clone(),
         provider,
@@ -174,22 +174,17 @@ async fn one_session_serializes_turns_and_attributes_chunks_per_conversation() {
     });
 
     // Wait until BOTH conversations reached their terminal write.
-    let both_stopped = async {
-        for _ in 0..300 {
+    common::wait_until("both turns finish", Duration::from_secs(10), || {
+        let store = store.clone();
+        let (conv_a, conv_b) = (conv_a.clone(), conv_b.clone());
+        Box::pin(async move {
             let a = store.events_since(&conv_a, 0, 100).await.unwrap();
             let b = store.events_since(&conv_b, 0, 100).await.unwrap();
-            let a_done = a.iter().any(|e| e.kind == "dispatch.stopped");
-            let b_done = b.iter().any(|e| e.kind == "dispatch.stopped");
-            if a_done && b_done {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("both turns must finish");
-    };
-    tokio::time::timeout(Duration::from_secs(10), both_stopped)
-        .await
-        .expect("serialized turns complete");
+            a.iter().any(|e| e.kind == "dispatch.stopped")
+                && b.iter().any(|e| e.kind == "dispatch.stopped")
+        })
+    })
+    .await;
 
     let events_a = store.events_since(&conv_a, 0, 100).await.unwrap();
     let events_b = store.events_since(&conv_b, 0, 100).await.unwrap();
@@ -220,22 +215,11 @@ async fn one_session_serializes_turns_and_attributes_chunks_per_conversation() {
     );
     assert!(!chunk_b.payload.to_string().contains("message for a"));
 
-    // Serialization: whenever B's dispatch started, A's turn had already
-    // stopped (one session, one turn at a time).
-    let a_stopped_at = events_a
-        .iter()
-        .find(|e| e.kind == "dispatch.stopped")
-        .map(|e| e.created_at.clone())
-        .expect("A stopped");
-    let b_started_at = events_b
-        .iter()
-        .find(|e| e.kind == "dispatch.started")
-        .map(|e| e.created_at.clone())
-        .expect("B started");
-    assert!(
-        a_stopped_at <= b_started_at,
-        "A must stop before B starts: {a_stopped_at} vs {b_started_at}"
-    );
+    // Serialization: one session drives one turn at a time — the driver
+    // observed at most ONE prompt in flight across both conversations.
+    // A wall-clock event-order proof cannot distinguish same-millisecond
+    // events, an overlap counter can.
+    assert_eq!(driver.max_overlap(), 1, "one session never overlaps turns");
 
     let _ = shutdown_tx.send(()).await;
 }
@@ -303,7 +287,7 @@ async fn two_peers_dispatch_in_parallel_without_wedging() {
             driver: Arc::new(agy.clone()),
         },
     );
-    let provider = Arc::new(FakeProvider { bindings });
+    let provider = Arc::new(FakeProvider::new(bindings));
     let (dispatcher, _handle) = Dispatcher::new(
         store.clone(),
         provider,
@@ -326,12 +310,10 @@ async fn two_peers_dispatch_in_parallel_without_wedging() {
     // BOTH prompts must be in flight BEFORE any release: a serialized
     // dispatcher would never reach the second peer while the first
     // turn blocks.
-    for _ in 0..300 {
-        if codex.prompt_texts().len() == 1 && agy.prompt_texts().len() == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    common::wait_until("both prompts in flight", Duration::from_secs(10), || {
+        Box::pin(async { codex.prompt_texts().len() == 1 && agy.prompt_texts().len() == 1 })
+    })
+    .await;
     assert_eq!(
         codex.prompt_texts().len(),
         1,
@@ -346,17 +328,19 @@ async fn two_peers_dispatch_in_parallel_without_wedging() {
     agy.release_all();
 
     // BOTH turns must complete.
-    for _ in 0..300 {
-        let events = store.events_since(&conversation_id, 0, 100).await.unwrap();
-        let stopped = events
-            .iter()
-            .filter(|e| e.kind == "dispatch.stopped")
-            .count();
-        if stopped == 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    common::wait_until("both peers stopped", Duration::from_secs(10), || {
+        let store = store.clone();
+        let conversation_id = conversation_id.clone();
+        Box::pin(async move {
+            let events = store.events_since(&conversation_id, 0, 100).await.unwrap();
+            events
+                .iter()
+                .filter(|e| e.kind == "dispatch.stopped")
+                .count()
+                == 2
+        })
+    })
+    .await;
     let events = store.events_since(&conversation_id, 0, 100).await.unwrap();
     let stopped = events
         .iter()
@@ -439,7 +423,7 @@ async fn concurrent_turns_in_one_conversation_do_not_duplicate_guidance() {
             driver: Arc::new(agy.clone()),
         },
     );
-    let provider = Arc::new(FakeProvider { bindings });
+    let provider = Arc::new(FakeProvider::new(bindings));
     let (dispatcher, _handle) = Dispatcher::new(
         store.clone(),
         provider,
@@ -460,12 +444,12 @@ async fn concurrent_turns_in_one_conversation_do_not_duplicate_guidance() {
     });
 
     // Both turns in flight (both claims attempted), then release.
-    for _ in 0..300 {
-        if codex.prompt_texts().len() == 1 && agy.prompt_texts().len() == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    common::wait_until(
+        "both guidance-race turns in flight",
+        Duration::from_secs(10),
+        || Box::pin(async { codex.prompt_texts().len() == 1 && agy.prompt_texts().len() == 1 }),
+    )
+    .await;
     assert_eq!(codex.prompt_texts().len(), 1, "codex turn in flight");
     assert_eq!(agy.prompt_texts().len(), 1, "agy turn in flight");
     let needle = "[operator guidance from operator]: only once";
@@ -483,17 +467,23 @@ async fn concurrent_turns_in_one_conversation_do_not_duplicate_guidance() {
 
     // Both complete; the guidance is delivered exactly once (the
     // winning turn marked it, the other never saw it).
-    for _ in 0..300 {
-        let events = store.events_since(&conversation_id, 0, 100).await.unwrap();
-        let stopped = events
-            .iter()
-            .filter(|e| e.kind == "dispatch.stopped")
-            .count();
-        if stopped == 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    common::wait_until(
+        "both guidance-race turns stopped",
+        Duration::from_secs(10),
+        || {
+            let store = store.clone();
+            let conversation_id = conversation_id.clone();
+            Box::pin(async move {
+                let events = store.events_since(&conversation_id, 0, 100).await.unwrap();
+                events
+                    .iter()
+                    .filter(|e| e.kind == "dispatch.stopped")
+                    .count()
+                    == 2
+            })
+        },
+    )
+    .await;
     let undelivered = store.undelivered_guidance(&conversation_id).await.unwrap();
     assert!(
         undelivered.is_empty(),
@@ -515,26 +505,20 @@ async fn trailing_chunk_after_the_terminal_response_is_not_dropped() {
 
     // The trailing chunk arrives ~150 ms AFTER the stop reason; the
     // drive task's grace window must still commit it.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let events = harness
-            .store
-            .events_since(&harness.conversation_id, 0, 100)
-            .await
-            .unwrap();
-        let trailing = events.iter().any(|e| {
-            e.kind == "turn.chunk"
-                && e.payload["content"]
-                    .as_str()
-                    .is_some_and(|content| content.starts_with("trailing:"))
-        });
-        if trailing {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the trailing chunk was dropped; events: {events:#?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let store = harness.store.clone();
+    let conversation_id = harness.conversation_id.clone();
+    common::wait_until("the trailing chunk", Duration::from_secs(10), || {
+        let store = store.clone();
+        let conversation_id = conversation_id.clone();
+        Box::pin(async move {
+            let events = store.events_since(&conversation_id, 0, 100).await.unwrap();
+            events.iter().any(|e| {
+                e.kind == "turn.chunk"
+                    && e.payload["content"]
+                        .as_str()
+                        .is_some_and(|content| content.starts_with("trailing:"))
+            })
+        })
+    })
+    .await;
 }

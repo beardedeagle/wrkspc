@@ -153,7 +153,7 @@ fn simultaneous_requests_serialize_to_one_active_prompt() {
     let conversation = seed_store(&db);
     let log = dir.join("prompts.log");
     let fake = fake_agent_path();
-    let command = format!("{} --log-prompts {}", fake.display(), log.display());
+    let command = format!("{} --log-turn {}", fake.display(), log.display());
 
     let (node, port, token) = boot(&dir, &db, &command);
     let client = api_client(&token);
@@ -172,7 +172,14 @@ fn simultaneous_requests_serialize_to_one_active_prompt() {
     let raw = std::fs::read_to_string(&log).expect("prompt log");
     let timestamps: Vec<u128> = raw
         .lines()
-        .map(|line| line.split('\t').next().unwrap().parse().unwrap())
+        .filter(|line| line.starts_with("start\t"))
+        .map(|line| {
+            line.split('\t')
+                .nth(2)
+                .expect("turn log carries a millisecond stamp")
+                .parse()
+                .unwrap()
+        })
         .collect();
     assert_eq!(timestamps.len(), 3, "three prompts: {raw}");
     for window in timestamps.windows(2) {

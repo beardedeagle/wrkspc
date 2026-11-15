@@ -18,35 +18,6 @@ pub fn is_presence_state(state: &str) -> bool {
     PRESENCE_STATES.contains(&state)
 }
 
-/// Generated identifiers are UUID v4 strings.
-pub type Id = String;
-
-/// Timestamps are RFC 3339 UTC strings.
-pub type Timestamp = String;
-
-/// Participant class, matching the HLD's two-class model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerClass {
-    /// Speaks A2A directly; the hub coordinates on its behalf.
-    A2aNative,
-    /// Resides in a harness; wrkspc exposes MCP tools to it and speaks A2A
-    /// on its behalf.
-    Harness,
-    /// Human operator.
-    Human,
-}
-
-impl PeerClass {
-    /// Returns the wire/DB literal for this class.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PeerClass::A2aNative => "a2a_native",
-            PeerClass::Harness => "harness",
-            PeerClass::Human => "human",
-        }
-    }
-}
-
 /// Delivery gate state per message recipient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryState {
@@ -100,11 +71,6 @@ impl IntentState {
             IntentState::Failed => "failed",
             IntentState::Canceled => "canceled",
         }
-    }
-
-    /// Whether this intent state blocks new dispatch work.
-    pub fn blocks_new_work(self) -> bool {
-        matches!(self, IntentState::Claimed)
     }
 }
 

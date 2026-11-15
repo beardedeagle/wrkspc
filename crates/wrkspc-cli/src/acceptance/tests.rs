@@ -413,6 +413,28 @@ async fn jsonrpc_error_envelope_is_not_translated() {
     assert_eq!(accepted_events(&store, &conversation).await, 0);
 }
 
+// A JSON-RPC batch (array) body must never reach the SDK handler on
+// the stamped surface: per-element validation does not exist, so the
+// whole batch fails closed with a 400.
+#[tokio::test]
+async fn jsonrpc_batch_bodies_are_rejected_on_the_stamped_surface() {
+    let (store, conversation) = seeded().await;
+    let router = router_under_test(store.clone()).await;
+
+    let batch = serde_json::json!([
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "SendMessage",
+            "params": { "message": { "messageId": "m-batch", "role": "ROLE_USER", "contextId": conversation, "parts": [], "metadata": { "peerId": "operator", "recipients": ["codex"], "executionRequested": true } } },
+        }),
+    ])
+    .to_string();
+    let (status, _body) = post(router, Some("wrkspc-pilot-host"), &batch).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(accepted_events(&store, &conversation).await, 0);
+}
+
 #[tokio::test]
 async fn sender_asserted_from_wrong_host_is_rejected_before_acceptance() {
     let (store, conversation) = seeded().await;

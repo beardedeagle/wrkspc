@@ -41,6 +41,15 @@ pub(crate) async fn post_message(
     Path(id): Path<String>,
     Json(body): Json<PostMessageBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // The UI composer refuses empty sends, and so does the API: a blank
+    // post would commit an empty message and mint execution intents for
+    // an empty prompt.
+    if body.content.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "message content must not be blank" })),
+        ));
+    }
     // The operator posts as a participant; every other member receives the
     // delivery with execution requested (the dispatcher drives it).
     // Ejected (booted/banned) members are skipped: the operator's post
@@ -345,6 +354,12 @@ pub(crate) async fn add_guidance(
     Path(id): Path<String>,
     Json(body): Json<GuidanceBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if body.text.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "guidance text must not be blank" })),
+        ));
+    }
     let guidance_id = state
         .store
         .add_guidance(&id, "operator", &body.text)
@@ -356,6 +371,7 @@ pub(crate) async fn add_guidance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UiConfig;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -398,7 +414,11 @@ mod tests {
     #[tokio::test]
     async fn hub_connected_operator_post_defers_execution() {
         let (store, conversation) = seeded().await;
-        let state = AppState::new(store.clone(), Arc::new(NoCancel), false, false, true, None);
+        let config = UiConfig {
+            hub_connected: true,
+            ..Default::default()
+        };
+        let state = AppState::new(store.clone(), Arc::new(NoCancel), &config, None);
         let Json(response) = post_message(
             State(state),
             Path(conversation.clone()),
@@ -426,7 +446,12 @@ mod tests {
     #[tokio::test]
     async fn standalone_operator_post_still_executes_directly() {
         let (store, conversation) = seeded().await;
-        let state = AppState::new(store.clone(), Arc::new(NoCancel), false, false, false, None);
+        let state = AppState::new(
+            store.clone(),
+            Arc::new(NoCancel),
+            &UiConfig::default(),
+            None,
+        );
         let Json(response) = post_message(
             State(state),
             Path(conversation.clone()),
@@ -442,5 +467,46 @@ mod tests {
             store.claim_intent(&message_id, "codex").await.is_ok(),
             "standalone posts keep their local intent"
         );
+    }
+
+    /// Blank posts and blank guidance are refused with 400 before any
+    /// store mutation: an empty prompt must never mint execution
+    /// intents or commit guidance.
+    #[tokio::test]
+    async fn empty_posts_and_blank_guidance_are_refused() {
+        let (store, conversation) = seeded().await;
+        let state = AppState::new(
+            store.clone(),
+            Arc::new(NoCancel),
+            &UiConfig::default(),
+            None,
+        );
+
+        let error = post_message(
+            State(state.clone()),
+            Path(conversation.clone()),
+            Json(PostMessageBody {
+                content: "   ".to_string(),
+                recipients: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(
+            store.due_intents().await.unwrap().is_empty(),
+            "a blank post mints no execution intents"
+        );
+
+        let error = add_guidance(
+            State(state),
+            Path(conversation),
+            Json(GuidanceBody {
+                text: " ".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 }

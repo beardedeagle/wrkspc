@@ -46,7 +46,7 @@ pub(crate) async fn cancel_enveloped_work(store: &Store, task_id: &str) -> Resul
     let Some(row) = store
         .task_get(task_id)
         .await
-        .map_err(|error| A2AError::internal(error.to_string()))?
+        .map_err(crate::store_adapter::internal_store_error)?
     else {
         // The row-level cancel below reports the not-found verdict.
         return Ok(());
@@ -73,12 +73,12 @@ pub(crate) async fn cancel_enveloped_work(store: &Store, task_id: &str) -> Resul
         ),
         // Already terminal or no intent row: the cancel is idempotent
         // or has nothing to reach — proceed to the row-level cancel.
-        Err(wrkspc_core::StoreError::IntentTerminal { .. })
-        | Err(wrkspc_core::StoreError::NotFound { .. }) => {}
+        Err(
+            wrkspc_core::StoreError::IntentTerminal { .. }
+            | wrkspc_core::StoreError::NotFound { .. },
+        ) => {}
         Err(error) => {
-            return Err(A2AError::internal(format!(
-                "cancel propagation failed: {error}"
-            )));
+            return Err(crate::store_adapter::internal_store_error(error));
         }
     }
     Ok(())
@@ -92,20 +92,16 @@ impl AgentExecutor for WrkspcExecutor {
         // Never log message text: stderr and supervisor logs are not a
         // secret-safe channel (P08). Byte/part counts carry the
         // operational signal without the content.
-        let parts = ctx.message.as_ref().map(|m| m.parts.len()).unwrap_or(0);
-        let bytes: usize = ctx
-            .message
-            .as_ref()
-            .map(|m| {
-                m.parts
-                    .iter()
-                    .filter_map(|p| match &p.content {
-                        a2a::PartContent::Text(text) => Some(text.len()),
-                        _ => None,
-                    })
-                    .sum()
-            })
-            .unwrap_or(0);
+        let parts = ctx.message.as_ref().map_or(0, |m| m.parts.len());
+        let bytes: usize = ctx.message.as_ref().map_or(0, |m| {
+            m.parts
+                .iter()
+                .filter_map(|p| match &p.content {
+                    a2a::PartContent::Text(text) => Some(text.len()),
+                    _ => None,
+                })
+                .sum()
+        });
         tracing::info!(
             task_id = %ctx.task_id,
             parts,
@@ -134,14 +130,18 @@ impl AgentExecutor for WrkspcExecutor {
         {
             history.push(current.clone());
         }
-        // A continuation preserves any non-terminal stored state —
-        // Working, InputRequired (awaiting approval), AuthRequired —
-        // instead of resetting a progressing task to Submitted. Fresh
-        // tasks fall back to Submitted; a terminal record re-emits its
-        // own terminal state idempotently through the SDK, never this
-        // acceptance leg.
+        // A continuation preserves only the states a task can actually
+        // progress THROUGH — Working, InputRequired (awaiting approval),
+        // AuthRequired — instead of resetting a progressing task to
+        // Submitted. Everything else falls back to Submitted:
+        // `Unspecified` is the reserved zero value the wire mapping
+        // must never re-emit (state_mapping.rs), and a terminal record
+        // re-emits its own terminal state idempotently through the SDK,
+        // never this acceptance leg.
         let state = match stored.as_ref().map(|t| &t.status.state) {
-            Some(state) if !state.is_terminal() => state.clone(),
+            Some(
+                state @ (TaskState::Working | TaskState::InputRequired | TaskState::AuthRequired),
+            ) => state.clone(),
             _ => TaskState::Submitted,
         };
         let task = Task {
@@ -186,7 +186,7 @@ impl AgentExecutor for WrkspcExecutor {
             let current = store
                 .task_get(&task_id)
                 .await
-                .map_err(|error| A2AError::internal(error.to_string()))?
+                .map_err(crate::store_adapter::internal_store_error)?
                 .ok_or_else(|| A2AError::task_not_found(&task_id))?;
             let mut snapshot: serde_json::Value = serde_json::from_str(&current.task_json)
                 .map_err(|error| A2AError::internal(error.to_string()))?;
@@ -220,7 +220,9 @@ impl AgentExecutor for WrkspcExecutor {
                         "task {task_id} is terminal ({state}) and cannot be canceled"
                     )));
                 }
-                Err(other) => return Err(A2AError::internal(other.to_string())),
+                Err(other) => {
+                    return Err(crate::store_adapter::internal_store_error(other));
+                }
             }
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
                 task_id,

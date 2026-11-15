@@ -44,7 +44,10 @@ pub fn install(
     let mut skill_changed = false;
     if current != SKILL_MD {
         ensure_safe_target(home, &path)?;
-        std::fs::write(&path, SKILL_MD)?;
+        // The skill copy rides the same atomic replace as the pointer:
+        // a crash or power loss mid-write must never leave a truncated
+        // SKILL.md (the pointer guarantees byte-for-byte durability).
+        replace_file_atomically(&path, SKILL_MD)?;
         skill_changed = true;
         if current.is_empty() {
             any_new = true;
@@ -63,7 +66,10 @@ pub fn install(
         })() {
             if skill_changed {
                 if skill_existed {
-                    std::fs::write(&path, &current)?;
+                    // The rollback restores the user's prior content:
+                    // atomic, like every other write here — a crash
+                    // mid-rollback must not truncate it either.
+                    replace_file_atomically(&path, &current)?;
                 } else {
                     let _ = std::fs::remove_file(&path);
                 }

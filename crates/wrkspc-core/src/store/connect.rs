@@ -6,7 +6,6 @@ use crate::error::{Result, StoreError};
 use crate::model::PILOT_HOST_ID;
 use chrono::Utc;
 use std::path::Path;
-use std::str::FromStr;
 use std::time::Duration;
 
 impl Store {
@@ -54,7 +53,12 @@ impl Store {
     /// honor `busy_timeout` (sqlx comment; observed as `database is
     /// locked` claim failures racing a bridge spawn).
     async fn open_with(path: &Path, owner: &str, exclusive: bool) -> Result<Self> {
-        let mut opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
+        // The path is a filename, never a URL: string interpolation
+        // would let a `?`/`#` inside a legal filename be parsed as
+        // sqlx connect parameters (`mode=memory`, `cache=shared`,
+        // `nolock`) and silently open the wrong database.
+        let mut opts = SqliteConnectOptions::new()
+            .filename(path)
             .create_if_missing(true)
             .foreign_keys(true)
             // Concurrent writers (e.g. two guidance claims in one
@@ -76,7 +80,7 @@ impl Store {
         };
         if exclusive {
             store.migrate().await?;
-            store.acquire_lock(path).await?;
+            store.acquire_lock(path)?;
         }
         Ok(store)
     }
@@ -128,17 +132,35 @@ impl Store {
     /// `wrkspc-node`/`wrkspc-hub`) cannot both hold it, and a crashed
     /// process releases it automatically when the kernel reaps its
     /// file descriptors (safe crash recovery).
-    async fn acquire_lock(&self, path: &Path) -> Result<()> {
+    fn acquire_lock(&self, path: &Path) -> Result<()> {
         use fs2::FileExt;
 
         let lock_path = format!("{}.lock", path.display());
-        let file = std::fs::OpenOptions::new()
+        // The sidecar must be a regular file this process owns: a
+        // planted symlink (`<db>.lock -> ~/.ssh/authorized_keys`) in a
+        // shared/writable db dir would be truncated by the metadata
+        // write below. O_NOFOLLOW refuses the symlink at open time
+        // (unix), and the post-open check verifies regularity where
+        // O_NOFOLLOW is unavailable.
+        let mut options = std::fs::OpenOptions::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
             .map_err(|e| StoreError::Db(sqlx::Error::Io(e)))?;
+        if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+            return Err(StoreError::Db(sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "lock sidecar is not a regular file",
+            ))));
+        }
         if let Err(_error) = file.try_lock_exclusive() {
             // Someone else holds it: report who, best-effort (the
             // sidecar carries the holder's owner string).

@@ -11,11 +11,24 @@ use wrkspc_acp::stop::stop_reason_str;
 use wrkspc_acp::stop_reason_to_attempt_state;
 use wrkspc_core::{DueIntent, Store};
 
+/// The transcript contribution of one recorded session update.
+enum Recorded {
+    /// A text chunk was committed.
+    Text,
+    /// The update carried no storable text (a non-text chunk or a
+    /// non-message update): skipped by design, but counted so a turn
+    /// that emitted only non-text output is never mistaken for
+    /// silence.
+    SkippedNonText,
+}
+
 /// Records an agent message chunk as a committed `turn.chunk` event.
 ///
 /// Non-text chunks are skipped (the pilot records message output, not
-/// tool-call internals). The chunk's ACP `message_id` is kept (null when
-/// the agent sends none) so a reader can tell where one agent message
+/// tool-call internals) but reported as [`Recorded::SkippedNonText`]
+/// so the drive can mark the gap when a turn produced no storable
+/// text at all. The chunk's ACP `message_id` is kept (null when the
+/// agent sends none) so a reader can tell where one agent message
 /// ends and the next begins within a turn.
 ///
 /// * `store` — the transactional store.
@@ -34,24 +47,27 @@ async fn record_chunk(
     attempt_id: &str,
     session_id: &str,
     update: agent_client_protocol::v1::schema::SessionUpdate,
-) -> Result<(), wrkspc_core::StoreError> {
-    if let agent_client_protocol::v1::schema::SessionUpdate::AgentMessageChunk(chunk) = update
-        && let ContentBlock::Text(text) = chunk.content
-    {
-        store
-            .append_event(
-                conversation_id,
-                "turn.chunk",
-                &json!({
-                    "attempt_id": attempt_id,
-                    "session_id": session_id,
-                    "content": text.text,
-                    "message_id": chunk.message_id,
-                }),
-            )
-            .await?;
-    }
-    Ok(())
+) -> Result<Recorded, wrkspc_core::StoreError> {
+    let agent_client_protocol::v1::schema::SessionUpdate::AgentMessageChunk(chunk) = update else {
+        return Ok(Recorded::SkippedNonText);
+    };
+    let message_id = chunk.message_id;
+    let ContentBlock::Text(text) = chunk.content else {
+        return Ok(Recorded::SkippedNonText);
+    };
+    store
+        .append_event(
+            conversation_id,
+            "turn.chunk",
+            &json!({
+                "attempt_id": attempt_id,
+                "session_id": session_id,
+                "content": text.text,
+                "message_id": message_id,
+            }),
+        )
+        .await?;
+    Ok(Recorded::Text)
 }
 
 /// RAII guard removing an attempt from the active set on exit (including
@@ -61,6 +77,9 @@ struct ActiveGuard {
     /// The busy slot this drive holds (`Some(peer_id)` when the busy
     /// insert succeeded) — keyed by peer id, like the set itself (E08).
     busy_peer: Option<String>,
+    /// The session the turn ran on: recorded with the quarantine so a
+    /// later sweep can release it once the peer binds a different one.
+    session_id: Option<String>,
     /// Quarantine: an unconfirmed mid-turn cancel keeps the peer busy
     /// so the session is not reused while the adapter's turn still runs.
     keep_busy: std::cell::Cell<bool>,
@@ -76,10 +95,24 @@ impl Drop for ActiveGuard {
         // early return before registration must not strand a watch
         // channel for the dispatcher's lifetime.
         state.pending_cancels.remove(&self.attempt_id);
-        if !self.keep_busy.get()
-            && let Some(peer_id) = &self.busy_peer
-        {
+        let Some(peer_id) = &self.busy_peer else {
+            return;
+        };
+        if self.keep_busy.get() {
+            // Quarantine: the unconfirmed turn still runs on this
+            // session, so the busy slot stays. The protected session is
+            // recorded so a later claim can release the slot once the
+            // peer binds a DIFFERENT session — the old transport is
+            // provably gone, and chunk recording is session-scoped, so
+            // no misattribution can follow.
+            if let Some(session_id) = &self.session_id {
+                state
+                    .quarantined
+                    .insert(peer_id.clone(), session_id.clone());
+            }
+        } else {
             state.busy_peers.remove(peer_id);
+            state.quarantined.remove(peer_id);
         }
     }
 }
@@ -132,6 +165,7 @@ pub(crate) async fn drive_intent(
     let _guard = ActiveGuard {
         attempt_id: attempt_id.clone(),
         busy_peer,
+        session_id: binding.as_ref().map(|binding| binding.session_id.clone()),
         keep_busy: std::cell::Cell::new(false),
         state: Arc::clone(&state),
     };
@@ -150,39 +184,44 @@ pub(crate) async fn drive_intent(
             .mark_unknown(&attempt_id, "no session binding for recipient")
             .await
             .map_err(|e| format!("unknown attempt write failed: {e}"))?;
-        let _ = store
-            .append_event(
-                &intent.conversation_id,
-                "dispatch.unknown",
-                &json!({
-                    "attempt_id": attempt_id,
-                    "recipient_id": intent.recipient_id,
-                    "reason": "no session binding",
-                }),
-            )
-            .await;
+        append_feed_event(
+            &store,
+            &intent.conversation_id,
+            "dispatch.unknown",
+            &attempt_id,
+            &json!({
+                "attempt_id": attempt_id,
+                "recipient_id": intent.recipient_id,
+                "reason": "no session binding",
+            }),
+        )
+        .await;
         return Ok(());
     };
     match tokio::time::timeout(lookup_timeout, provider.lookup(&intent.recipient_id)).await {
         // In production the registry resolve is a cache hit: the
         // session already exists. A changed binding is churn.
-        Ok(Some(current)) if current.session_id == binding.session_id => {}
+        Ok(Some(current))
+            if current.session_id == binding.session_id
+                && current.peer_id == intent.recipient_id
+                && Arc::ptr_eq(&current.driver, &binding.driver) => {}
         Ok(_) => {
             store
                 .mark_unknown(&attempt_id, "session binding churned during claim")
                 .await
                 .map_err(|e| format!("unknown attempt write failed: {e}"))?;
-            let _ = store
-                .append_event(
-                    &intent.conversation_id,
-                    "dispatch.unknown",
-                    &json!({
-                        "attempt_id": attempt_id,
-                        "recipient_id": intent.recipient_id,
-                        "reason": "session binding churned during claim",
-                    }),
-                )
-                .await;
+            append_feed_event(
+                &store,
+                &intent.conversation_id,
+                "dispatch.unknown",
+                &attempt_id,
+                &json!({
+                    "attempt_id": attempt_id,
+                    "recipient_id": intent.recipient_id,
+                    "reason": "session binding churned during claim",
+                }),
+            )
+            .await;
             return Ok(());
         }
         Err(_) => {
@@ -193,17 +232,18 @@ pub(crate) async fn drive_intent(
                 )
                 .await
                 .map_err(|e| format!("unknown attempt write failed: {e}"))?;
-            let _ = store
-                .append_event(
-                    &intent.conversation_id,
-                    "dispatch.unknown",
-                    &json!({
-                        "attempt_id": attempt_id,
-                        "recipient_id": intent.recipient_id,
-                        "reason": "session re-check timed out (adapter nonresponsive)",
-                    }),
-                )
-                .await;
+            append_feed_event(
+                &store,
+                &intent.conversation_id,
+                "dispatch.unknown",
+                &attempt_id,
+                &json!({
+                    "attempt_id": attempt_id,
+                    "recipient_id": intent.recipient_id,
+                    "reason": "session re-check timed out (adapter nonresponsive)",
+                }),
+            )
+            .await;
             return Ok(());
         }
     }
@@ -226,30 +266,20 @@ pub(crate) async fn drive_intent(
             .mark_unknown(&attempt_id, &error.to_string())
             .await
             .map_err(|e| format!("unknown attempt write failed: {e}"))?;
-        let _ = store
-            .append_event(
-                &intent.conversation_id,
-                "dispatch.unknown",
-                &json!({
-                    "attempt_id": attempt_id,
-                    "reason": "dispatch write failed",
-                    "error": error.to_string(),
-                }),
-            )
-            .await;
-        return Ok(()); // the guard clears tracking
-    }
-    let _ = store
-        .append_event(
+        append_feed_event(
+            &store,
             &intent.conversation_id,
-            "dispatch.started",
+            "dispatch.unknown",
+            &attempt_id,
             &json!({
                 "attempt_id": attempt_id,
-                "recipient_id": intent.recipient_id,
-                "session_id": binding.session_id,
+                "reason": "dispatch write failed",
+                "error": error.to_string(),
             }),
         )
         .await;
+        return Ok(()); // the guard clears tracking
+    }
 
     // The dispatch boundary — the LAST decision point before the prompt
     // send. A cancel or a moderation gate (fence, hold, ejected peer)
@@ -265,13 +295,14 @@ pub(crate) async fn drive_intent(
                 )
                 .await
                 .map_err(|e| format!("canceled attempt terminal write failed: {e}"))?;
-            let _ = store
-                .append_event(
-                    &intent.conversation_id,
-                    "dispatch.canceled",
-                    &json!({ "attempt_id": attempt_id, "reason": "cancel requested before dispatch" }),
-                )
-                .await;
+            append_feed_event(
+                &store,
+                &intent.conversation_id,
+                "dispatch.canceled",
+                &attempt_id,
+                &json!({ "attempt_id": attempt_id, "reason": "cancel requested before dispatch" }),
+            )
+            .await;
             return Ok(());
         }
         Ok(false) => {}
@@ -281,6 +312,18 @@ pub(crate) async fn drive_intent(
                 .mark_unknown(&attempt_id, &error.to_string())
                 .await
                 .map_err(|e| format!("unknown attempt write failed: {e}"))?;
+            append_feed_event(
+                &store,
+                &intent.conversation_id,
+                "dispatch.unknown",
+                &attempt_id,
+                &json!({
+                    "attempt_id": attempt_id,
+                    "reason": "cancel check at the dispatch boundary failed",
+                    "error": error.to_string(),
+                }),
+            )
+            .await;
             return Ok(());
         }
     }
@@ -301,19 +344,32 @@ pub(crate) async fn drive_intent(
                         .mark_unknown(&attempt_id, &gate_error.to_string())
                         .await
                         .map_err(|e| format!("unknown attempt write failed: {e}"))?;
-                    return Ok(());
-                }
-                let _ = store
-                    .append_event(
+                    append_feed_event(
+                        &store,
                         &intent.conversation_id,
-                        "dispatch.gated",
+                        "dispatch.unknown",
+                        &attempt_id,
                         &json!({
                             "attempt_id": attempt_id,
-                            "recipient_id": intent.recipient_id,
-                            "reason": reason,
+                            "reason": "gate_attempt failed",
+                            "error": gate_error.to_string(),
                         }),
                     )
                     .await;
+                    return Ok(());
+                }
+                append_feed_event(
+                    &store,
+                    &intent.conversation_id,
+                    "dispatch.gated",
+                    &attempt_id,
+                    &json!({
+                        "attempt_id": attempt_id,
+                        "recipient_id": intent.recipient_id,
+                        "reason": reason,
+                    }),
+                )
+                .await;
                 return Ok(());
             }
             other => {
@@ -322,6 +378,18 @@ pub(crate) async fn drive_intent(
                     .mark_unknown(&attempt_id, &other.to_string())
                     .await
                     .map_err(|e| format!("unknown attempt write failed: {e}"))?;
+                append_feed_event(
+                    &store,
+                    &intent.conversation_id,
+                    "dispatch.unknown",
+                    &attempt_id,
+                    &json!({
+                        "attempt_id": attempt_id,
+                        "reason": "delivery gate check failed",
+                        "error": other.to_string(),
+                    }),
+                )
+                .await;
                 return Ok(());
             }
         }
@@ -366,16 +434,17 @@ pub(crate) async fn drive_intent(
             )
             .await
             .map_err(|e| format!("canceled attempt terminal write failed: {e}"))?;
-        let _ = store
-            .append_event(
-                &intent.conversation_id,
-                "dispatch.canceled",
-                &json!({
-                    "attempt_id": attempt_id,
-                    "reason": "cancel requested before dispatch",
-                }),
-            )
-            .await;
+        append_feed_event(
+            &store,
+            &intent.conversation_id,
+            "dispatch.canceled",
+            &attempt_id,
+            &json!({
+                "attempt_id": attempt_id,
+                "reason": "cancel requested before dispatch",
+            }),
+        )
+        .await;
         return Ok(());
     }
 
@@ -383,6 +452,8 @@ pub(crate) async fn drive_intent(
     // adapter's emission rate; either way the transcript must show the
     // gap instead of silently dropping turn output (E06/H-16).
     let mut capture_write_failures: u64 = 0;
+    let mut chunks_committed: u64 = 0;
+    let mut non_text_updates: u64 = 0;
 
     // Guidance rides the next SUCCESSFUL prompt in the conversation
     // (E09) — and it is CLAIMED atomically right before the send (C3):
@@ -406,17 +477,18 @@ pub(crate) async fn drive_intent(
                 )
                 .await
                 .map_err(|e| format!("terminal attempt write failed: {e}"))?;
-            let _ = store
-                .append_event(
-                    &intent.conversation_id,
-                    "dispatch.failed",
-                    &json!({
-                        "attempt_id": attempt_id,
-                        "reason": "guidance claim failed",
-                        "error": error.to_string(),
-                    }),
-                )
-                .await;
+            append_feed_event(
+                &store,
+                &intent.conversation_id,
+                "dispatch.failed",
+                &attempt_id,
+                &json!({
+                    "attempt_id": attempt_id,
+                    "reason": "guidance claim failed",
+                    "error": error.to_string(),
+                }),
+            )
+            .await;
             return Ok(());
         }
     };
@@ -443,18 +515,36 @@ pub(crate) async fn drive_intent(
             )
             .await
             .map_err(|e| format!("canceled attempt terminal write failed: {e}"))?;
-        let _ = store
-            .append_event(
-                &intent.conversation_id,
-                "dispatch.canceled",
-                &json!({
-                    "attempt_id": attempt_id,
-                    "reason": "cancel requested before dispatch",
-                }),
-            )
-            .await;
+        append_feed_event(
+            &store,
+            &intent.conversation_id,
+            "dispatch.canceled",
+            &attempt_id,
+            &json!({
+                "attempt_id": attempt_id,
+                "reason": "cancel requested before dispatch",
+            }),
+        )
+        .await;
         return Ok(());
     }
+
+    // All boundary gates and the registration are behind us and the
+    // prompt WILL be sent: only now does the feed record the attempt as
+    // started, so a gated or pre-dispatch-canceled attempt is never
+    // presented as one that ran.
+    append_feed_event(
+        &store,
+        &intent.conversation_id,
+        "dispatch.started",
+        &attempt_id,
+        &json!({
+            "attempt_id": attempt_id,
+            "recipient_id": intent.recipient_id,
+            "session_id": binding.session_id,
+        }),
+    )
+    .await;
 
     let guidance_blocks = guidance.iter().map(|g| {
         ContentBlock::Text(TextContent::new(format!(
@@ -510,7 +600,7 @@ pub(crate) async fn drive_intent(
                 event = events.recv(), if events_open => {
                     match event {
                         Ok(event) if event.session_id == binding.session_id => {
-                            if let Err(error) = record_chunk(
+                            match record_chunk(
                                 &store,
                                 &intent.conversation_id,
                                 &attempt_id,
@@ -519,8 +609,12 @@ pub(crate) async fn drive_intent(
                             )
                             .await
                             {
-                                tracing::warn!(%error, %attempt_id, "chunk commit failed");
-                                capture_write_failures += 1;
+                                Ok(Recorded::Text) => chunks_committed += 1,
+                                Ok(Recorded::SkippedNonText) => non_text_updates += 1,
+                                Err(error) => {
+                                    tracing::warn!(%error, %attempt_id, "chunk commit failed");
+                                    capture_write_failures += 1;
+                                }
                             }
                         }
                         Ok(_) => {}
@@ -552,7 +646,7 @@ pub(crate) async fn drive_intent(
         loop {
             match events.try_recv() {
                 Ok(event) if event.session_id == binding.session_id => {
-                    if let Err(error) = record_chunk(
+                    match record_chunk(
                         &store,
                         &intent.conversation_id,
                         &attempt_id,
@@ -561,8 +655,12 @@ pub(crate) async fn drive_intent(
                     )
                     .await
                     {
-                        tracing::warn!(%error, %attempt_id, "chunk commit failed");
-                        capture_write_failures += 1;
+                        Ok(Recorded::Text) => chunks_committed += 1,
+                        Ok(Recorded::SkippedNonText) => non_text_updates += 1,
+                        Err(error) => {
+                            tracing::warn!(%error, %attempt_id, "chunk commit failed");
+                            capture_write_failures += 1;
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -589,7 +687,7 @@ pub(crate) async fn drive_intent(
         loop {
             match tokio::time::timeout(std::time::Duration::from_millis(250), events.recv()).await {
                 Ok(Ok(event)) if event.session_id == binding.session_id => {
-                    if let Err(error) = record_chunk(
+                    match record_chunk(
                         &store,
                         &intent.conversation_id,
                         &attempt_id,
@@ -598,8 +696,12 @@ pub(crate) async fn drive_intent(
                     )
                     .await
                     {
-                        tracing::warn!(%error, %attempt_id, "chunk commit failed");
-                        capture_write_failures += 1;
+                        Ok(Recorded::Text) => chunks_committed += 1,
+                        Ok(Recorded::SkippedNonText) => non_text_updates += 1,
+                        Err(error) => {
+                            tracing::warn!(%error, %attempt_id, "chunk commit failed");
+                            capture_write_failures += 1;
+                        }
                     }
                 }
                 Ok(Ok(_)) => {}
@@ -621,7 +723,8 @@ pub(crate) async fn drive_intent(
     };
     _guard.keep_busy.set(quarantine_busy);
     // A partial capture is never reported as complete: committed chunk
-    // write failures leave their own visible marker.
+    // write failures leave their own visible marker, and a turn whose
+    // output was entirely non-text must not read as silence.
     if capture_write_failures > 0 {
         record_gap(
             &store,
@@ -629,6 +732,16 @@ pub(crate) async fn drive_intent(
             &attempt_id,
             "chunk commit failures",
             capture_write_failures,
+        )
+        .await;
+    }
+    if chunks_committed == 0 && non_text_updates > 0 {
+        record_gap(
+            &store,
+            &intent.conversation_id,
+            &attempt_id,
+            "non-text output not captured",
+            non_text_updates,
         )
         .await;
     }
@@ -650,17 +763,18 @@ pub(crate) async fn drive_intent(
                 )
                 .await
                 .map_err(|e| format!("terminal attempt write failed: {e}"))?;
-            let _ = store
-                .append_event(
-                    &intent.conversation_id,
-                    "dispatch.stopped",
-                    &json!({
-                        "attempt_id": attempt_id,
-                        "state": attempt_state.as_str(),
-                        "stop_reason": stop_reason_str(&reason),
-                    }),
-                )
-                .await;
+            append_feed_event(
+                &store,
+                &intent.conversation_id,
+                "dispatch.stopped",
+                &attempt_id,
+                &json!({
+                    "attempt_id": attempt_id,
+                    "state": attempt_state.as_str(),
+                    "stop_reason": stop_reason_str(&reason),
+                }),
+            )
+            .await;
         }
         Err(error) => {
             // mark_unknown releases any guidance claim in the SAME
@@ -671,13 +785,14 @@ pub(crate) async fn drive_intent(
                 .mark_unknown(&attempt_id, &error)
                 .await
                 .map_err(|e| format!("unknown attempt write failed: {e}"))?;
-            let _ = store
-                .append_event(
-                    &intent.conversation_id,
-                    "dispatch.unknown",
-                    &json!({ "attempt_id": attempt_id, "error": error }),
-                )
-                .await;
+            append_feed_event(
+                &store,
+                &intent.conversation_id,
+                "dispatch.unknown",
+                &attempt_id,
+                &json!({ "attempt_id": attempt_id, "error": error }),
+            )
+            .await;
         }
     }
     Ok(())
@@ -693,15 +808,31 @@ async fn record_gap(
     reason: &str,
     count: u64,
 ) {
-    let _ = store
-        .append_event(
-            conversation_id,
-            "capture.gap",
-            &json!({
-                "attempt_id": attempt_id,
-                "reason": reason,
-                "count": count,
-            }),
-        )
-        .await;
+    append_feed_event(
+        store,
+        conversation_id,
+        "capture.gap",
+        attempt_id,
+        &json!({
+            "attempt_id": attempt_id,
+            "reason": reason,
+            "count": count,
+        }),
+    )
+    .await;
+}
+
+/// Appends a feed event, warning (never failing the turn) when the
+/// append itself fails: a wedged events table must be visible in the
+/// logs instead of silently truncating the transcript.
+async fn append_feed_event(
+    store: &Store,
+    conversation_id: &str,
+    kind: &str,
+    attempt_id: &str,
+    payload: &serde_json::Value,
+) {
+    if let Err(error) = store.append_event(conversation_id, kind, payload).await {
+        tracing::warn!(%error, %attempt_id, %kind, "feed event append failed");
+    }
 }

@@ -183,16 +183,26 @@ async fn adapter_begin_cancel_is_atomic_and_terminal_aware() {
     assert_eq!(canceled.status.state, TaskState::Canceled);
 
     // Already terminal → not cancelable.
-    adapter
+    let err = adapter
         .begin_cancel("t1")
         .await
         .expect_err("second cancel must fail");
+    assert_eq!(
+        err.code,
+        a2a::error_code::TASK_NOT_CANCELABLE,
+        "a terminal task must be reported not-cancelable: {err}"
+    );
 
     // Unknown task → not found.
-    adapter
+    let err = adapter
         .begin_cancel("missing")
         .await
         .expect_err("unknown task must fail");
+    assert_eq!(
+        err.code,
+        a2a::error_code::TASK_NOT_FOUND,
+        "an unknown task must be reported not-found: {err}"
+    );
 }
 
 /// Cancel preserves the task record (H-13): the context, history,
@@ -281,8 +291,6 @@ async fn adapter_list_filters_and_paginates() {
             .create(task(&format!("t{i}"), "ctx-list", (*state).clone(), None))
             .await
             .unwrap();
-        // Stagger updates so updated_at ordering is deterministic.
-        tokio::time::sleep(Duration::from_millis(2)).await;
     }
     // One task in another context must not appear.
     adapter
@@ -306,6 +314,13 @@ async fn adapter_list_filters_and_paginates() {
     assert_eq!(all.total_size, 4, "context filter scopes the count");
     assert_eq!(all.tasks.len(), 2, "page size respected");
     assert!(!all.next_page_token.is_empty(), "more pages exist");
+    // Newest first, exactly: tasks were created t0→t3, so the
+    // deterministic `updated_at DESC, task_id DESC` ordering returns
+    // t3→t0 — both keys agree with reverse creation order (no sleep
+    // stagger needed; a timestamp tie falls through to the task_id
+    // tiebreak, which preserves the same order).
+    let page_one_ids: Vec<&str> = all.tasks.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(page_one_ids, ["t3", "t2"], "page one is the newest half");
 
     let page_two = adapter
         .list(&ListTasksRequest {
@@ -322,10 +337,88 @@ async fn adapter_list_filters_and_paginates() {
         .expect("page two");
     assert_eq!(page_two.tasks.len(), 2, "remaining rows on page two");
     assert!(page_two.next_page_token.is_empty(), "no third page");
+    let page_two_ids: Vec<&str> = page_two.tasks.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(page_two_ids, ["t1", "t0"], "page two is the oldest half");
+    // Cursor correctness: the two pages are disjoint and their union
+    // covers every row exactly once — a duplicate-page cursor would
+    // fail the disjointness check, a dropped row the union check.
+    let mut seen = std::collections::HashSet::new();
+    for id in page_one_ids.iter().chain(page_two_ids.iter()) {
+        assert!(seen.insert(*id), "task {id} appears on both pages");
+    }
+    assert_eq!(seen.len(), 4, "every listed row appears exactly once");
     // P11: `total_size` is the logical query total on EVERY page — the
     // keyset cursor must never shrink it to the remaining suffix.
     assert_eq!(all.total_size, 4, "page one reports the logical total");
     assert_eq!(page_two.total_size, 4, "page two reports the same total");
+}
+
+/// A malformed page token is an invalid request, not a silent empty
+/// page: the caller must learn its cursor is bad instead of getting a
+/// plausible-looking continuation.
+#[tokio::test]
+async fn adapter_list_rejects_invalid_page_token() {
+    let store = Store::open_in_memory("a2a-test").await.unwrap();
+    let adapter = WrkspcTaskStore::new(store);
+    adapter
+        .create(task("t1", "ctx-a", TaskState::Submitted, None))
+        .await
+        .unwrap();
+
+    let err = adapter
+        .list(&ListTasksRequest {
+            context_id: Some("ctx-a".to_string()),
+            status: None,
+            page_size: Some(10),
+            page_token: Some("not-a-page-token".to_string()),
+            history_length: None,
+            status_timestamp_after: None,
+            include_artifacts: None,
+            tenant: None,
+        })
+        .await
+        .expect_err("a malformed token must be rejected");
+    assert_eq!(
+        err.code,
+        a2a::error_code::INVALID_REQUEST,
+        "the malformed cursor must surface as an invalid request: {err}"
+    );
+}
+
+/// The status-timestamp window filters on the store's `updated_at`
+/// column: only rows updated at or after the bound are returned.
+#[tokio::test]
+async fn adapter_list_honors_status_timestamp_after() {
+    let store = Store::open_in_memory("a2a-test").await.unwrap();
+    let adapter = WrkspcTaskStore::new(store);
+    adapter
+        .create(task("old", "ctx-a", TaskState::Submitted, None))
+        .await
+        .unwrap();
+    // A short pause separates the two updates so the bound lands
+    // strictly between them (the filter comparison is `>=`).
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let bound = chrono::Utc::now();
+    adapter
+        .create(task("new", "ctx-a", TaskState::Working, None))
+        .await
+        .unwrap();
+
+    let filtered = adapter
+        .list(&ListTasksRequest {
+            context_id: Some("ctx-a".to_string()),
+            status: None,
+            page_size: Some(10),
+            page_token: None,
+            history_length: None,
+            status_timestamp_after: Some(bound),
+            include_artifacts: None,
+            tenant: None,
+        })
+        .await
+        .expect("list");
+    let ids: Vec<&str> = filtered.tasks.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, ["new"], "the window must exclude the older update");
 }
 
 /// P11 (artifact half): an explicit `include_artifacts: Some(false)`
@@ -671,6 +764,39 @@ async fn executor_continuation_preserves_input_required_state() {
         task.status.state,
         TaskState::InputRequired,
         "an awaiting-approval task must not be reset to Submitted"
+    );
+}
+
+/// A continuation of a task in AuthRequired keeps that state — the
+/// third collaboration state the acceptance leg preserves, never
+/// reset to Submitted.
+#[tokio::test]
+async fn executor_continuation_preserves_auth_required_state() {
+    let store = wrkspc_core::Store::open_in_memory("a2a-executor-auth-required")
+        .await
+        .unwrap();
+    let stored = task("t1", "ctx-a", TaskState::AuthRequired, None);
+
+    let ctx = ExecutorContext {
+        message: Some(user_message("re-auth")),
+        task_id: "t1".into(),
+        stored_task: Some(stored),
+        context_id: "ctx-a".to_string(),
+        metadata: None,
+        user: None,
+        service_params: Default::default(),
+        tenant: None,
+    };
+    let stream = WrkspcExecutor::new(store.clone()).execute(ctx);
+    let events: Vec<_> = futures::StreamExt::collect(stream).await;
+    let event = events.into_iter().next().expect("one event").expect("ok");
+    let a2a::event::StreamResponse::Task(task) = event else {
+        panic!("the stream must begin with the Task object");
+    };
+    assert_eq!(
+        task.status.state,
+        TaskState::AuthRequired,
+        "an auth-required task must not be reset to Submitted"
     );
 }
 

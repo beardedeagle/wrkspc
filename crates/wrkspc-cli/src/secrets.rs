@@ -292,7 +292,7 @@ pub async fn resolve_ui_token(
     {
         return Ok(token);
     }
-    let account = token_account(identity, db);
+    let account = token_account(identity, db)?;
     let legacy = std::path::PathBuf::from(format!("{}.ui-token", db.display()));
     if let Some(token) =
         bounded_store_op("keychain read", move || platform_store().load(&account)).await?
@@ -315,7 +315,7 @@ pub async fn resolve_ui_token(
     // remove it so the token never lingers on disk in the clear.
     if let Some(token) = load_legacy_token_file(&legacy).await? {
         let stored = token.clone();
-        let account = token_account(identity, db);
+        let account = token_account(identity, db)?;
         bounded_store_op("keychain write", move || {
             platform_store().store(&account, &stored)
         })
@@ -354,7 +354,7 @@ pub async fn resolve_ui_token(
     }
     let token = uuid::Uuid::new_v4().to_string();
     let stored = token.clone();
-    let account = token_account(identity, db);
+    let account = token_account(identity, db)?;
     bounded_store_op("keychain write", move || {
         platform_store().store(&account, &stored)
     })
@@ -363,7 +363,7 @@ pub async fn resolve_ui_token(
     // STORED value is the credential the UI will accept, so it is
     // what this caller reports (CU-02 — every caller agrees on one
     // stable value).
-    let account = token_account(identity, db);
+    let account = token_account(identity, db)?;
     if let Some(existing) =
         bounded_store_op("keychain read", move || platform_store().load(&account)).await?
     {
@@ -382,17 +382,29 @@ pub async fn resolve_ui_token(
 ///
 /// `identity` is the node's stable name (macOS account); `db` is the
 /// canonical database path (non-macOS file key).
-fn token_account(identity: &str, db: &Path) -> String {
+///
+/// # Errors
+///
+/// Returns the canonicalization failure on non-macOS: keying by a
+/// fallback path would split the node and ui-token stores, so a
+/// database path that cannot be canonicalized is an error, never a
+/// silent fallback.
+fn token_account(identity: &str, db: &Path) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
         let _ = db;
-        ui_token_account(identity)
+        Ok(ui_token_account(identity))
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = identity;
-        let canonical = crate::util::canonical_db_path(db).unwrap_or_else(|_| db.to_path_buf());
-        ui_token_account(&canonical.display().to_string())
+        let canonical = crate::util::canonical_db_path(db).map_err(|error| {
+            format!(
+                "cannot canonicalize database path {} for the token key: {error}",
+                db.display()
+            )
+        })?;
+        Ok(ui_token_account(&canonical.display().to_string()))
     }
 }
 
@@ -652,6 +664,7 @@ struct KeychainStore {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 fn keychain_accounts(service: &str) -> Result<Vec<String>, String> {
     use core_foundation::array::{CFArray, CFArrayRef};
     use core_foundation::base::{CFType, TCFType};
@@ -719,7 +732,16 @@ impl TokenStore for KeychainStore {
             std::thread::sleep(std::time::Duration::from_millis(millis));
         }
         match security_framework::passwords::get_generic_password(self.service, account) {
-            Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+            // A keychain value that is not valid UTF-8 is a corrupt
+            // credential, never something to repair silently: lossy
+            // decoding would hand the caller a wrong token with no
+            // corruption signal (unlike the file store, which errors).
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(token) => Ok(Some(token)),
+                Err(error) => Err(format!(
+                    "keychain value for {account} is not valid UTF-8 ({error})"
+                )),
+            },
             Err(error) if error.code() == security_framework_sys::base::errSecItemNotFound => {
                 Ok(None)
             }

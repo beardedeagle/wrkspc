@@ -16,6 +16,8 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 fs2 = "0.4"
+# O_NOFOLLOW for the lock sidecar (symlink refusal on unix).
+libc = "0.2"
 
 [lints]
 workspace = true

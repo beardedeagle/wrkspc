@@ -30,7 +30,7 @@ impl Store {
         task_json: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        let result = match sqlx::query(
+        sqlx::query(
             "INSERT INTO a2a_tasks
                (task_id, context_id, state, terminal, task_json, version, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
@@ -44,26 +44,17 @@ impl Store {
         .bind(&now)
         .execute(self.pool())
         .await
-        {
-            Ok(result) => result,
-            // SQLite raises a constraint error on a duplicate primary
-            // key; rows_affected() never reports zero here. Match the
-            // violation so callers get the documented AlreadyExists
-            // instead of a generic Db error.
-            Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
-                return Err(StoreError::AlreadyExists {
-                    entity: "a2a task",
-                    id: task_id.to_string(),
-                });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if result.rows_affected() == 0 {
-            return Err(StoreError::AlreadyExists {
+        // SQLite raises a constraint error on a duplicate primary
+        // key; rows_affected() never reports zero here. Match the
+        // violation so callers get the documented AlreadyExists
+        // instead of a generic Db error.
+        .map_err(|error| match error {
+            sqlx::Error::Database(db) if db.is_unique_violation() => StoreError::AlreadyExists {
                 entity: "a2a task",
                 id: task_id.to_string(),
-            });
-        }
+            },
+            other => other.into(),
+        })?;
         Ok(())
     }
 
@@ -158,7 +149,7 @@ impl Store {
             .bind(task_id)
             .fetch_optional(self.pool())
             .await?;
-        Ok(row.map(task_row_from_sql))
+        Ok(row.as_ref().map(task_row_from_sql))
     }
 
     /// Lists task rows, newest first, with keyset pagination.
@@ -185,6 +176,12 @@ impl Store {
         page: Option<(&str, &str)>,
         limit: i64,
     ) -> Result<(Vec<TaskRow>, i64)> {
+        // A negative limit is clamped to an empty page: SQLite reads
+        // `LIMIT -1` as unbounded and this function then refreshes
+        // guidance per returned row, so one bad caller value would
+        // become a full-table scan plus writes. No upper clamp — the
+        // page size is the A2A caller's contract.
+        let limit = limit.max(0);
         // Logical filters (context/state/status window) scope BOTH the
         // count and the page; the keyset cursor scopes ONLY the page
         // (P11 — counting under the cursor made `total_size` shrink to
@@ -243,7 +240,7 @@ impl Store {
             rows_query = rows_query.bind(bind);
         }
         let rows = rows_query.bind(limit).fetch_all(self.pool()).await?;
-        let mut tasks: Vec<TaskRow> = rows.into_iter().map(task_row_from_sql).collect();
+        let mut tasks: Vec<TaskRow> = rows.iter().map(task_row_from_sql).collect();
         // The queue read is the delivery handoff boundary: before an
         // unclaimed delivery envelope rides to a node, its guidance
         // snapshot is brought up to date with the conversation's
@@ -311,13 +308,12 @@ impl Store {
         let current_ids: Vec<&str> = delivery
             .get("guidance")
             .and_then(|guidance| guidance.as_array())
-            .map(|entries| {
+            .map_or_default(|entries| {
                 entries
                     .iter()
                     .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         let pending_ids: Vec<&str> = pending
             .iter()
             .map(|guidance| guidance.id.as_str())
@@ -690,7 +686,10 @@ impl Store {
         canceled_json: &str,
     ) -> Result<TaskRow> {
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool().begin().await?;
+        // IMMEDIATE: the terminal check and the terminal UPDATE are a
+        // read-modify-write pair; a deferred snapshot could promote
+        // under a concurrent writer and surface SQLITE_BUSY_SNAPSHOT.
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query("SELECT * FROM a2a_tasks WHERE task_id = ?")
             .bind(task_id)
             .fetch_optional(&mut *tx)
@@ -699,7 +698,7 @@ impl Store {
                 entity: "a2a task",
                 id: task_id.to_string(),
             })?;
-        let current = task_row_from_sql(row);
+        let current = task_row_from_sql(&row);
         if current.terminal {
             return Err(StoreError::TaskTerminal {
                 task_id: task_id.to_string(),
@@ -778,9 +777,20 @@ impl Store {
         }
         let canceled_json = serde_json::to_string(&blob)
             .map_err(|error| StoreError::Db(sqlx::Error::Encode(Box::new(error))))?;
-        let canceled = self
+        // A concurrent cancel that committed between the read above and
+        // this transition satisfies the idempotent contract — the task
+        // is terminal either way — so the documented `Ok(None)` holds
+        // instead of surfacing a race as TaskTerminal/NotFound.
+        let canceled = match self
             .task_begin_cancel(task_id, "canceled", &canceled_json)
-            .await?;
+            .await
+        {
+            Ok(row) => row,
+            Err(StoreError::TaskTerminal { .. }) | Err(StoreError::NotFound { .. }) => {
+                return Ok(None);
+            }
+            Err(other) => return Err(other),
+        };
         Ok(Some(canceled))
     }
 }

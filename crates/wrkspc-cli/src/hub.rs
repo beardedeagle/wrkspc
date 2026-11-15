@@ -70,7 +70,7 @@ pub struct HubRunArgs {
 /// Returns a boxed error on store, bind, or TLS-material failures.
 // The default bind address is a compile-time constant (same
 // reviewed allowance as the UiConfig Default impl).
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let db = canonical_db_path(&args.db)?;
     let store = Store::open(&db, "wrkspc-hub").await?;
@@ -497,6 +497,12 @@ async fn require_peer_stamp(
 
 /// Loads the serial deny-list file (one lowercase hex serial per line).
 ///
+/// The file must be a REGULAR file (a symlink, FIFO, or device is
+/// refused — a FIFO would block the open indefinitely), bounded in
+/// size, and every line must be hex: a malformed line is dropped with
+/// a warning, since a non-hex serial could never match a certificate
+/// serial and a silently accepted typo would leave a peer allowed.
+///
 /// `path` is the optional file path.
 ///
 /// # Returns
@@ -505,16 +511,52 @@ async fn require_peer_stamp(
 ///
 /// # Errors
 ///
-/// Returns an error when the file exists but cannot be read.
+/// Returns an error when the file exists but is not a readable,
+/// bounded, regular file — the deny-list fails CLOSED, never open.
 fn load_deny_list(path: Option<&Path>) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
     let Some(path) = path else {
         return Ok(HashSet::new());
     };
+    // Checked with symlink_metadata BEFORE opening: a FIFO would block
+    // the open, a symlink or directory must not be followed into the
+    // deny set, and a multi-GB file must not be materialized before
+    // the hub starts listening.
+    const MAX_DENY_LIST_BYTES: u64 = 1 << 20; // 1 MiB
+    const MAX_DENY_LIST_LINES: usize = 10_000;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot stat revoke list {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "revoke list {} is not a regular file — refusing to load it",
+            path.display()
+        )
+        .into());
+    }
+    if metadata.len() > MAX_DENY_LIST_BYTES {
+        return Err(format!(
+            "revoke list {} exceeds {} bytes — refusing to load it",
+            path.display(),
+            MAX_DENY_LIST_BYTES
+        )
+        .into());
+    }
     let mut set = HashSet::new();
     for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
         let line = line?.trim().to_ascii_lowercase();
-        if !line.is_empty() {
-            set.insert(line);
+        if line.is_empty() {
+            continue;
+        }
+        if !line.chars().all(|c| c.is_ascii_hexdigit()) {
+            tracing::warn!(line = %line, "revoke list line is not a hex serial; dropping");
+            continue;
+        }
+        set.insert(line);
+        if set.len() > MAX_DENY_LIST_LINES {
+            return Err(format!(
+                "revoke list {} exceeds {MAX_DENY_LIST_LINES} entries — refusing to load it",
+                path.display()
+            )
+            .into());
         }
     }
     tracing::info!(count = set.len(), "serial deny-list loaded");

@@ -27,6 +27,7 @@
 /// caller warns and continues rather than failing closed: refusing to start
 /// would turn a defence-in-depth measure into an outage.
 #[cfg(unix)]
+#[allow(unsafe_code)]
 pub fn forbid_core_dumps() -> std::io::Result<()> {
     let limit = libc::rlimit {
         rlim_cur: 0,

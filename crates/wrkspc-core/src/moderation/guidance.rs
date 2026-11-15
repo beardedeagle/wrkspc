@@ -2,7 +2,7 @@
 //! marking.
 
 use super::Guidance;
-use crate::error::Result;
+use crate::error::{Result, StoreError};
 use crate::store::Store;
 use chrono::Utc;
 use serde_json::json;
@@ -18,6 +18,20 @@ impl Store {
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool().begin().await?;
+        // Guidance is conversation-scoped state: refusing a bogus room
+        // id here keeps orphaned rows out of the delivery queues
+        // instead of surfacing a raw FK-style error later.
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM conversations WHERE id = ?")
+            .bind(conversation_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            tx.rollback().await?;
+            return Err(StoreError::NotFound {
+                entity: "conversation",
+                id: conversation_id.to_string(),
+            });
+        }
         sqlx::query(
             "INSERT INTO guidance (id, conversation_id, author_id, text, delivered, created_at)
              VALUES (?, ?, ?, ?, 0, ?)",
@@ -155,6 +169,19 @@ impl Store {
         }
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool().begin().await?;
+        // Same boundary as `add_guidance`: a hub envelope naming a room
+        // this node does not know is refused loudly, not orphaned.
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM conversations WHERE id = ?")
+            .bind(conversation_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            tx.rollback().await?;
+            return Err(StoreError::NotFound {
+                entity: "conversation",
+                id: conversation_id.to_string(),
+            });
+        }
         for (id, author_id, text) in entries {
             sqlx::query(
                 "INSERT OR IGNORE INTO guidance (id, conversation_id, author_id, text, delivered, created_at)
@@ -188,27 +215,5 @@ impl Store {
         .fetch_all(self.pool())
         .await?;
         Ok(ids)
-    }
-
-    /// Marks guidance entries delivered (after they rode a prompt).
-    ///
-    /// * `ids` — the guidance ids.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::error::StoreError::Db`] on failure.
-    pub async fn mark_guidance_delivered(&self, ids: &[&str]) -> Result<()> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let mut tx = self.pool().begin().await?;
-        for id in ids {
-            sqlx::query("UPDATE guidance SET delivered = 1, claimed_attempt = NULL WHERE id = ?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        Ok(())
     }
 }

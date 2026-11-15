@@ -196,7 +196,14 @@ async fn guidance_flows_undelivered_then_delivered() {
     assert_eq!(undelivered[0].id, g1);
     assert_eq!(undelivered[1].id, g2);
 
-    store.mark_guidance_delivered(&[&g1]).await.unwrap();
+    // The scoped (conversation-validated) variant is the delivery
+    // boundary: the same UPDATE, gated on the conversation the
+    // guidance belongs to.
+    let marked = store
+        .mark_guidance_delivered_scoped(&conversation_id, &[&g1])
+        .await
+        .unwrap();
+    assert_eq!(marked, 1);
     let remaining = store.undelivered_guidance(&conversation_id).await.unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].id, g2);
@@ -311,7 +318,13 @@ async fn guidance_ingest_is_idempotent_and_ackable() {
     let pending = store.undelivered_guidance(&conversation_id).await.unwrap();
     assert_eq!(pending.len(), 2, "ingest is idempotent: {pending:?}");
 
-    store.mark_guidance_delivered(&["hub-g-1"]).await.unwrap();
+    assert_eq!(
+        store
+            .mark_guidance_delivered_scoped(&conversation_id, &["hub-g-1"])
+            .await
+            .unwrap(),
+        1
+    );
     let ack = store
         .delivered_guidance_ids(&conversation_id)
         .await

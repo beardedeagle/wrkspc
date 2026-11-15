@@ -6,7 +6,7 @@ mod common;
 use common::{seeded, temp_db_path};
 use sqlx::SqlitePool;
 use std::future::Future;
-use std::time::Duration;
+use std::str::FromStr;
 use wrkspc_core::{CancelOutcome, FenceKind, RecipientRequest, Store, StoreError};
 
 /// The linked engine, not only the lockfile, must contain the WAL page-size fix.
@@ -38,13 +38,18 @@ async fn after_competing_writer<T>(
         .execute(&mut *writer)
         .await
         .unwrap();
-    tokio::pin!(operation);
-    let early = tokio::time::timeout(Duration::from_millis(500), &mut operation).await;
-    writer.commit().await.unwrap();
+    // The blocked-writer proof is the lock ordering itself, not a
+    // wall-clock guess about scheduling: a zero-busy-timeout probe must
+    // fail with SQLITE_BUSY while the competing writer holds the lock,
+    // so the operator write below is pinned until the commit.
+    let probe = sqlx::query("UPDATE peers SET name = name || '!'")
+        .execute(pool)
+        .await;
     assert!(
-        early.is_err(),
-        "operator writes must wait for the existing writer"
+        matches!(&probe, Err(sqlx::Error::Database(db)) if db.code().as_deref().is_some_and(|code| code.starts_with('5'))),
+        "the competing writer must hold the lock: {probe:?}"
     );
+    writer.commit().await.unwrap();
     operation
         .await
         .expect("operator write succeeds after the competing writer commits")
@@ -58,7 +63,17 @@ async fn operator_writes_wait_for_competing_sqlite_writer() {
         .await
         .unwrap();
     let (operator, agent, conversation) = seeded(&store).await;
-    let writer = SqlitePool::connect(&format!("sqlite://{}", path.display()))
+    // Zero busy timeout: the probe inside `after_competing_writer` must
+    // fail immediately with SQLITE_BUSY instead of waiting out a grace
+    // period.
+    let writer = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                .unwrap()
+                .foreign_keys(true)
+                .busy_timeout(std::time::Duration::ZERO),
+        )
         .await
         .unwrap();
 

@@ -13,7 +13,7 @@ pub mod views;
 
 pub use error::{Result, StoreError};
 pub use model::{
-    AttemptState, DeliveryState, FenceKind, IntentState, PILOT_HOST_ID, PRESENCE_STATES, PeerClass,
+    AttemptState, DeliveryState, FenceKind, IntentState, PILOT_HOST_ID, PRESENCE_STATES,
     Reconciliation, is_presence_state,
 };
 pub use moderation::{CancelOutcome, DueIntent, Guidance, OpenAttempt};

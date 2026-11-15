@@ -41,6 +41,7 @@ async fn patch_conversation_sets_the_name() {
         .find(|row| row["id"] == conversation_id)
         .expect("the room is listed");
     assert_eq!(row["name"], "Veritas design");
+    let _ = ui.shutdown.send(());
 }
 
 /// A null or blank name clears it: a room is fully usable unnamed.
@@ -80,6 +81,7 @@ async fn patch_conversation_clears_the_name() {
         serde_json::Value::Null,
         "a blank name clears it"
     );
+    let _ = ui.shutdown.send(());
 }
 
 /// An unknown room is a 404, not a silent no-op.
@@ -95,6 +97,7 @@ async fn patch_conversation_refuses_an_unknown_room() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    let _ = ui.shutdown.send(());
 }
 
 /// An over-long name is refused rather than truncated.
@@ -131,4 +134,5 @@ async fn patch_conversation_refuses_an_over_long_name() {
         serde_json::Value::Null,
         "the refusal changed nothing"
     );
+    let _ = ui.shutdown.send(());
 }

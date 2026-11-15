@@ -52,7 +52,12 @@ impl Store {
                     state: intent_state,
                 });
             }
-            ("queued", None) => {
+            ("queued" | "claimed" | "dispatched", None) => {
+                // No open attempt row exists — including the crash
+                // window where the intent is claimed/dispatched but its
+                // attempt was never committed. The intent itself is
+                // canceled (the claim path treats that window as
+                // recoverable, so canceling here must not refuse).
                 sqlx::query("UPDATE execution_intents SET state = 'canceled' WHERE id = ?")
                     .bind(&intent_id)
                     .execute(&mut *tx)

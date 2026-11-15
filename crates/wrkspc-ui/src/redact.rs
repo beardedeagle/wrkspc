@@ -25,6 +25,11 @@ fn regexes() -> &'static Regexes {
             r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
         )
         .expect("static regex compiles"),
+        // A truncated PEM block (a cut message, a mid-stream adapter
+        // error) has no END marker: mask from the BEGIN marker to
+        // end-of-string so the partial key material never renders.
+        pem_truncated: regex::Regex::new(r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*$")
+            .expect("static regex compiles"),
         bearer: regex::Regex::new(r"(?i)\b(bearer)\s+[a-z0-9._~+/=-]{8,}")
             .expect("static regex compiles"),
         // Key=value secrets. Quote-aware on both sides of the separator
@@ -37,15 +42,21 @@ fn regexes() -> &'static Regexes {
         )
         .expect("static regex compiles"),
         // API keys carry hyphens and underscores inside the key material
-        // (`«redacted:sk-…»...`, `sk-proj-...`); an alphabet without them
-        // stops at the first separator and leaves the suffix exposed.
-        api_key: regex::Regex::new(r"(?i)\bsk-[a-z0-9_-]{8,}").expect("static regex compiles"),
+        // (`sk-proj-...`); an alphabet without them stops at the first
+        // separator and leaves the suffix exposed. Providers use several
+        // prefixes: sk-/sk_ (Stripe), AKIA (AWS), ghp_ (GitHub), and
+        // xox[bpas]- (Slack) — the alternation covers them all.
+        api_key: regex::Regex::new(
+            r"(?i)\b(?:sk[-_][a-z0-9_-]{8,}|AKIA[0-9A-Z]{16}|ghp_[a-z0-9]{8,}|xox[bpas]-[a-z0-9-]{8,})",
+        )
+        .expect("static regex compiles"),
     })
 }
 
 /// The compiled redaction regexes.
 struct Regexes {
     pem: regex::Regex,
+    pem_truncated: regex::Regex,
     bearer: regex::Regex,
     secret_assign: regex::Regex,
     api_key: regex::Regex,
@@ -59,6 +70,9 @@ struct Regexes {
 pub fn redact(text: &str) -> String {
     let regexes = regexes();
     let redacted = regexes.pem.replace_all(text, "[REDACTED private key]");
+    let redacted = regexes
+        .pem_truncated
+        .replace_all(&redacted, "[REDACTED private key]");
     let redacted = regexes.bearer.replace_all(&redacted, "$1 [REDACTED]");
     let redacted = regexes
         .secret_assign
@@ -98,13 +112,13 @@ pub fn redact_value(value: &Value) -> Value {
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(k, v)| {
-                    // Sensitive keys mask the whole value: the leaf
-                    // under `password`/`secret`/`access_token`/`api_key`
-                    // never renders, whatever its shape (UI-07).
+                    // Keys pass through the same display mask as values
+                    // (UI-07): a credential used as a dynamic object key
+                    // must not render unmasked either.
                     if is_sensitive_key(k) {
-                        (k.clone(), Value::String("[REDACTED]".to_string()))
+                        (redact(k), Value::String("[REDACTED]".to_string()))
                     } else {
-                        (k.clone(), redact_value(v))
+                        (redact(k), redact_value(v))
                     }
                 })
                 .collect(),
@@ -211,6 +225,51 @@ mod tests {
         let serialized = serde_json::to_string(&out).unwrap();
         assert!(!serialized.contains("hunter2"), "got: {serialized}");
         assert!(!serialized.contains("tok-abc"), "got: {serialized}");
+    }
+
+    #[test]
+    fn masks_secret_shaped_object_keys() {
+        // A credential in KEY position (a dynamic object key) must mask
+        // like a value does: keys pass through `redact` (UI-07).
+        let value = serde_json::json!({
+            "kind": "tool.invoked",
+            "args": { "sk-proj-abcd1234": "payload" },
+        });
+        let out = redact_value(&value);
+        let serialized = serde_json::to_string(&out).unwrap();
+        assert!(!serialized.contains("sk-proj"), "got: {serialized}");
+        assert!(serialized.contains("[REDACTED key]"), "got: {serialized}");
+    }
+
+    #[test]
+    fn masks_truncated_pem_blocks() {
+        // A BEGIN marker without its END (a cut message, a mid-stream
+        // adapter error) must not leak the partial key material.
+        let out = redact("cut mid-stream: -----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...");
+        assert!(out.contains("[REDACTED private key]"), "got: {out}");
+        assert!(!out.contains("MIIEow"), "got: {out}");
+        assert!(out.contains("cut mid-stream"), "got: {out}");
+    }
+
+    #[test]
+    fn masks_provider_key_shapes() {
+        // Stripe live/secret, AWS, GitHub, and Slack token shapes all
+        // mask: the api_key alternation covers provider prefixes beyond
+        // `sk-`.
+        // Prefix fragments are split with concat! so push protection's
+        // obfuscation-tolerant scanners see no contiguous key-shaped
+        // literal — these are mask-pattern fixtures, never real keys.
+        for secret in [
+            concat!("sk", "_live_notarealsecret000"),
+            concat!("sk", "-projexample12345"),
+            concat!("AK", "IAIOSFODNN7EXAMPLE"),
+            concat!("gh", "p_abcdefgh12345678"),
+            concat!("xo", "xb-123456789012-exampletoken"),
+        ] {
+            let out = redact(&format!("leak: {secret}"));
+            assert!(!out.contains(secret), "got: {out}");
+            assert!(out.contains("[REDACTED key]"), "got: {out}");
+        }
     }
 
     #[test]

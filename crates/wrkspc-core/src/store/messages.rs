@@ -200,7 +200,11 @@ impl Store {
         conversation_id: &str,
         content: &str,
     ) -> Result<Vec<String>> {
-        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        // A deferred READ transaction, never IMMEDIATE: this is a
+        // read-only operator-surface call, and holding the WAL write
+        // lock across the per-peer loop below would stall every writer
+        // for its whole duration.
+        let mut tx = self.pool.begin().await?;
         let matched = self
             .mentioned_members(&mut tx, conversation_id, content)
             .await?;
@@ -225,6 +229,7 @@ impl Store {
             }
             resolved.push(peer_id);
         }
+        tx.rollback().await?;
         Ok(resolved)
     }
 
@@ -417,13 +422,10 @@ impl Store {
                 }
             }
             // The stored flag reflects the committed intents, never a
-            // stale first-acceptance snapshot.
-            if requests_execution {
-                sqlx::query("UPDATE messages SET execution_requested = 1 WHERE id = ?")
-                    .bind(&existing_id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
+            // stale first-acceptance snapshot: reaching this point with
+            // `requests_execution` means the execution-authority guard
+            // above already saw the flag committed, so there is nothing
+            // to update here.
             tx.commit().await?;
             return Ok(AcceptOutcome::Replay {
                 message_id: existing_id,
@@ -682,7 +684,10 @@ impl Store {
                     // No id match: the alias/display-name match must be
                     // unique, so a token matching two members (whether
                     // through one channel or across both) is refused
-                    // rather than guessed by row order.
+                    // rather than guessed by row order. Members come
+                    // from a PK-unique set, so the candidate list is
+                    // already duplicate-free — its length IS the match
+                    // count.
                     let by_alias_or_name: Vec<&Candidate> = members
                         .iter()
                         .filter(|member| {
@@ -693,28 +698,18 @@ impl Store {
                                 || member.name.eq_ignore_ascii_case(&name)
                         })
                         .collect();
-                    let mut unique: Vec<&Candidate> = Vec::new();
-                    for member in by_alias_or_name {
-                        if !unique.iter().any(|seen| seen.peer_id == member.peer_id) {
-                            unique.push(member);
-                        }
-                    }
-                    match unique.len() {
+                    match by_alias_or_name.len() {
                         0 => None,
-                        1 => Some(unique[0]),
+                        1 => Some(by_alias_or_name[0]),
                         _ => {
-                            return Err(StoreError::AmbiguousPeerRef {
-                                reference: name.to_string(),
-                            });
+                            return Err(StoreError::AmbiguousPeerRef { reference: name });
                         }
                     }
                 }
                 // Two peer ids differing only by case are equally
                 // ambiguous under case-insensitive mention semantics.
                 _ => {
-                    return Err(StoreError::AmbiguousPeerRef {
-                        reference: name.to_string(),
-                    });
+                    return Err(StoreError::AmbiguousPeerRef { reference: name });
                 }
             };
             if let Some(member) = hit
@@ -789,7 +784,7 @@ fn mentioned_names(content: &str) -> Vec<String> {
             continue;
         };
         let boundary = token[..at].chars().last();
-        if boundary.is_some_and(|c| c.is_alphanumeric()) {
+        if boundary.is_some_and(char::is_alphanumeric) {
             continue;
         }
         let rest = &token[at + 1..];
@@ -800,7 +795,7 @@ fn mentioned_names(content: &str) -> Vec<String> {
         if name.is_empty() || names.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
             continue;
         }
-        names.push(name.to_string());
+        names.push(name.to_owned());
     }
     names
 }

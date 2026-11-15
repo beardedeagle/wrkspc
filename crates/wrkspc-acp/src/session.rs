@@ -45,7 +45,7 @@ enum Command {
     SetConfigOption {
         session_id: String,
         config_id: String,
-        value: String,
+        value: SessionConfigOptionValue,
         respond: oneshot::Sender<Result<()>>,
     },
     Cancel {
@@ -148,7 +148,9 @@ impl SessionHandle {
     /// server injection (ACP `session/new` `mcpServers` — the harness
     /// sees the wrkspc tools from its first turn).
     ///
-    /// * `cwd` — the session's working directory.
+    /// * `cwd` — the session's working directory; relative paths are
+    ///   resolved against the client process cwd before the request is
+    ///   sent (the ACP contract requires an absolute path).
     /// * `mcp_servers` — the MCP servers to inject (stdio today; HTTP when
     ///   the harness advertises `mcp_capabilities.http`).
     ///
@@ -162,16 +164,23 @@ impl SessionHandle {
         cwd: PathBuf,
         mcp_servers: Vec<McpServer>,
     ) -> Result<String> {
+        // ACP NewSessionRequest.cwd must be absolute; anchor relative
+        // paths at the client process cwd instead of leaking a bare
+        // relative path to the adapter.
+        let cwd = std::path::absolute(cwd).map_err(|error| {
+            AcpError::Protocol(format!("failed to resolve session cwd: {error}"))
+        })?;
         let (respond, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Command::NewSession {
+        round_trip(
+            &self.cmd_tx,
+            Command::NewSession {
                 cwd,
                 mcp_servers,
                 respond,
-            })
-            .await
-            .map_err(|_| AcpError::NotRunning)?;
-        rx.await.map_err(|_| AcpError::NotRunning)?
+            },
+            rx,
+        )
+        .await
     }
 
     /// Sends a prompt and waits for the turn's stop reason.
@@ -191,25 +200,27 @@ impl SessionHandle {
         blocks: Vec<ContentBlock>,
     ) -> Result<StopReason> {
         let (respond, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Command::Prompt {
+        round_trip(
+            &self.cmd_tx,
+            Command::Prompt {
                 session_id: session_id.into(),
                 blocks,
                 respond,
-            })
-            .await
-            .map_err(|_| AcpError::NotRunning)?;
-        rx.await.map_err(|_| AcpError::NotRunning)?
+            },
+            rx,
+        )
+        .await
     }
 
-    /// Sets a session configuration option (ACP `session/set_config_option`).
+    /// Sets a session configuration option to a string value id (ACP
+    /// `session/set_config_option`).
     ///
     /// The antigravity binding uses `config_id = "model"` for D-4b's
     /// mandatory per-session model pinning.
     ///
     /// * `session_id` — the target session.
     /// * `config_id` — the option's config id (e.g. `"model"`).
-    /// * `value` — the option value.
+    /// * `value` — the option's value id.
     ///
     /// # Errors
     ///
@@ -222,17 +233,45 @@ impl SessionHandle {
         config_id: impl Into<String>,
         value: impl Into<String>,
     ) -> Result<()> {
+        self.set_config_option_value(
+            session_id,
+            config_id,
+            SessionConfigOptionValue::value_id(value.into()),
+        )
+        .await
+    }
+
+    /// Sets a session configuration option to a typed value (ACP
+    /// `session/set_config_option`).
+    ///
+    /// * `session_id` — the target session.
+    /// * `config_id` — the option's config id.
+    /// * `value` — the typed option value; [`SessionConfigOptionValue::Boolean`]
+    ///   reaches boolean options that the string form cannot express.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Protocol`] when the adapter
+    /// rejects the request and [`AcpError::NotRunning`]
+    /// when the session task is gone.
+    pub async fn set_config_option_value(
+        &self,
+        session_id: impl Into<String>,
+        config_id: impl Into<String>,
+        value: SessionConfigOptionValue,
+    ) -> Result<()> {
         let (respond, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Command::SetConfigOption {
+        round_trip(
+            &self.cmd_tx,
+            Command::SetConfigOption {
                 session_id: session_id.into(),
                 config_id: config_id.into(),
-                value: value.into(),
+                value,
                 respond,
-            })
-            .await
-            .map_err(|_| AcpError::NotRunning)?;
-        rx.await.map_err(|_| AcpError::NotRunning)?
+            },
+            rx,
+        )
+        .await
     }
 
     /// Requests cancellation of the session's in-flight turn.
@@ -257,16 +296,35 @@ impl SessionHandle {
 
     /// Shuts the session task down and tears down the adapter connection.
     ///
+    /// Takes `&self`, so shared handles shut down without an extra clone
+    /// and the handle stays usable to observe [`SessionHandle::closed`]
+    /// after the teardown is ordered.
+    ///
     /// # Errors
     ///
     /// Returns [`AcpError::NotRunning`] when the
     /// session task is already gone.
-    pub async fn shutdown(self) -> Result<()> {
+    pub async fn shutdown(&self) -> Result<()> {
         self.cmd_tx
             .send(Command::Shutdown)
             .await
             .map_err(|_| AcpError::NotRunning)
     }
+}
+
+/// Sends one command and awaits its oneshot reply; a channel failure on
+/// either leg means the session task is gone, so the request was
+/// definitely not sent.
+async fn round_trip<T>(
+    cmd_tx: &mpsc::Sender<Command>,
+    command: Command,
+    rx: oneshot::Receiver<Result<T>>,
+) -> Result<T> {
+    cmd_tx
+        .send(command)
+        .await
+        .map_err(|_| AcpError::NotRunning)?;
+    rx.await.map_err(|_| AcpError::NotRunning)?
 }
 
 /// One serialized unit of work on the connection. Prompts, session
@@ -289,7 +347,7 @@ enum Unit {
     SetConfig {
         session_id: String,
         config_id: String,
-        value: String,
+        value: SessionConfigOptionValue,
         respond: oneshot::Sender<Result<()>>,
     },
 }
@@ -446,6 +504,13 @@ fn submit_unit(
             pending.push_back(unit);
         }
     } else {
+        // Fast path: the slot is free. A caller that dropped its
+        // oneshot between enqueueing the command and this dispatch
+        // must not have the request sent — a sent bid with no waiter
+        // would duplicate on timeout-retry (E11).
+        if unit_abandoned(&unit) {
+            return;
+        }
         *in_flight = true;
         start_unit(connection, done_slot, unit);
     }
@@ -500,7 +565,7 @@ fn start_unit(
                     .send_request(SetSessionConfigOptionRequest::new(
                         session_id,
                         SessionConfigId::new(config_id),
-                        SessionConfigOptionValue::value_id(value),
+                        value,
                     ))
                     .block_task()
                     .await

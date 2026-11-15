@@ -92,13 +92,15 @@ pub enum StoreError {
     )]
     ExecutionAuthorityConflict { message_id: String },
 
+    /// A presence report carried a state outside the presence
+    /// vocabulary; the write is refused at the core boundary so no
+    /// caller can persist a state the readers do not understand.
+    #[error("invalid presence state `{state}`")]
+    InvalidPresenceState { state: String },
+
     /// Schema migration failure.
     #[error("migration error: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
-
-    /// A task failed to join.
-    #[error("task failed: {0}")]
-    Join(#[from] tokio::task::JoinError),
 }
 
 /// Result alias for store operations.

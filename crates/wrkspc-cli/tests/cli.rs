@@ -71,3 +71,24 @@ fn all_and_harness_conflict_at_parse_time() {
         "the conflict must be reported: {error}"
     );
 }
+
+// The negative path the smoke test above cannot reach: an unknown
+// flag must exit nonzero and put the usage on stderr — the CLI shell
+// rejects bad input instead of ignoring it.
+#[test]
+fn unknown_flag_exits_nonzero_with_usage_on_stderr() {
+    let output = Command::cargo_bin("wrkspc")
+        .unwrap()
+        .args(["node", "run", "--no-such-flag"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "an unknown flag must exit nonzero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--no-such-flag") && stderr.contains("Usage:"),
+        "stderr must carry the offending flag and the usage: {stderr}"
+    );
+}

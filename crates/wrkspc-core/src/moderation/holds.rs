@@ -68,7 +68,10 @@ impl Store {
     /// in a state that cannot be held (`delivered`/`expired`/
     /// `blocked`), and [`StoreError::Db`] on failure.
     pub async fn hold_delivery(&self, message_id: &str, peer_id: &str, set_by: &str) -> Result<()> {
-        let mut tx = self.pool().begin().await?;
+        // IMMEDIATE: the hold is a read-modify-write — the state check
+        // and the UPDATE must not race another writer's commit
+        // (deferred snapshots surface as SQLITE_BUSY_SNAPSHOT).
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT delivery_state FROM message_recipients
              WHERE message_id = ? AND peer_id = ?",
@@ -169,7 +172,8 @@ impl Store {
         peer_id: &str,
         set_by: &str,
     ) -> Result<()> {
-        let mut tx = self.pool().begin().await?;
+        // IMMEDIATE: read-modify-write (see hold_delivery).
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT delivery_state FROM message_recipients
              WHERE message_id = ? AND peer_id = ?",
@@ -238,24 +242,25 @@ pub(crate) async fn delivery_gate_in_tx(
     message_id: &str,
     peer_id: &str,
 ) -> Result<Option<(String, String)>> {
-    if let Some(row) = sqlx::query(
-        "SELECT m.conversation_id AS conversation_id, GROUP_CONCAT(f.kind) AS kinds
-         FROM messages m
-         JOIN fences f ON f.conversation_id = m.conversation_id
-           AND f.peer_id = ? AND f.active = 1
-           AND f.kind IN ('pause', 'hold', 'block')
-         WHERE m.id = ?
-         GROUP BY m.conversation_id",
+    // One conversation lookup serves every branch below — the fence,
+    // delivery-state, and peer gates all report the message's room.
+    let conversation_id: String =
+        sqlx::query_scalar("SELECT conversation_id FROM messages WHERE id = ?")
+            .bind(message_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let kinds: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT GROUP_CONCAT(kind) FROM fences
+         WHERE conversation_id = ? AND peer_id = ? AND active = 1
+           AND kind IN ('pause', 'hold', 'block')",
     )
+    .bind(&conversation_id)
     .bind(peer_id)
-    .bind(message_id)
     .fetch_optional(&mut *tx)
     .await?
-    {
-        return Ok(Some((
-            row.get("conversation_id"),
-            format!("fence:{}", row.get::<String, _>("kinds")),
-        )));
+    .flatten();
+    if let Some(kinds) = kinds {
+        return Ok(Some((conversation_id.clone(), format!("fence:{kinds}"))));
     }
     let delivery_state: Option<String> = sqlx::query(
         "SELECT delivery_state FROM message_recipients WHERE message_id = ? AND peer_id = ?",
@@ -268,12 +273,7 @@ pub(crate) async fn delivery_gate_in_tx(
     if let Some(state) = delivery_state.as_deref()
         && matches!(state, "held" | "blocked" | "expired")
     {
-        let conversation_id: String =
-            sqlx::query_scalar("SELECT conversation_id FROM messages WHERE id = ?")
-                .bind(message_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        return Ok(Some((conversation_id, format!("delivery:{state}"))));
+        return Ok(Some((conversation_id.clone(), format!("delivery:{state}"))));
     }
     if let Some(status) = sqlx::query_scalar::<_, String>("SELECT status FROM peers WHERE id = ?")
         .bind(peer_id)
@@ -281,11 +281,6 @@ pub(crate) async fn delivery_gate_in_tx(
         .await?
         && status != "enrolled"
     {
-        let conversation_id: String =
-            sqlx::query_scalar("SELECT conversation_id FROM messages WHERE id = ?")
-                .bind(message_id)
-                .fetch_one(&mut *tx)
-                .await?;
         return Ok(Some((conversation_id, format!("peer:{status}"))));
     }
     Ok(None)

@@ -77,7 +77,12 @@ pub async fn run_poll_loop(
         // The hub pages the queue (50 tasks newest-first by default) and
         // keeps terminal rows, so a queue deeper than one page must be
         // walked or older pending deliveries stay unreachable forever.
-        // Walk until the hub stops returning a page token.
+        // Walk until the hub stops returning a page token — but bound the
+        // walk: a hub that never returns an empty token (or a queue
+        // deeper than sane) must not wedge this tick, starve the
+        // outbound/presence/outcome legs, or grow the row buffer without
+        // bound. The remainder reconciles next tick.
+        const MAX_TASKS_PER_TICK: usize = 1000;
         loop {
             let request = a2a::ListTasksRequest {
                 context_id: Some(host_id.clone()),
@@ -94,21 +99,47 @@ pub async fn run_poll_loop(
                     let rows: Vec<TaskRow> = response
                         .tasks
                         .iter()
-                        .map(|task| TaskRow {
-                            task_id: task.id.clone(),
-                            context_id: task.context_id.clone(),
-                            state: wrkspc_a2a::state_mapping::task_state_literal(
-                                &task.status.state,
-                            )
-                            .to_string(),
-                            terminal: task.status.state.is_terminal(),
-                            task_json: serde_json::to_string(task).unwrap_or_default(),
-                            version: 0,
-                            created_at: String::new(),
-                            updated_at: String::new(),
+                        .filter_map(|task| {
+                            // A task that cannot be serialized cannot be
+                            // mirrored or acked: skip it loudly (the hub
+                            // keeps it pollable, so it retries next tick)
+                            // instead of storing an empty task_json that
+                            // the delivery parser would then skip
+                            // forever, silently.
+                            let task_json = match serde_json::to_string(task) {
+                                Ok(json) => json,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        task_id = %task.id,
+                                        "hub task serialization failed; skipping this tick"
+                                    );
+                                    return None;
+                                }
+                            };
+                            Some(TaskRow {
+                                task_id: task.id.clone(),
+                                context_id: task.context_id.clone(),
+                                state: wrkspc_a2a::state_mapping::task_state_literal(
+                                    &task.status.state,
+                                )
+                                .to_string(),
+                                terminal: task.status.state.is_terminal(),
+                                task_json,
+                                version: 0,
+                                created_at: String::new(),
+                                updated_at: String::new(),
+                            })
                         })
                         .collect();
                     tasks.extend(rows);
+                    if tasks.len() >= MAX_TASKS_PER_TICK {
+                        tracing::warn!(
+                            tasks = tasks.len(),
+                            "hub queue exceeds the per-tick walk cap; the remainder reconciles next tick"
+                        );
+                        break;
+                    }
                     if response.next_page_token.is_empty() {
                         break;
                     }
@@ -202,15 +233,36 @@ pub async fn run_poll_loop(
         // back, so the hub's task learns execution outcomes instead of
         // reading completion from the ack. Retried until the hub
         // confirms (or answers "unknown task" — then the report is
-        // dropped; there is no task to fold it into).
-        for report in store.hub_pending_outcomes().await.unwrap_or_default() {
+        // dropped; there is no task to fold it into). A store read
+        // failure is logged, never mistaken for an empty queue: the
+        // operator must be able to tell a wedged outcome queue from a
+        // healthy one.
+        let reports = match store.hub_pending_outcomes().await {
+            Ok(reports) => reports,
+            Err(error) => {
+                tracing::warn!(%error, "outcome queue read failed; retrying next poll");
+                Vec::new()
+            }
+        };
+        for report in reports {
             // Guidance consumed locally rides the report: the hub marks
             // its authoritative rows delivered (idempotent; unknown ids
-            // are no-ops), closing the propagation loop.
-            let guidance_delivered = store
-                .delivered_guidance_ids(&report.conversation_id)
-                .await
-                .unwrap_or_default();
+            // are no-ops), closing the propagation loop. On a read
+            // failure the report still rides — without guidance acks it
+            // is retried next tick.
+            let guidance_delivered =
+                match store.delivered_guidance_ids(&report.conversation_id).await {
+                    Ok(ids) => ids,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            task_id = %report.task_id,
+                            attempt_id = %report.attempt_id,
+                            "guidance id read failed; reporting without guidance acks"
+                        );
+                        Vec::new()
+                    }
+                };
             let response = client
                 .post(format!("{hub_url}/delivery-report"))
                 .json(&serde_json::json!({
@@ -260,55 +312,67 @@ pub async fn run_poll_loop(
         // Hub -> node reconciliation leg: operator decisions queued on
         // the hub's mirrored unknown attempts apply to THIS store's
         // attempt rows; the resulting terminal state then reports back
-        // through the outcome leg, which consumes the mirror.
-        if let Ok(response) = client
+        // through the outcome leg, which consumes the mirror. A failed
+        // fetch is logged — a stuck unknown-attempt queue must never be
+        // indistinguishable from an empty one — and retried next tick.
+        match client
             .get(format!("{hub_url}/reconciliation-decisions"))
             .send()
             .await
-            && response.status().is_success()
         {
-            let decisions: Vec<wrkspc_core::HubUnknownView> = match response.json().await {
-                Ok(decisions) => decisions,
-                Err(error) => {
-                    tracing::warn!(%error, "reconciliation decisions unparseable");
-                    Vec::new()
+            Ok(response) if response.status().is_success() => {
+                let decisions: Vec<wrkspc_core::HubUnknownView> = match response.json().await {
+                    Ok(decisions) => decisions,
+                    Err(error) => {
+                        tracing::warn!(%error, "reconciliation decisions unparseable");
+                        Vec::new()
+                    }
+                };
+                for decision in decisions {
+                    let Some(encoded) = decision.decision.as_deref() else {
+                        continue;
+                    };
+                    let reconciliation = match encoded {
+                        "retry" => Some(wrkspc_core::Reconciliation::Retry),
+                        "close:failed" => Some(wrkspc_core::Reconciliation::Close {
+                            state: wrkspc_core::AttemptState::Failed,
+                        }),
+                        "close:completed" => Some(wrkspc_core::Reconciliation::Close {
+                            state: wrkspc_core::AttemptState::Completed,
+                        }),
+                        "close:canceled" => Some(wrkspc_core::Reconciliation::Close {
+                            state: wrkspc_core::AttemptState::Canceled,
+                        }),
+                        _ => None,
+                    };
+                    let Some(reconciliation) = reconciliation else {
+                        tracing::warn!(%encoded, attempt_id = %decision.attempt_id, "unknown reconciliation decision");
+                        continue;
+                    };
+                    match store
+                        .reconcile_unknown(&decision.attempt_id, reconciliation)
+                        .await
+                    {
+                        Ok(()) => tracing::info!(
+                            attempt_id = %decision.attempt_id,
+                            "hub reconciliation decision applied"
+                        ),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            attempt_id = %decision.attempt_id,
+                            "hub reconciliation decision failed; retrying next poll"
+                        ),
+                    }
                 }
-            };
-            for decision in decisions {
-                let Some(encoded) = decision.decision.as_deref() else {
-                    continue;
-                };
-                let reconciliation = match encoded {
-                    "retry" => Some(wrkspc_core::Reconciliation::Retry),
-                    "close:failed" => Some(wrkspc_core::Reconciliation::Close {
-                        state: wrkspc_core::AttemptState::Failed,
-                    }),
-                    "close:completed" => Some(wrkspc_core::Reconciliation::Close {
-                        state: wrkspc_core::AttemptState::Completed,
-                    }),
-                    "close:canceled" => Some(wrkspc_core::Reconciliation::Close {
-                        state: wrkspc_core::AttemptState::Canceled,
-                    }),
-                    _ => None,
-                };
-                let Some(reconciliation) = reconciliation else {
-                    tracing::warn!(%encoded, attempt_id = %decision.attempt_id, "unknown reconciliation decision");
-                    continue;
-                };
-                match store
-                    .reconcile_unknown(&decision.attempt_id, reconciliation)
-                    .await
-                {
-                    Ok(()) => tracing::info!(
-                        attempt_id = %decision.attempt_id,
-                        "hub reconciliation decision applied"
-                    ),
-                    Err(error) => tracing::warn!(
-                        %error,
-                        attempt_id = %decision.attempt_id,
-                        "hub reconciliation decision failed; retrying next poll"
-                    ),
-                }
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    status = %response.status(),
+                    "reconciliation fetch refused; retrying next poll"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "reconciliation fetch failed; retrying next poll");
             }
         }
     }
