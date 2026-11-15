@@ -42,6 +42,11 @@ pub struct DispatcherConfig {
     /// Deadline for one session lookup (spawn/initialize/new/model pin):
     /// a nonresponsive adapter must not block the dispatcher beyond this.
     pub lookup_timeout: Duration,
+    /// Deadline for one adapter cancel notification: a hung cancel
+    /// future must not block the dispatcher's command loop beyond this
+    /// (the durable cancellation is already recorded in the store; the
+    /// adapter interrupt is best-effort and deadline-bounded).
+    pub cancel_timeout: Duration,
 }
 
 impl Default for DispatcherConfig {
@@ -49,6 +54,7 @@ impl Default for DispatcherConfig {
         Self {
             tick: Duration::from_millis(250),
             lookup_timeout: Duration::from_secs(45),
+            cancel_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -75,10 +81,14 @@ enum Command {
     Shutdown,
 }
 
-/// An in-flight turn: which session drives which attempt.
+/// An in-flight turn: which session drives which attempt, plus the
+/// drive's cancellation flag (the drive watches it across preparation
+/// and the prompt; a cancel that lands in the pre-registration window
+/// is parked in [`DispatchState::pending_cancels`] instead).
 struct InFlight {
     session_id: String,
     driver: Arc<dyn crate::driver::SessionDriver>,
+    cancel_flag: tokio::sync::watch::Sender<bool>,
 }
 
 /// A finished claim-and-drive task's output: the attempt id, its
@@ -104,6 +114,17 @@ struct DispatchState {
     busy_peers: HashSet<String>,
     /// In-flight turns by attempt id.
     in_flight: HashMap<String, InFlight>,
+    /// Lookups currently running for an intent, keyed
+    /// `"message_id/recipient_id"`: one claim-and-drive task per intent
+    /// at a time, covering the lookup itself. Without it, a lookup
+    /// slower than the tick spawns overlapping tasks for one intent —
+    /// and a stale task's timeout can mark an attempt unknown that
+    /// another drive is actively executing.
+    lookup_pending: HashSet<String>,
+    /// Cancellations durably recorded for attempts not yet registered
+    /// as in-flight (the claim-to-registration window): the drive
+    /// consumes its entry and refuses to send.
+    pending_cancels: HashMap<String, tokio::sync::watch::Sender<bool>>,
 }
 
 /// Handle to a running dispatcher: cancel requests and shutdown.
@@ -261,7 +282,7 @@ impl Dispatcher {
                 command = self.cmd_rx.recv() => {
                     match command {
                         Some(Command::Cancel { message_id, recipient_id, set_by, respond }) => {
-                            self.handle_cancel(&message_id, &recipient_id, &set_by, respond).await;
+                            self.spawn_cancel(&message_id, &recipient_id, &set_by, respond);
                         }
                         Some(Command::Shutdown) | None => break,
                     }
@@ -365,12 +386,23 @@ impl Dispatcher {
             }
         };
         for intent in due {
-            self.spawn_claim(tasks, intent);
+            let key = format!("{}/{}", intent.message_id, intent.recipient_id);
+            {
+                // One lookup per intent at a time: reserve BEFORE the
+                // spawn so a slow lookup cannot accumulate overlapping
+                // claim tasks (each sweep would otherwise spawn another
+                // task for the same still-queued intent).
+                let mut state_guard = lock_state(&self.state);
+                if !state_guard.lookup_pending.insert(key.clone()) {
+                    continue;
+                }
+            }
+            self.spawn_claim(tasks, intent, key);
         }
     }
 
     /// Spawns the claim-and-drive task for one intent.
-    fn spawn_claim(&self, tasks: &mut JoinSet<DriveOutput>, intent: DueIntent) {
+    fn spawn_claim(&self, tasks: &mut JoinSet<DriveOutput>, intent: DueIntent, key: String) {
         let store = self.store.clone();
         let provider = Arc::clone(&self.provider);
         let state = Arc::clone(&self.state);
@@ -379,41 +411,83 @@ impl Dispatcher {
             // Panics inside the drive are attributed to the attempt and
             // reconciled as unknown inside `claim_and_drive` (E07): no
             // panicking drive task ever frees its session silently.
-            claim_and_drive(store, provider, state, intent, lookup_timeout).await
+            let release_state = Arc::clone(&state);
+            let result = claim_and_drive(store, provider, state, intent, lookup_timeout).await;
+            {
+                // Release the reservation on EVERY exit path (success,
+                // error, panic) so the intent can be swept again.
+                let mut state_guard = lock_state(&release_state);
+                state_guard.lookup_pending.remove(&key);
+            }
+            result
         });
     }
 
-    /// Services a cancel command.
-    async fn handle_cancel(
+    /// Services a cancel command WITHOUT awaiting any adapter future:
+    /// the durable cancellation is recorded in the store (bounded by
+    /// the store's own timeouts), the caller is answered, and the
+    /// adapter interrupt — when an in-flight turn exists — runs as a
+    /// supervised, deadline-bounded task. A cancel that lands while
+    /// the drive is still preparing (claimed but not yet registered)
+    /// is parked in `pending_cancels` for the drive to consume.
+    fn spawn_cancel(
         &self,
         message_id: &str,
         recipient_id: &str,
         set_by: &str,
         respond: oneshot::Sender<Result<CancelOutcome, DispatcherError>>,
     ) {
-        let outcome = match self
-            .store
-            .request_cancel(message_id, recipient_id, set_by)
-            .await
-        {
-            Ok(CancelOutcome::Attempt { attempt_id }) => {
-                let driver_and_session = {
-                    let state = lock_state(&self.state);
-                    state
-                        .in_flight
-                        .get(&attempt_id)
-                        .map(|info| (info.session_id.clone(), Arc::clone(&info.driver)))
-                };
-                if let Some((session_id, driver)) = driver_and_session
-                    && let Err(error) = driver.cancel(&session_id).await
-                {
-                    tracing::warn!(%error, %attempt_id, "session cancel failed");
+        let store = self.store.clone();
+        let state = Arc::clone(&self.state);
+        let cancel_timeout = self.config.cancel_timeout;
+        let message_id = message_id.to_string();
+        let recipient_id = recipient_id.to_string();
+        let set_by = set_by.to_string();
+        tokio::spawn(async move {
+            let outcome = match store
+                .request_cancel(&message_id, &recipient_id, &set_by)
+                .await
+            {
+                Ok(CancelOutcome::Attempt { attempt_id }) => {
+                    {
+                        let mut state_guard = lock_state(&state);
+                        if let Some(info) = state_guard.in_flight.get(&attempt_id) {
+                            let _ = info.cancel_flag.send(true);
+                            let session_id = info.session_id.clone();
+                            let driver = Arc::clone(&info.driver);
+                            let inner_attempt = attempt_id.clone();
+                            // Best-effort adapter interrupt, bounded: the
+                            // turn's own stop reason confirms the
+                            // cancellation even when this hangs.
+                            tokio::spawn(async move {
+                                let result = tokio::time::timeout(
+                                    cancel_timeout,
+                                    driver.cancel(&session_id),
+                                )
+                                .await;
+                                match result {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => tracing::warn!(
+                                        %error, %inner_attempt, "session cancel failed"
+                                    ),
+                                    Err(_) => tracing::warn!(
+                                        %inner_attempt, "session cancel timed out"
+                                    ),
+                                }
+                            });
+                        } else {
+                            // Pre-registration window: the drive consumes
+                            // this entry and refuses to send the prompt.
+                            let (flag, _rx) = tokio::sync::watch::channel(true);
+                            state_guard.pending_cancels.insert(attempt_id.clone(), flag);
+                        }
+                    }
+                    Ok(CancelOutcome::Attempt { attempt_id })
                 }
-                Ok(CancelOutcome::Attempt { attempt_id })
-            }
-            other => other.map_err(DispatcherError::Store),
-        };
-        let _ = respond.send(outcome);
+                other => other.map_err(DispatcherError::Store),
+            };
+            let _ = respond.send(outcome);
+        });
     }
 }
 
@@ -444,11 +518,17 @@ async fn claim_and_drive(
         Ok(None) => None,
         Err(_) => {
             let reason = "session lookup timed out (adapter nonresponsive)";
-            let attempt_id = match store
-                .claim_intent(&intent.message_id, &intent.recipient_id)
+            // Fresh-only claim: a timed-out lookup must never mark an
+            // attempt unknown that ANOTHER drive claimed and is
+            // actively executing. With the per-intent reservation only
+            // one lookup runs at a time, but a stale sweep could still
+            // race a concurrent claim; None means someone else owns it
+            // and we leave it alone.
+            let claimed = match store
+                .claim_intent_if_unclaimed(&intent.message_id, &intent.recipient_id)
                 .await
             {
-                Ok(attempt_id) => attempt_id,
+                Ok(claimed) => claimed,
                 Err(error) => {
                     tracing::warn!(
                         %error,
@@ -458,6 +538,9 @@ async fn claim_and_drive(
                     );
                     return ok(format!("{}/{}", intent.message_id, intent.recipient_id));
                 }
+            };
+            let Some(attempt_id) = claimed else {
+                return ok(format!("{}/{}", intent.message_id, intent.recipient_id));
             };
             if let Err(error) = store.mark_unknown(&attempt_id, reason).await {
                 tracing::warn!(%error, %attempt_id, "unknown write after lookup timeout failed");

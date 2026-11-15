@@ -90,10 +90,7 @@ impl SessionHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         let (ev_tx, ev_rx) = tokio::sync::broadcast::channel::<SessionEvent>(256);
         let task: crate::transport::ConnectionTask = Box::new(move |connection| {
-            Box::pin(async move {
-                run_session_loop(connection, cmd_rx).await;
-                Ok(())
-            })
+            Box::pin(async move { run_session_loop(connection, cmd_rx).await })
         });
         let (closed_tx, closed_rx) = tokio::sync::watch::channel::<Option<String>>(None);
         tokio::spawn(async move {
@@ -272,32 +269,60 @@ impl SessionHandle {
     }
 }
 
-async fn run_session_loop(connection: ConnectionTo<Agent>, mut cmd_rx: mpsc::Receiver<Command>) {
-    // Initialize once, before serving any session command. If the adapter
-    // cannot initialize, fail every command explicitly rather than hang.
-    let init = connection
+/// One serialized unit of work on the connection. Prompts, session
+/// creation, and config updates share the single in-flight slot: the
+/// loop never awaits an adapter future inline, so Shutdown and Cancel
+/// stay serviceable even while an adapter stalls mid-request — a hung
+/// session/new or session/set_config_option must not wedge teardown
+/// the way a hung prompt previously could not.
+enum Unit {
+    Prompt {
+        session_id: String,
+        blocks: Vec<ContentBlock>,
+        respond: oneshot::Sender<Result<StopReason>>,
+    },
+    NewSession {
+        cwd: PathBuf,
+        mcp_servers: Vec<McpServer>,
+        respond: oneshot::Sender<Result<String>>,
+    },
+    SetConfig {
+        session_id: String,
+        config_id: String,
+        value: String,
+        respond: oneshot::Sender<Result<()>>,
+    },
+}
+
+async fn run_session_loop(
+    connection: ConnectionTo<Agent>,
+    mut cmd_rx: mpsc::Receiver<Command>,
+) -> std::result::Result<(), agent_client_protocol::Error> {
+    // Initialize once, before serving any session command. A refused
+    // initialize FAILS THE CONNECTION: the loop returns the error, the
+    // transport task tears the child down, and closed() carries the
+    // reason — a half-alive session that answers NotRunning forever
+    // would look connected to the registry and never be evicted.
+    if let Err(error) = connection
         .send_request(InitializeRequest::new(ProtocolVersion::V1))
         .block_task()
-        .await;
-    let initialized = init.is_ok();
-    if let Err(error) = &init {
-        tracing::error!(
-            %error,
-            "adapter initialize failed; session commands will be refused",
-        );
+        .await
+    {
+        // A refused initialize FAILS THE CONNECTION: the error rides
+        // the connection task into with_connection, the child is torn
+        // down, and closed() carries the reason — a half-alive session
+        // that answered NotRunning forever would look connected to the
+        // registry and never be evicted.
+        tracing::error!(%error, "adapter initialize failed");
+        return Err(error);
     }
 
-    // Prompts are serialized (one in-flight turn per session) but cancel and
-    // shutdown are serviced mid-turn: the prompt runs as a subtask while the
-    // loop keeps receiving commands. The pending queue is BOUNDED (E11):
-    // beyond the admission bound, a prompt is rejected as definitely unsent
-    // instead of growing the queue without limit.
-    const MAX_PENDING: usize = 64;
-    let mut pending: std::collections::VecDeque<(
-        String,
-        Vec<ContentBlock>,
-        oneshot::Sender<Result<StopReason>>,
-    )> = std::collections::VecDeque::new();
+    // Serialization: one unit in flight at a time; the unit runs as a
+    // subtask while the loop keeps receiving commands (cancel and
+    // shutdown are serviced mid-turn). The pending queue is BOUNDED
+    // (E11): beyond the admission bound a unit is rejected as
+    // definitely unsent instead of growing the queue without limit.
+    let mut pending: std::collections::VecDeque<Unit> = std::collections::VecDeque::new();
     let mut in_flight = false;
     let mut done_rx: Option<oneshot::Receiver<()>> = None;
 
@@ -320,14 +345,14 @@ async fn run_session_loop(connection: ConnectionTo<Agent>, mut cmd_rx: mpsc::Rec
             }, if done_rx.is_some() => {
                 done_rx = None;
                 in_flight = false;
-                // Skip queued prompts whose caller has abandoned them:
-                // a dropped receiver means the prompt was never sent,
+                // Skip queued units whose caller has abandoned them:
+                // a dropped receiver means the request was never sent,
                 // so it must not start later (E11).
-                while let Some((session_id, blocks, respond)) = pending.pop_front() {
-                    if respond.is_closed() {
+                while let Some(unit) = pending.pop_front() {
+                    if unit_abandoned(&unit) {
                         continue;
                     }
-                    start_prompt(&connection, &mut done_rx, session_id, blocks, respond);
+                    start_unit(&connection, &mut done_rx, unit);
                     in_flight = true;
                     break;
                 }
@@ -340,67 +365,39 @@ async fn run_session_loop(connection: ConnectionTo<Agent>, mut cmd_rx: mpsc::Rec
                         cwd,
                         mcp_servers,
                         respond,
-                    } => {
-                        let outcome = if initialized {
-                            connection
-                                .send_request(
-                                    NewSessionRequest::new(cwd).mcp_servers(mcp_servers),
-                                )
-                                .block_task()
-                                .await
-                                .map(|r| r.session_id.to_string())
-                                .map_err(AcpError::from)
-                        } else {
-                            Err(AcpError::NotRunning)
-                        };
-                        let _ = respond.send(outcome);
-                    }
+                    } => submit_unit(
+                        &connection,
+                        &mut done_rx,
+                        &mut pending,
+                        &mut in_flight,
+                        Unit::NewSession { cwd, mcp_servers, respond },
+                    ),
                     Command::Prompt {
                         session_id,
                         blocks,
                         respond,
-                    } => {
-                        if !initialized {
-                            let _ = respond.send(Err(AcpError::NotRunning));
-                        } else if in_flight {
-                            if pending.len() >= MAX_PENDING {
-                                // Definitely unsent: reject loudly instead
-                                // of queueing without bound (E11).
-                                let _ = respond.send(Err(AcpError::QueueFull));
-                            } else {
-                                pending.push_back((session_id, blocks, respond));
-                            }
-                        } else {
-                            start_prompt(&connection, &mut done_rx, session_id, blocks, respond);
-                            in_flight = true;
-                        }
-                    }
+                    } => submit_unit(
+                        &connection,
+                        &mut done_rx,
+                        &mut pending,
+                        &mut in_flight,
+                        Unit::Prompt { session_id, blocks, respond },
+                    ),
                     Command::SetConfigOption {
                         session_id,
                         config_id,
                         value,
                         respond,
-                    } => {
-                        let outcome = if initialized {
-                            connection
-                                .send_request(SetSessionConfigOptionRequest::new(
-                                    session_id,
-                                    SessionConfigId::new(config_id),
-                                    SessionConfigOptionValue::value_id(value),
-                                ))
-                                .block_task()
-                                .await
-                                .map(|_| ())
-                                .map_err(AcpError::from)
-                        } else {
-                            Err(AcpError::NotRunning)
-                        };
-                        let _ = respond.send(outcome);
-                    }
+                    } => submit_unit(
+                        &connection,
+                        &mut done_rx,
+                        &mut pending,
+                        &mut in_flight,
+                        Unit::SetConfig { session_id, config_id, value, respond },
+                    ),
                     Command::Cancel { session_id } => {
-                        if initialized
-                            && let Err(error) =
-                                connection.send_notification(CancelNotification::new(session_id))
+                        if let Err(error) =
+                            connection.send_notification(CancelNotification::new(session_id))
                         {
                             tracing::warn!(%error, "session/cancel notification failed");
                         }
@@ -409,28 +406,109 @@ async fn run_session_loop(connection: ConnectionTo<Agent>, mut cmd_rx: mpsc::Rec
             }
         }
     }
+    Ok(())
 }
 
-/// Spawns one prompt turn as a subtask. On completion the caller's channel
-/// receives the outcome and the serialization slot is released via `done_tx`.
-fn start_prompt(
+/// Whether the caller of a queued unit has gone away.
+fn unit_abandoned(unit: &Unit) -> bool {
+    match unit {
+        Unit::Prompt { respond, .. } => respond.is_closed(),
+        Unit::NewSession { respond, .. } => respond.is_closed(),
+        Unit::SetConfig { respond, .. } => respond.is_closed(),
+    }
+}
+
+/// Routes one unit into the serialization slot: starts it immediately
+/// when the slot is free, queues it (bounded), or rejects it as
+/// definitely unsent when the queue is full (E11).
+fn submit_unit(
     connection: &ConnectionTo<Agent>,
     done_slot: &mut Option<oneshot::Receiver<()>>,
-    session_id: String,
-    blocks: Vec<ContentBlock>,
-    respond: oneshot::Sender<Result<StopReason>>,
+    pending: &mut std::collections::VecDeque<Unit>,
+    in_flight: &mut bool,
+    unit: Unit,
+) {
+    const MAX_PENDING: usize = 64;
+    if *in_flight {
+        if pending.len() >= MAX_PENDING {
+            match unit {
+                Unit::Prompt { respond, .. } => {
+                    let _ = respond.send(Err(AcpError::QueueFull));
+                }
+                Unit::NewSession { respond, .. } => {
+                    let _ = respond.send(Err(AcpError::QueueFull));
+                }
+                Unit::SetConfig { respond, .. } => {
+                    let _ = respond.send(Err(AcpError::QueueFull));
+                }
+            }
+        } else {
+            pending.push_back(unit);
+        }
+    } else {
+        *in_flight = true;
+        start_unit(connection, done_slot, unit);
+    }
+}
+
+/// Spawns one unit as a subtask. On completion the caller's channel
+/// receives the outcome and the serialization slot is released via
+/// `done_tx`.
+fn start_unit(
+    connection: &ConnectionTo<Agent>,
+    done_slot: &mut Option<oneshot::Receiver<()>>,
+    unit: Unit,
 ) {
     let connection = connection.clone();
     let (done_tx, done_rx) = oneshot::channel();
     *done_slot = Some(done_rx);
     tokio::spawn(async move {
-        let outcome = connection
-            .send_request(PromptRequest::new(session_id, blocks))
-            .block_task()
-            .await
-            .map(|r| r.stop_reason)
-            .map_err(AcpError::from);
-        let _ = respond.send(outcome);
+        match unit {
+            Unit::Prompt {
+                session_id,
+                blocks,
+                respond,
+            } => {
+                let outcome = connection
+                    .send_request(PromptRequest::new(session_id, blocks))
+                    .block_task()
+                    .await
+                    .map(|r| r.stop_reason)
+                    .map_err(AcpError::from);
+                let _ = respond.send(outcome);
+            }
+            Unit::NewSession {
+                cwd,
+                mcp_servers,
+                respond,
+            } => {
+                let outcome = connection
+                    .send_request(NewSessionRequest::new(cwd).mcp_servers(mcp_servers))
+                    .block_task()
+                    .await
+                    .map(|r| r.session_id.to_string())
+                    .map_err(AcpError::from);
+                let _ = respond.send(outcome);
+            }
+            Unit::SetConfig {
+                session_id,
+                config_id,
+                value,
+                respond,
+            } => {
+                let outcome = connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session_id,
+                        SessionConfigId::new(config_id),
+                        SessionConfigOptionValue::value_id(value),
+                    ))
+                    .block_task()
+                    .await
+                    .map(|_| ())
+                    .map_err(AcpError::from);
+                let _ = respond.send(outcome);
+            }
+        }
         let _ = done_tx.send(());
     });
 }

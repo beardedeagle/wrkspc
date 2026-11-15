@@ -160,6 +160,7 @@ async fn one_session_serializes_turns_and_attributes_chunks_per_conversation() {
         DispatcherConfig {
             tick: Duration::from_millis(10),
             lookup_timeout: std::time::Duration::from_secs(10),
+            ..Default::default()
         },
     );
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -309,6 +310,7 @@ async fn two_peers_dispatch_in_parallel_without_wedging() {
         DispatcherConfig {
             tick: Duration::from_millis(10),
             lookup_timeout: std::time::Duration::from_secs(10),
+            ..Default::default()
         },
     );
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -444,6 +446,7 @@ async fn concurrent_turns_in_one_conversation_do_not_duplicate_guidance() {
         DispatcherConfig {
             tick: Duration::from_millis(10),
             lookup_timeout: std::time::Duration::from_secs(10),
+            ..Default::default()
         },
     );
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);

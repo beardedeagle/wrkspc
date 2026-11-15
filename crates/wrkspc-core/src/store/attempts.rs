@@ -31,7 +31,52 @@ impl Store {
         .await
     }
 
+    /// Claims an intent ONLY when no open attempt exists for it: a
+    /// fresh claim returns `Ok(Some(attempt_id))`, while an intent
+    /// another drive has already claimed returns `Ok(None)`.
+    ///
+    /// This is the dispatcher's ownership probe for supervised
+    /// lookups: an idempotent [`claim_intent`](Store::claim_intent)
+    /// returns the existing attempt, so a stale timeout task could
+    /// quarantine an attempt another drive is actively executing.
+    /// With `fresh_only`, the timeout task only ever marks its OWN
+    /// fresh claim unknown.
+    ///
+    /// # Errors
+    ///
+    /// The same error set as [`claim_intent`](Store::claim_intent).
+    pub async fn claim_intent_if_unclaimed(
+        &self,
+        message_id: &str,
+        recipient_id: &str,
+    ) -> Result<Option<String>> {
+        Store::retry_on_busy(
+            || self.claim_intent_inner_with(message_id, recipient_id, true),
+            "claim_intent_if_unclaimed",
+        )
+        .await
+    }
+
     async fn claim_intent_inner(&self, message_id: &str, recipient_id: &str) -> Result<String> {
+        // fresh_only=false: every non-error outcome is a fresh claim or
+        // an existing open attempt, so Some always resolves.
+        match self
+            .claim_intent_inner_with(message_id, recipient_id, false)
+            .await?
+        {
+            Some(attempt_id) => Ok(attempt_id),
+            None => Err(StoreError::Db(sqlx::Error::Protocol(
+                "claim_intent resolved without an attempt".to_string(),
+            ))),
+        }
+    }
+
+    async fn claim_intent_inner_with(
+        &self,
+        message_id: &str,
+        recipient_id: &str,
+        fresh_only: bool,
+    ) -> Result<Option<String>> {
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin().await?;
 
@@ -65,7 +110,9 @@ impl Store {
             let open_id: String = row.get("id");
             let open_state: String = row.get("state");
             match open_state.as_str() {
-                "claimed" | "dispatched" => return Ok(open_id),
+                "claimed" | "dispatched" => {
+                    return Ok(if fresh_only { None } else { Some(open_id) });
+                }
                 "unknown" => {
                     return Err(StoreError::BlockedByUnknown {
                         intent: intent_id,
@@ -184,7 +231,7 @@ impl Store {
         .await?;
 
         tx.commit().await?;
-        Ok(attempt_id)
+        Ok(Some(attempt_id))
     }
 
     /// Records a delivery fence-ack: the recipient's node durably
@@ -403,9 +450,29 @@ impl Store {
         stop_reason: Option<&str>,
         result_ref: Option<&str>,
     ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        Self::terminal_transition_in_tx(&mut tx, attempt_id, state, stop_reason, result_ref)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Transitions the attempt (and its intent) to a terminal state
+    /// inside an already-open transaction. Idempotent re-emission of
+    /// the SAME terminal state succeeds; a conflicting terminal state
+    /// errors. Shared by [`mark_terminal`](Store::mark_terminal) and
+    /// [`complete_attempt`](Store::complete_attempt) so terminal
+    /// persistence and guidance consumption can commit atomically.
+    async fn terminal_transition_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        attempt_id: &str,
+        state: AttemptState,
+        stop_reason: Option<&str>,
+        result_ref: Option<&str>,
+    ) -> Result<()> {
         debug_assert!(
             state.is_terminal(),
-            "mark_terminal requires a terminal state"
+            "terminal_transition_in_tx requires a terminal state"
         );
         if !state.is_terminal() {
             return Err(StoreError::TerminalState {
@@ -415,11 +482,10 @@ impl Store {
             });
         }
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
 
         let row = sqlx::query("SELECT intent_id, state FROM attempts WHERE id = ?")
             .bind(attempt_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
             .ok_or_else(|| StoreError::NotFound {
                 entity: "attempt",
@@ -450,7 +516,7 @@ impl Store {
         .bind(result_ref)
         .bind(&now)
         .bind(attempt_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         let intent_state = match state {
             AttemptState::Completed => IntentState::Completed,
@@ -461,8 +527,55 @@ impl Store {
         sqlx::query("UPDATE execution_intents SET state = ? WHERE id = ?")
             .bind(intent_state.as_str())
             .bind(&intent_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
+        Ok(())
+    }
+
+    /// Commits a terminal attempt state and its guidance consumption in
+    /// ONE transaction: a crash or transient failure can no longer
+    /// leave guidance permanently claimed by an already-terminal
+    /// attempt (restart reconciliation only enumerates open attempts,
+    /// so a stranded claim would never be delivered or released).
+    ///
+    /// * `guidance_ids` — the guidance rows this turn consumed; empty
+    ///   is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// The same error set as [`mark_terminal`](Store::mark_terminal),
+    /// plus [`StoreError::Db`] when a guidance write fails (the
+    /// transaction rolls back, leaving the attempt open and the claim
+    /// intact for the drive's release path).
+    pub async fn complete_attempt(
+        &self,
+        attempt_id: &str,
+        state: AttemptState,
+        stop_reason: Option<&str>,
+        guidance_ids: &[&str],
+    ) -> Result<()> {
+        Store::retry_on_busy(
+            || self.complete_attempt_inner(attempt_id, state, stop_reason, guidance_ids),
+            "complete_attempt",
+        )
+        .await
+    }
+
+    async fn complete_attempt_inner(
+        &self,
+        attempt_id: &str,
+        state: AttemptState,
+        stop_reason: Option<&str>,
+        guidance_ids: &[&str],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        Self::terminal_transition_in_tx(&mut tx, attempt_id, state, stop_reason, None).await?;
+        for id in guidance_ids {
+            sqlx::query("UPDATE guidance SET delivered = 1, claimed_attempt = NULL WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(())
     }

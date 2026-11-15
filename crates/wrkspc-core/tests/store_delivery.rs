@@ -1660,3 +1660,156 @@ async fn unknown_mirror_rows_are_owned_by_task_and_host() {
     );
     assert!(store.hub_unknowns().await.unwrap().is_empty());
 }
+
+/// A fresh-only claim distinguishes ownership: the first claim creates
+/// the attempt, a second (idempotent) probe reports it as owned — the
+/// signal a stale supervised lookup needs so it can never quarantine an
+/// attempt another drive is executing.
+#[tokio::test]
+async fn claim_intent_if_unclaimed_distinguishes_fresh_from_owned() {
+    let store = Store::open_in_memory("fresh-claim-test").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+    let outcome = store
+        .accept_message(
+            &conversation,
+            "operator",
+            "key-fresh-claim",
+            "please review",
+            false,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "codex".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap();
+    let message_id = match outcome {
+        wrkspc_core::AcceptOutcome::Accepted { message_id } => message_id,
+        other => panic!("expected accepted: {other:?}"),
+    };
+
+    let fresh = store
+        .claim_intent_if_unclaimed(&message_id, "codex")
+        .await
+        .unwrap();
+    let attempt_id = fresh.expect("the first claim is fresh");
+
+    let owned = store
+        .claim_intent_if_unclaimed(&message_id, "codex")
+        .await
+        .unwrap();
+    assert!(
+        owned.is_none(),
+        "a second probe must report the attempt as owned, not re-claim it"
+    );
+
+    // The idempotent claim still returns the SAME attempt.
+    let idempotent = store.claim_intent(&message_id, "codex").await.unwrap();
+    assert_eq!(idempotent, attempt_id);
+}
+
+/// Terminal persistence and guidance consumption commit atomically: a
+/// failure rolls both back, so guidance can never be stranded on an
+/// already-terminal attempt that reconciliation cannot see.
+#[tokio::test]
+async fn complete_attempt_commits_terminal_and_guidance_atomically() {
+    let store = Store::open_in_memory("complete-attempt-test")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("codex", "codex", "harness")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+    store
+        .add_guidance(&conversation, "operator", "use the new api")
+        .await
+        .unwrap();
+    let outcome = store
+        .accept_message(
+            &conversation,
+            "operator",
+            "key-complete-attempt",
+            "please review",
+            false,
+            &[wrkspc_core::RecipientRequest {
+                peer_id: "codex".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap();
+    let message_id = match outcome {
+        wrkspc_core::AcceptOutcome::Accepted { message_id } => message_id,
+        other => panic!("expected accepted: {other:?}"),
+    };
+    let attempt_id = store.claim_intent(&message_id, "codex").await.unwrap();
+    let guidance = store
+        .claim_guidance(&conversation, &attempt_id)
+        .await
+        .unwrap();
+    assert_eq!(guidance.len(), 1);
+    let guidance_ids: Vec<&str> = guidance.iter().map(|g| g.id.as_str()).collect();
+
+    // Failure path: the attempt id is unknown, so the transaction must
+    // roll back BOTH the terminal write and the guidance consumption.
+    let failure = store
+        .complete_attempt(
+            "no-such-attempt",
+            wrkspc_core::AttemptState::Completed,
+            Some("end_turn"),
+            &guidance_ids,
+        )
+        .await;
+    assert!(failure.is_err(), "an unknown attempt must fail the call");
+    let still_claimed = store
+        .claim_guidance(&conversation, "probe-attempt")
+        .await
+        .unwrap();
+    assert!(
+        still_claimed.is_empty(),
+        "the failed transaction must leave the guidance claimed by the original attempt"
+    );
+
+    // Happy path: ONE transaction closes the attempt AND delivers the
+    // guidance.
+    store
+        .complete_attempt(
+            &attempt_id,
+            wrkspc_core::AttemptState::Completed,
+            Some("end_turn"),
+            &guidance_ids,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store.open_attempts().await.unwrap().is_empty(),
+        "the attempt must be terminal"
+    );
+    let delivered = store
+        .claim_guidance(&conversation, "later-attempt")
+        .await
+        .unwrap();
+    assert!(
+        delivered.is_empty(),
+        "delivered guidance must never ride another turn"
+    );
+}

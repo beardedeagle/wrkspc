@@ -348,6 +348,7 @@ async fn pause_landing_after_claim_but_before_the_prompt_gates_the_turn_and_requ
         DispatcherConfig {
             tick: Duration::from_millis(10),
             lookup_timeout: std::time::Duration::from_secs(10),
+            ..Default::default()
         },
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -484,6 +485,7 @@ async fn cancel_landing_after_claim_but_before_the_prompt_stops_the_turn() {
         DispatcherConfig {
             tick: Duration::from_millis(10),
             lookup_timeout: std::time::Duration::from_secs(10),
+            ..Default::default()
         },
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);

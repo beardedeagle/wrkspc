@@ -239,6 +239,7 @@ pub async fn spawn_harness(mode: Mode, with_binding: bool) -> Harness {
     let config = DispatcherConfig {
         tick: Duration::from_millis(10),
         lookup_timeout: std::time::Duration::from_secs(10),
+        ..Default::default()
     };
     let (dispatcher, handle) = Dispatcher::new(store.clone(), provider, config);
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);

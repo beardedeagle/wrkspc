@@ -24,6 +24,7 @@ fn config() -> DispatcherConfig {
     DispatcherConfig {
         tick: Duration::from_millis(10),
         lookup_timeout: Duration::from_millis(300),
+        ..Default::default()
     }
 }
 
@@ -459,4 +460,180 @@ async fn guidance_is_delivered_only_after_a_successful_turn() {
         "a successful turn marks the guidance delivered"
     );
     let _ = stop_tx2.send(());
+}
+
+/// A hung adapter cancel future must never block the dispatcher: the
+/// durable cancellation is recorded, the caller is answered, and the
+/// flag arm closes the turn deterministically — all while the adapter
+/// interrupt task sits parked on the nonresponsive cancel.
+#[tokio::test]
+async fn hung_adapter_cancel_never_blocks_the_dispatcher() {
+    let (store, conversation) = seeded().await;
+
+    #[derive(Default)]
+    struct Inner {
+        prompt_started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    }
+    #[derive(Clone, Default)]
+    struct HungCancelDriver(Arc<Inner>);
+    impl SessionDriver for HungCancelDriver {
+        fn prompt(
+            &self,
+            session_id: &str,
+            _blocks: Vec<ContentBlock>,
+        ) -> Pin<Box<dyn Future<Output = Result<StopReason, String>> + Send + '_>> {
+            let inner = Arc::clone(&self.0);
+            let session_id = session_id.to_string();
+            Box::pin(async move {
+                let (tx, rx) = oneshot::channel();
+                *inner.prompt_started.lock().unwrap() = Some(tx);
+                // Park until released: the flag arm must close the turn
+                // WITHOUT the adapter ever confirming.
+                let _ = rx.await;
+                tracing::debug!(%session_id, "prompt released");
+                Ok(StopReason::Cancelled)
+            })
+        }
+        fn cancel(
+            &self,
+            _session_id: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            // Never resolves: the dispatcher must not wait on this.
+            Box::pin(std::future::pending())
+        }
+        fn events(&self) -> tokio::sync::broadcast::Receiver<SessionEvent> {
+            let (tx, rx) = tokio::sync::broadcast::channel(1);
+            drop(tx);
+            rx
+        }
+    }
+
+    let driver = HungCancelDriver::default();
+    let provider: Arc<dyn SessionProvider> = Arc::new(common::FakeProvider {
+        bindings: HashMap::from([(
+            "codex".to_string(),
+            SessionBinding {
+                peer_id: "codex".to_string(),
+                session_id: "codex-session".to_string(),
+                driver: Arc::new(driver.clone()),
+            },
+        )]),
+    });
+    let (shutdown_tx, handle) = spawn_dispatcher(store.clone(), provider);
+
+    // Wait for the turn to actually start (the prompt parks).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if driver.0.prompt_started.lock().unwrap().is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("prompt must start");
+
+    let messages = store.list_messages(&conversation).await.unwrap();
+    let message_id = messages
+        .iter()
+        .find(|m| m.sender_id == "operator")
+        .unwrap()
+        .id
+        .clone();
+
+    // The cancel must be serviced (durable record + reply) despite the
+    // hung adapter interrupt task.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle.request_cancel(&message_id, "codex", "operator"),
+    )
+    .await
+    .expect("cancel must be serviced while the adapter cancel hangs")
+    .expect("cancel request succeeds");
+    assert!(
+        matches!(outcome, wrkspc_core::CancelOutcome::Attempt { .. }),
+        "an in-flight turn cancels as an attempt: {outcome:?}"
+    );
+
+    // The flag arm closes the turn deterministically: the attempt
+    // reaches Canceled without the adapter ever answering.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let open = store.open_attempts().await.unwrap();
+            let due = store.due_intents().await.unwrap();
+            if open.is_empty() && due.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the turn must close as canceled without adapter confirmation");
+
+    // Shutdown still completes: the parked cancel task rides the
+    // process teardown, never the run loop.
+    let _ = shutdown_tx.send(());
+}
+
+/// Slow lookups must not stack: one intent reserves ONE lookup at a
+/// time, so a lookup slower than the tick cannot accumulate
+/// overlapping claim tasks per intent.
+#[tokio::test]
+async fn slow_lookups_reserve_one_task_per_intent() {
+    let (store, _conversation) = seeded().await;
+
+    struct Inner {
+        started: std::sync::Mutex<Vec<oneshot::Sender<Option<SessionBinding>>>>,
+    }
+    struct ParkProvider(Arc<Inner>);
+    impl SessionProvider for ParkProvider {
+        fn lookup(
+            &self,
+            peer_id: &str,
+        ) -> Pin<Box<dyn Future<Output = Option<SessionBinding>> + Send + '_>> {
+            let inner = Arc::clone(&self.0);
+            let peer_id = peer_id.to_string();
+            Box::pin(async move {
+                let (tx, rx) = oneshot::channel();
+                inner.started.lock().unwrap().push(tx);
+                tracing::debug!(%peer_id, "lookup parked");
+                rx.await.ok().flatten()
+            })
+        }
+    }
+
+    let provider_inner = Arc::new(Inner {
+        started: std::sync::Mutex::new(Vec::new()),
+    });
+    let provider: Arc<dyn SessionProvider> = Arc::new(ParkProvider(Arc::clone(&provider_inner)));
+    let (shutdown_tx, handle) = spawn_dispatcher(store, provider);
+
+    // Both intents get exactly ONE lookup each, even across many ticks.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if provider_inner.started.lock().unwrap().len() >= 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both intents must start a lookup");
+
+    // Let many ticks elapse with both lookups parked: the reservation
+    // must hold the count at exactly two (one per intent).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        provider_inner.started.lock().unwrap().len(),
+        2,
+        "a slow lookup must not stack overlapping tasks per intent"
+    );
+
+    // Complete both lookups with no binding: the tasks close, the
+    // reservations release, and the dispatcher stays healthy.
+    for tx in provider_inner.started.lock().unwrap().drain(..) {
+        let _ = tx.send(None);
+    }
+    let _ = handle;
+    let _ = shutdown_tx.send(());
 }

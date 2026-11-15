@@ -3,7 +3,7 @@
 
 use super::{DispatchState, InFlight};
 use crate::driver::{SessionBinding, SessionProvider};
-use agent_client_protocol::v1::schema::{ContentBlock, TextContent};
+use agent_client_protocol::v1::schema::{ContentBlock, StopReason, TextContent};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -314,15 +314,54 @@ pub(crate) async fn drive_intent(
 
     // Registered only after the gate: a cancel arriving from here on
     // finds the attempt in flight and interrupts the running turn.
-    {
+    // Registration and the pending-cancel consume share ONE lock: a
+    // cancellation durably recorded during the claim-to-registration
+    // window is consumed here and the prompt is never sent.
+    let (cancel_flag_tx, mut cancel_flag_rx) = tokio::sync::watch::channel(false);
+    // The pending-cancel consume and the registration share ONE lock —
+    // and the lock never spans an await (the drive task must stay
+    // Send). A cancellation durably recorded during the
+    // claim-to-registration window is consumed here and the prompt is
+    // never sent.
+    let pre_canceled = {
         let mut state_guard = super::lock_state(&state);
-        state_guard.in_flight.insert(
-            attempt_id.clone(),
-            InFlight {
-                session_id: binding.session_id.clone(),
-                driver: Arc::clone(&binding.driver),
-            },
-        );
+        if state_guard.pending_cancels.remove(&attempt_id).is_some() {
+            true
+        } else {
+            state_guard.in_flight.insert(
+                attempt_id.clone(),
+                InFlight {
+                    session_id: binding.session_id.clone(),
+                    driver: Arc::clone(&binding.driver),
+                    cancel_flag: cancel_flag_tx,
+                },
+            );
+            false
+        }
+    };
+    if pre_canceled {
+        // Canceled while we were preparing: close deterministically and
+        // never send the prompt.
+        store
+            .mark_terminal(
+                &attempt_id,
+                wrkspc_core::AttemptState::Canceled,
+                Some("cancelled"),
+                None,
+            )
+            .await
+            .map_err(|e| format!("canceled attempt terminal write failed: {e}"))?;
+        let _ = store
+            .append_event(
+                &intent.conversation_id,
+                "dispatch.canceled",
+                &json!({
+                    "attempt_id": attempt_id,
+                    "reason": "cancel requested before dispatch",
+                }),
+            )
+            .await;
+        return Ok(());
     }
 
     // Capture accounting: chunk commits can fail or lag behind the
@@ -366,6 +405,40 @@ pub(crate) async fn drive_intent(
             return Ok(());
         }
     };
+    // A cancel may have landed while guidance claiming awaited: the
+    // flag flips, the claim is released, and the prompt never goes out.
+    if *cancel_flag_rx.borrow() {
+        if !guidance.is_empty()
+            && let Err(claim_error) = store.release_guidance_claim(&attempt_id).await
+        {
+            tracing::warn!(
+                %claim_error,
+                %attempt_id,
+                "guidance claim release failed after pre-send cancel",
+            );
+        }
+        store
+            .mark_terminal(
+                &attempt_id,
+                wrkspc_core::AttemptState::Canceled,
+                Some("cancelled"),
+                None,
+            )
+            .await
+            .map_err(|e| format!("canceled attempt terminal write failed: {e}"))?;
+        let _ = store
+            .append_event(
+                &intent.conversation_id,
+                "dispatch.canceled",
+                &json!({
+                    "attempt_id": attempt_id,
+                    "reason": "cancel requested before dispatch",
+                }),
+            )
+            .await;
+        return Ok(());
+    }
+
     let guidance_blocks = guidance.iter().map(|g| {
         ContentBlock::Text(TextContent::new(format!(
             "[operator guidance from {}]: {}",
@@ -386,6 +459,15 @@ pub(crate) async fn drive_intent(
         let outcome = loop {
             tokio::select! {
                 outcome = &mut prompt_fut => break outcome,
+                changed = cancel_flag_rx.changed() => {
+                    // An operator cancel flipped the flag mid-turn: the
+                    // durable cancellation is recorded and the adapter
+                    // interrupt was attempted; closing deterministically
+                    // never waits on the adapter to confirm.
+                    if changed.is_ok() && *cancel_flag_rx.borrow() {
+                        break Ok(StopReason::Cancelled);
+                    }
+                }
                 event = events.recv(), if events_open => {
                     match event {
                         Ok(event) if event.session_id == binding.session_id => {
@@ -514,23 +596,20 @@ pub(crate) async fn drive_intent(
     match outcome {
         Ok(reason) => {
             let attempt_state = stop_reason_to_attempt_state(&reason);
+            // Terminal persistence and guidance consumption commit in
+            // ONE store transaction: a failure between the two could
+            // otherwise strand guidance claimed by an already-terminal
+            // attempt that restart reconciliation can never see.
+            let ids: Vec<&str> = guidance.iter().map(|g| g.id.as_str()).collect();
             store
-                .mark_terminal(
+                .complete_attempt(
                     &attempt_id,
                     attempt_state,
                     Some(stop_reason_str(&reason)),
-                    None,
+                    &ids,
                 )
                 .await
                 .map_err(|e| format!("terminal attempt write failed: {e}"))?;
-            // Guidance is delivered only now: it demonstrably rode a
-            // prompt that reached a terminal stop reason (E09).
-            if !guidance.is_empty() {
-                let ids: Vec<&str> = guidance.iter().map(|g| g.id.as_str()).collect();
-                if let Err(error) = store.mark_guidance_delivered(&ids).await {
-                    tracing::warn!(%error, %attempt_id, "guidance delivered-mark failed; guidance re-rides the next turn");
-                }
-            }
             let _ = store
                 .append_event(
                     &intent.conversation_id,

@@ -67,6 +67,7 @@ async fn restart_reconciliation_marks_open_attempts_unknown() {
         DispatcherConfig {
             tick: Duration::from_millis(10),
             lookup_timeout: std::time::Duration::from_secs(10),
+            ..Default::default()
         },
     );
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
