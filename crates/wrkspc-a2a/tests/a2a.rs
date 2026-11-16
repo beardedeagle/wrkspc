@@ -5,7 +5,7 @@
 
 use a2a::{
     Artifact, GetTaskRequest, ListTasksRequest, Message, Part, Role, SendMessageRequest,
-    SendMessageResponse, Task, TaskState,
+    SendMessageResponse, SubscribeToTaskRequest, Task, TaskState,
 };
 use a2a_client::agent_card::AgentCardResolver;
 use a2a_client::{A2AClient, A2AClientFactory};
@@ -835,5 +835,85 @@ async fn executor_cancel_errors_on_malformed_stored_payload() {
     assert!(
         error.to_string().contains("not an object"),
         "the error must name the malformed payload: {error}"
+    );
+}
+
+/// C13: a store-driven transition reaches a subscriber. The snapshot
+/// arrives first, then the version change, and the terminal state
+/// ends the stream — the exact path the delivery-report leg drives
+/// for a sender watching its accepted task.
+#[tokio::test]
+async fn subscribe_tails_store_transitions_to_terminal() {
+    let (_addr, client, store, _shutdown) = wire_setup().await;
+    // Seed a non-terminal task row directly — the shape the acceptance
+    // leg stores (context = the conversation, submitted).
+    let task_id = "sender-task-1";
+    let seeded = task(
+        task_id,
+        "conversation-1",
+        TaskState::Submitted,
+        Some("accepted; awaiting wrkspc routing"),
+    );
+    store
+        .task_create(
+            task_id,
+            "conversation-1",
+            "submitted",
+            false,
+            &serde_json::to_string(&seeded).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let mut stream = client
+        .subscribe_to_task(&SubscribeToTaskRequest {
+            id: task_id.to_string(),
+            tenant: None,
+        })
+        .await
+        .expect("subscribe");
+
+    // The snapshot precedes any polling.
+    let first = stream.next().await.expect("snapshot event").expect("ok");
+    let a2a::event::StreamResponse::Task(snapshot) = first else {
+        panic!("subscribe must open with the Task snapshot");
+    };
+    assert_eq!(snapshot.id, task_id);
+    assert_eq!(snapshot.status.state, TaskState::Submitted);
+
+    // A store-driven terminal transition (what the delivery-report
+    // leg writes onto the accepted task) reaches the subscriber and
+    // ends the stream with the final task.
+    let terminal = task(
+        task_id,
+        "conversation-1",
+        TaskState::Completed,
+        Some("turn outcome recorded for codex: completed"),
+    );
+    store
+        .task_update(
+            task_id,
+            "completed",
+            true,
+            &serde_json::to_string(&terminal).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let second = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("terminal transition must arrive")
+        .expect("event")
+        .expect("ok");
+    let a2a::event::StreamResponse::Task(final_task) = second else {
+        panic!("the terminal change must close with the final Task");
+    };
+    assert_eq!(final_task.status.state, TaskState::Completed);
+
+    // The stream ends at the terminal state.
+    let third = tokio::time::timeout(Duration::from_secs(1), stream.next()).await;
+    assert!(
+        matches!(third, Ok(None)),
+        "the stream must end at the terminal task"
     );
 }

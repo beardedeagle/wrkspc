@@ -1149,3 +1149,118 @@ async fn replay_fanout_uses_committed_authority_not_the_retry_flag() {
         "replay fan-out authority must come from the committed message, not the retry payload"
     );
 }
+
+/// C13: a sender may subscribe to ITS OWN accepted task through the
+/// hub gate — the envelope's origin linkage proves the sender's host
+/// even though the accepted task's context is a conversation, not a
+/// delivery queue. Any other host is still refused.
+#[tokio::test]
+async fn sender_subscribes_to_its_own_accepted_task() {
+    let store = Store::open_in_memory("acceptance-subscribe").await.unwrap();
+    store
+        .ensure_peer_on_host("operator", "operator", "human", wrkspc_core::PILOT_HOST_ID)
+        .await
+        .unwrap();
+    store
+        .ensure_peer_on_host("codex", "codex", "harness", "node-test-1")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+
+    // The sender's accepted task (context = the conversation).
+    let accepted_task_id = "node-wire-msg-1";
+    store
+        .task_create(
+            accepted_task_id,
+            &conversation,
+            "submitted",
+            false,
+            &serde_json::json!({
+                "id": accepted_task_id,
+                "contextId": conversation,
+                "status": {"state": "TASK_STATE_SUBMITTED"},
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    // The delivery task whose envelope links the origin to the
+    // sender's host.
+    store
+        .task_create_delivery(wrkspc_core::DeliveryTaskRequest {
+            recipient_host: "node-test-1",
+            recipient_peer: "codex",
+            recipient_name: "codex",
+            recipient_class: "harness",
+            message_id: "hub-msg-1",
+            origin_message_id: Some(accepted_task_id),
+            conversation_id: &conversation,
+            sender_peer: "codex",
+            sender_name: "codex",
+            sender_class: "harness",
+            sender_host: "node-test-1",
+            content: "hello",
+            execution_requested: true,
+        })
+        .await
+        .unwrap();
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "SubscribeToTask",
+        "params": {"id": accepted_task_id},
+    })
+    .to_string();
+
+    let router = router_under_test(store.clone()).await;
+
+    // The sender's own host passes the gate (the request reaches the
+    // SDK handler, which answers anything EXCEPT the queue rejection).
+    let response = router
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/jsonrpc")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-wrkspc-peer", "node-test-1")
+                .body(axum::body::Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        !text.contains("not in this host's delivery queue"),
+        "the sender's own accepted task must pass the gate: {text}"
+    );
+
+    // Any other host is refused with the queue rejection.
+    let response = router
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/jsonrpc")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-wrkspc-peer", "other-host")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("not in this host's delivery queue"),
+        "a foreign host must be refused: {text}"
+    );
+}

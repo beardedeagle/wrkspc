@@ -339,10 +339,9 @@ pub(crate) async fn delivery_report(
             return (StatusCode::CONFLICT, "task payload is not valid JSON").into_response();
         }
     };
-    let Some(delivery) = payload
-        .get("metadata")
-        .and_then(|metadata| metadata.get("delivery"))
-    else {
+    // C2: the typed envelope — a payload without one is not a delivery
+    // task.
+    let Some(envelope) = wrkspc_core::DeliveryEnvelope::from_task_json(&task.task_json) else {
         return (StatusCode::CONFLICT, "not a delivery task").into_response();
     };
     if task.context_id != host {
@@ -363,18 +362,10 @@ pub(crate) async fn delivery_report(
         )
             .into_response();
     }
-    let (Some(recipient_peer), Some(conversation_id)) = (
-        delivery
-            .get("recipient_peer")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        delivery
-            .get("conversation_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-    ) else {
-        return (StatusCode::CONFLICT, "delivery payload is incomplete").into_response();
-    };
+    let (recipient_peer, conversation_id) = (
+        envelope.recipient_peer.clone(),
+        envelope.conversation_id.clone(),
+    );
 
     if body.state == "unknown" {
         // An outcome the node could not determine: mirror it on the
@@ -446,6 +437,62 @@ pub(crate) async fn delivery_report(
         Err(error) => {
             tracing::error!(%error, task_id = %body.task_id, "outcome report failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "delivery report failed").into_response();
+        }
+    }
+    // C13: the sender's accepted task — when the message came from a
+    // remote node, the envelope's origin IS that task's id on this
+    // hub — must see this terminal outcome: that is the documented
+    // streaming-results path, and the subscribe transport tails it.
+    // The first outcome wins: a later conflicting report can never
+    // rewrite a terminal record, and a mirror failure must not fail
+    // the delivery report itself.
+    if let Some(origin_task_id) = envelope.origin_message_id.as_deref()
+        && origin_task_id != body.task_id
+        && let Some(row) = state.store.task_get(origin_task_id).await.ok().flatten()
+    {
+        let mut accepted: serde_json::Value = match serde_json::from_str(&row.task_json) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, origin_task_id, "accepted task blob corrupt; outcome not mirrored");
+                serde_json::Value::Null
+            }
+        };
+        if !accepted.is_null() {
+            let wire_state = match body.state.as_str() {
+                "completed" => wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Completed),
+                "failed" => wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Failed),
+                _ => wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Canceled),
+            };
+            accepted["status"]["state"] = serde_json::Value::String(wire_state.to_string());
+            accepted["status"]["message"] = serde_json::json!({
+                "parts": [{
+                    "text": format!(
+                        "turn outcome recorded for {}: {}",
+                        recipient_peer, body.state
+                    ),
+                }],
+            });
+            match state
+                .store
+                .task_update(origin_task_id, &body.state, true, &accepted.to_string())
+                .await
+            {
+                Ok(_) => {}
+                // Same-terminal re-emission is idempotent success.
+                Err(wrkspc_core::StoreError::TaskTerminal { state: current, .. })
+                    if current == body.state => {}
+                Err(wrkspc_core::StoreError::TaskTerminal { state: current, .. }) => {
+                    tracing::warn!(
+                        origin_task_id,
+                        current_state = %current,
+                        reported = %body.state,
+                        "first terminal outcome wins; later report not mirrored",
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, origin_task_id, "outcome mirror to the accepted task failed");
+                }
+            }
         }
     }
     // A final terminal state completes the reconciliation loop: the

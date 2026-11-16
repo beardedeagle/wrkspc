@@ -28,6 +28,7 @@ fn hub_delivery_row(task_id: &str) -> TaskRow {
                     "recipient_class": "harness",
                     "content": "hello from the hub",
                     "execution_requested": true,
+                    "guidance": [],
                 },
             },
         })
@@ -390,6 +391,7 @@ async fn cohosted_echo_maps_back_to_the_original_local_message() {
                     "recipient_class": "harness",
                     "content": "hello agy",
                     "execution_requested": true,
+                    "guidance": [],
                 },
             },
         })

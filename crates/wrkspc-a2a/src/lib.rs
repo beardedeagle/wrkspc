@@ -16,6 +16,7 @@ pub mod executor;
 pub mod server;
 pub mod state_mapping;
 pub mod store_adapter;
+pub mod subscribe;
 
 pub use executor::WrkspcExecutor;
 pub use server::{
@@ -23,6 +24,7 @@ pub use server::{
 };
 pub use state_mapping::LifecycleState;
 pub use store_adapter::WrkspcTaskStore;
+pub use subscribe::WrkspcRequestHandler;
 
 /// The per-connection policy verdict from the serve-loop callback.
 ///

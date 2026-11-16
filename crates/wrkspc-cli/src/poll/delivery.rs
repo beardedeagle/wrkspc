@@ -463,6 +463,7 @@ mod tests {
                         "recipient_class": "harness",
                         "content": "hello from the hub",
                         "execution_requested": true,
+                        "guidance": [],
                     },
                 },
             })

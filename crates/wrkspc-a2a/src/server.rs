@@ -443,16 +443,17 @@ impl A2aSurface {
     ///
     /// The router (JSON-RPC + REST + agent card).
     pub fn into_router(self, base_url: &str) -> axum::Router {
-        let handler = Arc::new(
-            DefaultRequestHandler::new(
-                WrkspcExecutor::new(self.store.clone()),
-                WrkspcTaskStore::new(self.store),
-            )
-            // C11: the handler enforces the same surface contract the
-            // cards advertise — a declared media type off the list is
-            // refused on the A2A leg, matching the hub's own parse.
-            .with_default_input_modes(surface_contract()),
-        );
+        let inner = DefaultRequestHandler::new(
+            WrkspcExecutor::new(self.store.clone()),
+            WrkspcTaskStore::new(self.store.clone()),
+        )
+        // C11: the handler enforces the same surface contract the
+        // cards advertise — a declared media type off the list is
+        // refused on the A2A leg, matching the hub's own parse.
+        .with_default_input_modes(surface_contract());
+        // C13: subscribe tail-tails the store when no execution is
+        // active — the documented streaming-results transport.
+        let handler = Arc::new(crate::WrkspcRequestHandler::new(inner, self.store.clone()));
         let card_producer = Arc::new(StaticAgentCard::new(build_agent_card(base_url, self.mtls)));
 
         axum::Router::new()

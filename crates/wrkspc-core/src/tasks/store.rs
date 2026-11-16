@@ -139,6 +139,36 @@ impl Store {
         Ok(new_version)
     }
 
+    /// The sender host of the message whose origin a task id is (C13):
+    /// a delivery envelope whose `origin_message_id` matches `task_id`
+    /// carries the sender's host id, and the sender's accepted task is
+    /// exactly that origin. `None` when no delivery task links the id —
+    /// a hub-local acceptance has no node-side origin, and the events
+    /// feed is its channel.
+    ///
+    /// * `task_id` — the accepted task id (the sender's wire message
+    ///   id).
+    ///
+    /// # Returns
+    ///
+    /// The sender's host id, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`] on failure.
+    pub async fn task_origin_host(&self, task_id: &str) -> Result<Option<String>> {
+        let host: Option<String> = sqlx::query_scalar(
+            "SELECT json_extract(task_json, '$.metadata.delivery.sender_host')
+             FROM a2a_tasks
+             WHERE json_extract(task_json, '$.metadata.delivery.origin_message_id') = ?
+             LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(host)
+    }
+
     /// Fetches a task row.
     ///
     /// * `task_id` — the task to fetch.
