@@ -330,132 +330,19 @@ impl Store {
                     key: idempotency_key.to_string(),
                 });
             }
-            // A replay means the message is already stored, not that this
-            // recipient's work is done. The delivery loop feeds one
-            // delivery per recipient under the same origin id, so every
-            // recipient after the first reaches this branch: enrol it
-            // and raise its intent here, or the peer silently never
-            // runs.
-            self.assert_member(&mut tx, conversation_id, sender_id)
-                .await?;
-            // Execution authority is committed at first acceptance: a
-            // mail-only message can never become executable via a retry.
-            // The check covers BOTH channels a replay can smuggle
-            // authority through — the per-recipient flags AND the
-            // message-level flag. An empty recipient list makes the
-            // per-recipient scan vacuous, so without the global term a
-            // mail-only replay carrying execution_requested=true slips
-            // through and the caller's fan-out would queue executable
-            // work the original acceptance never granted.
-            let requests_execution =
-                execution_requested || recipients.iter().any(|r| r.execution_requested);
-            if requests_execution && !existing_execution {
-                return Err(StoreError::ExecutionAuthorityConflict {
-                    message_id: existing_id,
-                });
-            }
-            // The ceiling is CUMULATIVE across replays: each per-recipient
-            // delivery loop call lands here with its own small list, but a
-            // caller rotating lists under one idempotency key could
-            // otherwise accumulate unbounded recipients on one message.
-            // Two guards on the count: the incoming list may name the same
-            // peer twice (INSERT OR IGNORE would dedupe), and a legacy
-            // message committed before the cap may already exceed it — a
-            // pure re-ack that adds NOBODY must always pass, or an upgrade
-            // strands outstanding deliveries in process_deliveries' replay
-            // acks. The refusal fires only when the replay GROWS the set
-            // past the ceiling.
-            let committed_ids: Vec<String> =
-                sqlx::query_scalar("SELECT peer_id FROM message_recipients WHERE message_id = ?")
-                    .bind(&existing_id)
-                    .fetch_all(&mut *tx)
-                    .await?;
-            // A replay must honor the SAME recipient filters as first
-            // acceptance (resolve_recipients): the caller names its list
-            // explicitly, so an ejected peer is refused loudly, while
-            // self-addresses, duplicates, and human-class peers are
-            // skipped — a retry cannot smuggle a banned target or a
-            // human execution intent past the resolution gate.
-            let mut filtered: Vec<&RecipientRequest> = Vec::with_capacity(recipients.len());
-            for recipient in recipients {
-                if recipient.peer_id == sender_id {
-                    continue;
-                }
-                if self
-                    .peer_class(&mut tx, &recipient.peer_id)
-                    .await?
-                    .as_deref()
-                    == Some(HUMAN_CLASS)
-                {
-                    continue;
-                }
-                let status: Option<String> =
-                    sqlx::query_scalar("SELECT status FROM peers WHERE id = ?")
-                        .bind(&recipient.peer_id)
-                        .fetch_optional(&mut *tx)
-                        .await?;
-                if let Some(status) = status
-                    && status != "enrolled"
-                {
-                    return Err(StoreError::PeerEjected {
-                        peer_id: recipient.peer_id.clone(),
-                        status,
-                    });
-                }
-                filtered.push(recipient);
-            }
-            let mut new_unique_ids: Vec<&str> = Vec::new();
-            for recipient in &filtered {
-                if !committed_ids.iter().any(|id| id == &recipient.peer_id)
-                    && !new_unique_ids.contains(&recipient.peer_id.as_str())
-                {
-                    new_unique_ids.push(&recipient.peer_id);
-                }
-            }
-            if !new_unique_ids.is_empty()
-                && committed_ids.len() + new_unique_ids.len() > MAX_DIRECTED_RECIPIENTS
-            {
-                return Err(StoreError::TooManyRecipients {
-                    limit: MAX_DIRECTED_RECIPIENTS,
-                    count: committed_ids.len() + new_unique_ids.len(),
-                });
-            }
-            for recipient in &filtered {
-                self.assert_member(&mut tx, conversation_id, &recipient.peer_id)
-                    .await?;
-                sqlx::query(
-                    "INSERT OR IGNORE INTO message_recipients
-                       (message_id, peer_id, delivery_state)
-                     VALUES (?, ?, ?)",
+            return self
+                .replay_committed(
+                    tx,
+                    conversation_id,
+                    sender_id,
+                    &existing_id,
+                    existing_execution,
+                    execution_requested,
+                    recipients,
+                    &mode,
+                    &now,
                 )
-                .bind(&existing_id)
-                .bind(&recipient.peer_id)
-                .bind(DeliveryState::Stored.as_str())
-                .execute(&mut *tx)
-                .await?;
-                if mode.create_intents && recipient.execution_requested {
-                    sqlx::query(
-                        "INSERT OR IGNORE INTO execution_intents
-                           (id, message_id, recipient_id, state, created_at)
-                         VALUES (?, ?, ?, 'queued', ?)",
-                    )
-                    .bind(Uuid::new_v4().to_string())
-                    .bind(&existing_id)
-                    .bind(&recipient.peer_id)
-                    .bind(&now)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-            }
-            // The stored flag reflects the committed intents, never a
-            // stale first-acceptance snapshot: reaching this point with
-            // `requests_execution` means the execution-authority guard
-            // above already saw the flag committed, so there is nothing
-            // to update here.
-            tx.commit().await?;
-            return Ok(AcceptOutcome::Replay {
-                message_id: existing_id,
-            });
+                .await;
         }
 
         // Resolve who this post actually wakes before anything is written: the
@@ -543,6 +430,146 @@ impl Store {
 
         tx.commit().await?;
         Ok(AcceptOutcome::Accepted { message_id })
+    }
+
+    /// The replay leg of [`accept_message_with`](Store::accept_message_with):
+    /// the message row already exists, so this enrols the newly
+    /// presented recipients and raises their intents under the SAME
+    /// origin id — a recipient after the first reaches this branch,
+    /// and it must run or the peer silently never does.
+    #[allow(clippy::too_many_arguments)]
+    async fn replay_committed(
+        &self,
+        mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+        conversation_id: &str,
+        sender_id: &str,
+        existing_id: &str,
+        existing_execution: bool,
+        execution_requested: bool,
+        recipients: &[RecipientRequest],
+        mode: &AcceptMode,
+        now: &str,
+    ) -> Result<AcceptOutcome> {
+        // A replay means the message is already stored, not that this
+        // recipient's work is done. The delivery loop feeds one
+        // delivery per recipient under the same origin id, so every
+        // recipient after the first reaches this branch: enrol it
+        // and raise its intent here, or the peer silently never
+        // runs.
+        self.assert_member(&mut tx, conversation_id, sender_id).await?;
+        // Execution authority is committed at first acceptance: a
+        // mail-only message can never become executable via a retry.
+        // The check covers BOTH channels a replay can smuggle
+        // authority through — the per-recipient flags AND the
+        // message-level flag. An empty recipient list makes the
+        // per-recipient scan vacuous, so without the global term a
+        // mail-only replay carrying execution_requested=true slips
+        // through and the caller's fan-out would queue executable
+        // work the original acceptance never granted.
+        let requests_execution =
+            execution_requested || recipients.iter().any(|r| r.execution_requested);
+        if requests_execution && !existing_execution {
+            return Err(StoreError::ExecutionAuthorityConflict {
+                message_id: existing_id.to_string(),
+            });
+        }
+        // The ceiling is CUMULATIVE across replays: each per-recipient
+        // delivery loop call lands here with its own small list, but a
+        // caller rotating lists under one idempotency key could
+        // otherwise accumulate unbounded recipients on one message.
+        // Two guards on the count: the incoming list may name the same
+        // peer twice (INSERT OR IGNORE would dedupe), and a legacy
+        // message committed before the cap may already exceed it — a
+        // pure re-ack that adds NOBODY must always pass, or an upgrade
+        // strands outstanding deliveries in process_deliveries' replay
+        // acks. The refusal fires only when the replay GROWS the set
+        // past the ceiling.
+        let committed_ids: Vec<String> =
+            sqlx::query_scalar("SELECT peer_id FROM message_recipients WHERE message_id = ?")
+                .bind(existing_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        // A replay must honor the SAME recipient filters as first
+        // acceptance (resolve_recipients): the caller names its list
+        // explicitly, so an ejected peer is refused loudly, while
+        // self-addresses, duplicates, and human-class peers are
+        // skipped — a retry cannot smuggle a banned target or a
+        // human execution intent past the resolution gate.
+        let mut filtered: Vec<&RecipientRequest> = Vec::with_capacity(recipients.len());
+        for recipient in recipients {
+            if recipient.peer_id == sender_id {
+                continue;
+            }
+            if self.peer_class(&mut tx, &recipient.peer_id).await?.as_deref() == Some(HUMAN_CLASS) {
+                continue;
+            }
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM peers WHERE id = ?")
+                    .bind(&recipient.peer_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if let Some(status) = status
+                && status != "enrolled"
+            {
+                return Err(StoreError::PeerEjected {
+                    peer_id: recipient.peer_id.clone(),
+                    status,
+                });
+            }
+            filtered.push(recipient);
+        }
+        let mut new_unique_ids: Vec<&str> = Vec::new();
+        for recipient in &filtered {
+            if !committed_ids.iter().any(|id| id == &recipient.peer_id)
+                && !new_unique_ids.contains(&recipient.peer_id.as_str())
+            {
+                new_unique_ids.push(&recipient.peer_id);
+            }
+        }
+        if !new_unique_ids.is_empty()
+            && committed_ids.len() + new_unique_ids.len() > MAX_DIRECTED_RECIPIENTS
+        {
+            return Err(StoreError::TooManyRecipients {
+                limit: MAX_DIRECTED_RECIPIENTS,
+                count: committed_ids.len() + new_unique_ids.len(),
+            });
+        }
+        for recipient in &filtered {
+            self.assert_member(&mut tx, conversation_id, &recipient.peer_id)
+                .await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO message_recipients
+                   (message_id, peer_id, delivery_state)
+                 VALUES (?, ?, ?)",
+            )
+            .bind(existing_id)
+            .bind(&recipient.peer_id)
+            .bind(DeliveryState::Stored.as_str())
+            .execute(&mut *tx)
+            .await?;
+            if mode.create_intents && recipient.execution_requested {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO execution_intents
+                       (id, message_id, recipient_id, state, created_at)
+                     VALUES (?, ?, ?, 'queued', ?)",
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(existing_id)
+                .bind(&recipient.peer_id)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        // The stored flag reflects the committed intents, never a
+        // stale first-acceptance snapshot: reaching this point with
+        // `requests_execution` means the execution-authority guard
+        // above already saw the flag committed, so there is nothing
+        // to update here.
+        tx.commit().await?;
+        Ok(AcceptOutcome::Replay {
+            message_id: existing_id.to_string(),
+        })
     }
 }
 
