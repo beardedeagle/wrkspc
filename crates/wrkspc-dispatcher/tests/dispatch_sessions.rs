@@ -602,5 +602,5 @@ async fn every_gate_commits_before_the_prompt() {
         "dispatch.started must be committed before the prompt reaches the harness"
     );
 
-    let _ = shutdown_tx.send(());
+    shutdown_tx.send(()).await.expect("shutdown send");
 }

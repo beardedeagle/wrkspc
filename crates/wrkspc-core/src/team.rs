@@ -161,9 +161,8 @@ impl Store {
                 canceled.insert(peer);
             }
 
-            let sql = format!(
-                "SELECT id, name, class, host_id FROM peers WHERE id IN ({placeholders})",
-            );
+            let sql =
+                format!("SELECT id, name, class, host_id FROM peers WHERE id IN ({placeholders})",);
             let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
             for peer in chunk {
                 query = query.bind(peer);
@@ -284,7 +283,11 @@ impl Store {
             if rows.is_empty() {
                 break;
             }
-            let page_last = rows.last().expect("non-empty page has a last row");
+            let Some(page_last) = rows.last() else {
+                // An empty page can only mean the keyset cursor moved
+                // past the data — end the pass instead of panicking.
+                break;
+            };
             last_message = page_last.get("message_id");
             last_peer = page_last.get("peer_id");
 
@@ -292,10 +295,7 @@ impl Store {
             // message, deterministic task ids, and the distinct
             // senders' details.
             let mut canceled: std::collections::HashSet<(String, String)> = Default::default();
-            let mut by_message: std::collections::HashMap<
-                String,
-                Vec<String>,
-            > = Default::default();
+            let mut by_message: std::collections::HashMap<String, Vec<String>> = Default::default();
             for row in &rows {
                 by_message
                     .entry(row.get::<String, _>("message_id"))
@@ -309,8 +309,8 @@ impl Store {
                      WHERE message_id = ? AND state = 'canceled'
                        AND recipient_id IN ({placeholders})",
                 );
-                let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
-                    .bind(message_id);
+                let mut query =
+                    sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(message_id);
                 for peer in peers {
                     query = query.bind(peer);
                 }
@@ -349,9 +349,8 @@ impl Store {
             let mut sender_details: std::collections::HashMap<String, (String, String, String)> =
                 Default::default();
             let placeholders = vec!["?"; senders.len()].join(", ");
-            let sql = format!(
-                "SELECT id, name, class, host_id FROM peers WHERE id IN ({placeholders})",
-            );
+            let sql =
+                format!("SELECT id, name, class, host_id FROM peers WHERE id IN ({placeholders})",);
             let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
             for sender in &senders {
                 query = query.bind(sender);
@@ -385,17 +384,17 @@ impl Store {
                         entity: "peer",
                         id: sender_peer.clone(),
                     })?;
-            // The sender wire-message identity survives in
-            // `messages.idempotency_key` for node-originated sends (the
-            // A2A acceptance key IS the node's wire message id). A
-            // repaired envelope must carry it so a co-hosted echo maps
-            // back onto the original local row instead of minting a
-            // second message and execution intent — the normal fan-out
-            // forwards it explicitly and the repair must not degrade
-            // to the hub-derived id. Hub-local senders (the operator
-            // UI) have no node-side origin: their key is a fresh
-            // acceptance id, not a wire identity, and must not ride as
-            // the origin.
+                // The sender wire-message identity survives in
+                // `messages.idempotency_key` for node-originated sends (the
+                // A2A acceptance key IS the node's wire message id). A
+                // repaired envelope must carry it so a co-hosted echo maps
+                // back onto the original local row instead of minting a
+                // second message and execution intent — the normal fan-out
+                // forwards it explicitly and the repair must not degrade
+                // to the hub-derived id. Hub-local senders (the operator
+                // UI) have no node-side origin: their key is a fresh
+                // acceptance id, not a wire identity, and must not ride as
+                // the origin.
                 let origin_message_id =
                     (sender_host != local_host).then(|| row.get::<String, _>("idempotency_key"));
                 let recipient_host: String = row.get("recipient_host");
