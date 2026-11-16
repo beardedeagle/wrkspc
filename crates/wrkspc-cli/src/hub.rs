@@ -595,10 +595,7 @@ impl wrkspc_ui::CancelRequester for HubCancel {
             // The hub-side intent (queued → canceled, with the feed
             // event). A mail-only message has no intent and nothing to
             // cancel here.
-            let outcome = match store
-                .request_cancel(message_id, recipient_id, set_by)
-                .await
-            {
+            let outcome = match store.request_cancel(message_id, recipient_id, set_by).await {
                 Ok(outcome) => outcome,
                 Err(wrkspc_core::StoreError::NotFound { .. }) => {
                     // No intent to cancel; fall through to the task.
