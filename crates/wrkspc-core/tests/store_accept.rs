@@ -995,10 +995,7 @@ async fn replay_cannot_accumulate_recipients_past_the_cap() {
         .await
         .expect_err("replay rotation past the cumulative cap must be refused");
     assert!(
-        matches!(
-            error,
-            StoreError::TooManyRecipients { limit: 32, .. }
-        ),
+        matches!(error, StoreError::TooManyRecipients { limit: 32, .. }),
         "got {error:?}"
     );
 }

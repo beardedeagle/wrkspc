@@ -4,7 +4,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use a2a::TaskState;
-use wrkspc_a2a::state_mapping::{LifecycleState, task_state_from_literal, task_state_literal, to_task_state};
+use wrkspc_a2a::state_mapping::{
+    LifecycleState, task_state_from_literal, task_state_literal, to_task_state,
+};
 
 #[test]
 fn maps_lifecycle_per_hld_table() {
@@ -42,7 +44,10 @@ fn maps_lifecycle_per_hld_table() {
         to_task_state(LifecycleState::Completed),
         Some(TaskState::Completed)
     );
-    assert_eq!(to_task_state(LifecycleState::Failed), Some(TaskState::Failed));
+    assert_eq!(
+        to_task_state(LifecycleState::Failed),
+        Some(TaskState::Failed)
+    );
     assert_eq!(
         to_task_state(LifecycleState::Canceled),
         Some(TaskState::Canceled)

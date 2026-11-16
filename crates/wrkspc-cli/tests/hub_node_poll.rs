@@ -15,6 +15,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+
+mod common;
+use common::scratch_dir;
 use std::time::{Duration, Instant};
 
 use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
@@ -29,20 +32,6 @@ impl Drop for Hub {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-/// Unique scratch dir for one test run.
-fn scratch_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "wrkspc-loop-test-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 /// Writes a test PKI: CA, hub server cert/key (loopback SANs), and a

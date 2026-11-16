@@ -174,15 +174,14 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
         // for hub acceptance and the echoed delivery claim.
         args.hub.is_some(),
     ));
-    let (dispatcher, dispatcher_handle) =
-        Dispatcher::new(
-            store.clone(),
-            provider.clone(),
-            DispatcherConfig {
-                lookup_timeout: std::time::Duration::from_secs(args.lookup_timeout_secs),
-                ..DispatcherConfig::default()
-            },
-        );
+    let (dispatcher, dispatcher_handle) = Dispatcher::new(
+        store.clone(),
+        provider.clone(),
+        DispatcherConfig {
+            lookup_timeout: std::time::Duration::from_secs(args.lookup_timeout_secs),
+            ..DispatcherConfig::default()
+        },
+    );
 
     // Operator token: an explicit `--ui-token-file` wins (the deploy
     // wrapper's tmpfs handoff), then WRKSPC_UI_TOKEN, then the

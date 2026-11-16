@@ -1,15 +1,15 @@
 //! wrkspc-a2a — the agent-facing coordination surface.
 //!
-//! The pilot runs this in-process as the coordinator role. It serves the
-//! v1.0 agent card, a `TaskStore` impl over the wrkspc store, and the six
-//! core A2A methods (`send_message`, `send_streaming_message`, `get_task`,
-//! `list_tasks`, `cancel_task`, `subscribe_to_task`).
+//! The hub runs this in-process as the coordination surface. It serves
+//! the v1.0 agent card, a `TaskStore` impl over the wrkspc store, and
+//! the six core A2A methods (`send_message`, `send_streaming_message`,
+//! `get_task`, `list_tasks`, `cancel_task`, `subscribe_to_task`).
 //!
 //! The executor deliberately does NOT complete tasks: acceptance is
 //! recorded as `submitted` with a status message (a continuation keeps
 //! its existing non-terminal state), and execution state is driven by
-//! the dispatcher (unit 5). A completed *turn* is never claimed as task
-//! success (D-3 predicate).
+//! the dispatcher. A completed *turn* is never claimed as task success
+//! (D-3 predicate).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod executor;
@@ -23,7 +23,6 @@ pub use server::{
 };
 pub use state_mapping::LifecycleState;
 pub use store_adapter::WrkspcTaskStore;
-
 
 /// The per-connection policy verdict from the serve-loop callback.
 ///

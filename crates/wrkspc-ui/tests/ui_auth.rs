@@ -123,10 +123,7 @@ async fn cookie_unsafe_requests_require_the_guard_header() {
         .await
         .unwrap();
     assert!(created.status().is_success(), "got {}", created.status());
-    let conversation_id = created
-        .json::<serde_json::Value>()
-        .await
-        .unwrap()["id"]
+    let conversation_id = created.json::<serde_json::Value>().await.unwrap()["id"]
         .as_str()
         .unwrap()
         .to_string();

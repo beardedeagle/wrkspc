@@ -6,8 +6,8 @@ mod common;
 
 use common::{key, pool_for, seeded, temp_db_path};
 use sqlx::Row;
-use wrkspc_core::{FenceKind, PILOT_HOST_ID, Store};
 use uuid::Uuid;
+use wrkspc_core::{FenceKind, PILOT_HOST_ID, Store};
 
 /// The event feed resumes from a cursor with monotonic sequence numbers.
 #[tokio::test]

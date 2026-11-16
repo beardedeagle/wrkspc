@@ -94,7 +94,8 @@ impl Store {
         payload: &serde_json::Value,
     ) -> Result<i64> {
         let mut tx = self.pool.begin().await?;
-        self.assert_member(&mut tx, conversation_id, peer_id).await?;
+        self.assert_member(&mut tx, conversation_id, peer_id)
+            .await?;
         let seq = self
             .append_event_in(&mut tx, conversation_id, kind, payload)
             .await?;
@@ -124,7 +125,8 @@ impl Store {
     ) -> Result<Vec<Event>> {
         let limit = limit.clamp(1, 1000);
         let mut tx = self.pool.begin().await?;
-        self.assert_member(&mut tx, conversation_id, peer_id).await?;
+        self.assert_member(&mut tx, conversation_id, peer_id)
+            .await?;
         let rows = sqlx::query(
             "SELECT seq, conversation_id, kind, payload, created_at
              FROM events

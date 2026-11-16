@@ -352,32 +352,22 @@ impl Store {
             // A corrupt marker is a wedged outcome queue, not an empty
             // one: warn with the task id so the operator can tell the
             // difference (neighboring poll legs already warn).
-            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&task_json) else {
-                tracing::warn!(%task_id, "hub_pending_outcomes: marker payload is corrupt; outcome queue may wedge");
+            let Some(envelope) = crate::tasks::DeliveryEnvelope::from_task_json(&task_json) else {
+                tracing::warn!(%task_id, "hub_pending_outcomes: marker payload is corrupt or lacks the delivery envelope; outcome queue may wedge");
                 continue;
             };
-            let Some(delivery) = payload
-                .get("metadata")
-                .and_then(|metadata| metadata.get("delivery"))
-            else {
-                tracing::warn!(%task_id, "hub_pending_outcomes: marker payload lacks metadata.delivery");
-                continue;
-            };
-            if delivery.get("kind").and_then(|kind| kind.as_str()) != Some("delivery") {
+            if envelope.kind != "delivery" {
                 tracing::warn!(%task_id, "hub_pending_outcomes: marker payload is not a delivery envelope");
                 continue;
             }
-            let (Some(hub_message_id), Some(recipient_peer), Some(conversation_id)) = (
-                delivery.get("message_id").and_then(|v| v.as_str()),
-                delivery.get("recipient_peer").and_then(|v| v.as_str()),
-                delivery.get("conversation_id").and_then(|v| v.as_str()),
-            ) else {
-                tracing::warn!(%task_id, "hub_pending_outcomes: delivery envelope missing identity keys");
-                continue;
-            };
-            let accept_key = delivery
-                .get("origin_message_id")
-                .and_then(|v| v.as_str())
+            let (hub_message_id, recipient_peer, conversation_id) = (
+                &envelope.message_id,
+                &envelope.recipient_peer,
+                &envelope.conversation_id,
+            );
+            let accept_key = envelope
+                .origin_message_id
+                .as_deref()
                 .unwrap_or(hub_message_id);
             mirrored.insert(
                 (

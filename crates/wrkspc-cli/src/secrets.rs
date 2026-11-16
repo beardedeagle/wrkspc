@@ -3,9 +3,9 @@
 //! The operator UI token is a bearer credential: it must not sit in
 //! plaintext on disk. On macOS it lives in the user's login Keychain
 //! (encrypted at rest, OS-managed ACLs). Other platforms fall back to
-//! the legacy 0600 file next to the database until a platform store
-//! lands (Windows: Credential Manager; Linux: secret service) — the
-//! trait seam exists so those arrive as new implementations.
+//! a 0600 token file next to the database until a platform store lands
+//! (Windows: Credential Manager; Linux: secret service) — the trait
+//! seam exists so those arrive as new implementations.
 
 use std::path::Path;
 
@@ -88,64 +88,6 @@ where
     }
 }
 
-/// Loads a legacy `<db>.ui-token` file for migration. A symlink or a
-/// non-regular file is refused, never followed (CU-05: only the
-/// intended plaintext file may be consumed).
-async fn load_legacy_token_file(path: &std::path::Path) -> Result<Option<String>, String> {
-    let meta = match tokio::fs::symlink_metadata(path).await {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(format!(
-                "cannot stat legacy token file {}: {e}",
-                path.display()
-            ));
-        }
-    };
-    if meta.file_type().is_symlink() || !meta.is_file() {
-        tracing::warn!(
-            "legacy token path {} is not a regular file — leaving it alone",
-            path.display()
-        );
-        return Ok(None);
-    }
-    let contents = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|e| format!("cannot read legacy token file {}: {e}", path.display()))?;
-    let token = contents.trim().to_string();
-    Ok((!token.is_empty()).then_some(token))
-}
-
-/// Removes the legacy plaintext token file, but ONLY when it still
-/// holds the value now stored elsewhere (CU-05): a file that changed
-/// since migration is left alone with a warning, and every failure —
-/// stat, read, mismatch, removal — is logged, never silent.
-async fn cleanup_legacy_token_file(path: &std::path::Path, stored: &str) {
-    let Some(current) = (match load_legacy_token_file(path).await {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(%error, "legacy token cleanup failed");
-            return;
-        }
-    }) else {
-        // Already gone (or refused as a link) — nothing to do.
-        return;
-    };
-    if current != stored {
-        tracing::warn!(
-            "legacy token file {} holds a different value than the store — leaving it for the operator to inspect",
-            path.display()
-        );
-        return;
-    }
-    if let Err(error) = tokio::fs::remove_file(path).await {
-        tracing::warn!(
-            %error,
-            "legacy token file cleanup failed — the credential remains on disk; it will be retried on the next start"
-        );
-    }
-}
-
 /// Reads the operator token from an explicit file (the deploy wrapper's
 /// tmpfs handoff). Read-only and fail-closed: a missing file, an empty
 /// file, a symlink, or a non-regular file is an error — never a silent
@@ -181,20 +123,22 @@ pub async fn resolve_ui_token_from_file(path: &Path) -> Result<String, String> {
 }
 
 /// The per-peer MCP bearer token for the node's loopback HTTP listener.
-/// macOS: the Keychain (service `wrkspc.mcp`, account = peer id); the
-/// legacy `<db>.<peer>.mcp-token` sidecar is migrated into the Keychain
-/// and removed only after a readback proves the stored value matches.
-/// Other platforms: the audited 0600 sidecar. `WRKSPC_MCP_TOKEN` (a
-/// test/emergency pin, same role as the UI-token override) wins on
-/// every platform.
+/// macOS: the Keychain (service `wrkspc.mcp`, account = peer id);
+/// other platforms: the audited 0600 sidecar next to `db`.
+/// `WRKSPC_MCP_TOKEN` (a test/emergency pin, same role as the UI-token
+/// override) wins on every platform.
 ///
-/// `db` is the node database (legacy sidecar location); `peer` is the
-/// binding's peer id.
+/// `db` is the node database (the non-macOS sidecar location); `peer`
+/// is the binding's peer id.
 ///
 /// # Errors
 ///
 /// Returns the store or filesystem failure.
 pub async fn mcp_token_for_peer(db: &Path, peer: &str) -> Result<String, String> {
+    // `db` only locates the sidecar on file-store platforms; the
+    // Keychain path keys by peer alone.
+    #[cfg(target_os = "macos")]
+    let _ = db;
     if let Some(token) = std::env::var("WRKSPC_MCP_TOKEN")
         .ok()
         .filter(|token| !token.is_empty())
@@ -204,39 +148,13 @@ pub async fn mcp_token_for_peer(db: &Path, peer: &str) -> Result<String, String>
     #[cfg(target_os = "macos")]
     {
         let account = format!("wrkspc.mcp.{peer}");
-        let legacy = std::path::PathBuf::from(format!("{}.{peer}.mcp-token", db.display()));
         let read_account = account.clone();
         if let Some(token) = bounded_store_op("keychain read", move || {
             mcp_platform_store().load(&read_account)
         })
         .await?
         {
-            cleanup_legacy_token_file(&legacy, &token).await;
             return Ok(token);
-        }
-        if let Some(token) = load_legacy_token_file(&legacy).await? {
-            let stored = token.clone();
-            let store_account = account.clone();
-            bounded_store_op("keychain write", move || {
-                mcp_platform_store().store(&store_account, &stored)
-            })
-            .await?;
-            // Readback proves the migration before the sidecar dies.
-            let readback_account = account.clone();
-            let readback = bounded_store_op("keychain read", move || {
-                mcp_platform_store().load(&readback_account)
-            })
-            .await?;
-            return match readback {
-                Some(value) if value == token => {
-                    cleanup_legacy_token_file(&legacy, &token).await;
-                    Ok(token)
-                }
-                _ => Err(
-                    "mcp token migration failed readback — leaving the sidecar in place"
-                        .to_string(),
-                ),
-            };
         }
         let token = uuid::Uuid::new_v4().to_string();
         let stored = token.clone();
@@ -267,12 +185,10 @@ pub fn mcp_platform_store() -> Box<dyn TokenStore> {
 /// wrapper's tmpfs handoff), otherwise the environment override,
 /// otherwise the platform store keyed by the node's `identity` (macOS:
 /// a Keychain entry named for the node, e.g. `wrkspc.<host>`; elsewhere:
-/// a 0600 file next to `db`), migrating any legacy plaintext file or
-/// database-path-keyed Keychain entry into it, otherwise a freshly
-/// generated token.
+/// a 0600 file next to `db`), otherwise a freshly generated token.
 ///
 /// `identity` is the node's stable name (its host id, or `default`);
-/// `db` is the canonical database path (legacy-file migration key);
+/// `db` is the canonical database path (the non-macOS file key);
 /// `file` is the optional explicit token file (`--ui-token-file`).
 ///
 /// # Errors
@@ -293,64 +209,10 @@ pub async fn resolve_ui_token(
         return Ok(token);
     }
     let account = token_account(identity, db)?;
-    let legacy = std::path::PathBuf::from(format!("{}.ui-token", db.display()));
     if let Some(token) =
         bounded_store_op("keychain read", move || platform_store().load(&account)).await?
     {
-        // Retry the legacy-file cleanup on EVERY start (CU-05): a
-        // previous migration whose deletion failed (read-only
-        // directory) must not leave the live credential on disk
-        // forever — the Keychain-hit return used to precede all
-        // cleanup, so the failure was never revisited.
-        // macOS only: on file-store platforms the legacy path IS the
-        // platform store's own file, and "cleaning" it deletes the
-        // live credential — the next resolve_ui_token call generates
-        // a fresh token, and the hub's two listeners (UI and A2A)
-        // diverge, each accepting a different token.
-        #[cfg(target_os = "macos")]
-        cleanup_legacy_token_file(&legacy, &token).await;
         return Ok(token);
-    }
-    // Migrate a legacy plaintext file into the platform store, then
-    // remove it so the token never lingers on disk in the clear.
-    if let Some(token) = load_legacy_token_file(&legacy).await? {
-        let stored = token.clone();
-        let account = token_account(identity, db)?;
-        bounded_store_op("keychain write", move || {
-            platform_store().store(&account, &stored)
-        })
-        .await?;
-        cleanup_legacy_token_file(&legacy, &token).await;
-        return Ok(token);
-    }
-    // Migrate a database-path-keyed Keychain entry (pre-host-identity
-    // builds) into the node-named entry, then drop the old one.
-    #[cfg(target_os = "macos")]
-    {
-        let legacy_account = format!("{}.ui-token", db.display());
-        let legacy_for_load = legacy_account.clone();
-        let account = ui_token_account(identity);
-        if let Some(token) = bounded_store_op("keychain read", move || {
-            platform_store().load(&legacy_for_load)
-        })
-        .await?
-        {
-            let stored = token.clone();
-            bounded_store_op("keychain write", move || {
-                platform_store().store(&account, &stored)
-            })
-            .await?;
-            // Best-effort cleanup of the migrated entry.
-            match bounded_store_op("keychain delete", move || {
-                platform_store().delete(&legacy_account)
-            })
-            .await
-            {
-                Ok(()) => {}
-                Err(error) => tracing::warn!(%error, "legacy keychain entry cleanup failed"),
-            }
-            return Ok(token);
-        }
     }
     let token = uuid::Uuid::new_v4().to_string();
     let stored = token.clone();

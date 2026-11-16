@@ -19,12 +19,12 @@ pub struct FakeCancel {
 }
 
 impl CancelRequester for FakeCancel {
-    fn request_cancel(
-        &self,
-        message_id: &str,
-        recipient_id: &str,
-        _set_by: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<CancelOutcome, String>> + Send + '_>> {
+    fn request_cancel<'a>(
+        &'a self,
+        message_id: &'a str,
+        recipient_id: &'a str,
+        _set_by: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CancelOutcome, String>> + Send + 'a>> {
         self.calls
             .lock()
             .unwrap()

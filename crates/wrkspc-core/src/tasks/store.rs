@@ -2,7 +2,9 @@
 //! task CRUD with keyset pagination, delivery-task queueing, and the
 //! delivery claim lifecycle.
 
-use super::{DeliveryClaimOutcome, DeliveryTaskRequest, TaskRow, task_row_from_sql};
+use super::{
+    DeliveryClaimOutcome, DeliveryEnvelope, DeliveryTaskRequest, TaskRow, task_row_from_sql,
+};
 use crate::error::{Result, StoreError};
 use crate::store::Store;
 use chrono::Utc;
@@ -287,30 +289,18 @@ impl Store {
             if row.terminal {
                 continue;
             }
-            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&row.task_json) else {
+            // C2: the typed envelope — a malformed or foreign blob is
+            // simply not a claimable delivery.
+            let Some(envelope) = DeliveryEnvelope::from_task_json(&row.task_json) else {
                 continue;
             };
-            let Some(delivery) = payload
-                .get("metadata")
-                .and_then(|metadata| metadata.get("delivery"))
-                .and_then(|delivery| delivery.as_object())
-            else {
-                continue;
-            };
-            if delivery.get("kind").and_then(|kind| kind.as_str()) != Some("delivery") {
+            if envelope.kind != "delivery" {
                 continue;
             }
-            let Some(conversation_id) = delivery
-                .get("conversation_id")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-            else {
-                continue;
-            };
             candidates.push(Candidate {
                 index,
                 task_id: row.task_id.clone(),
-                conversation_id,
+                conversation_id: envelope.conversation_id,
             });
         }
         if candidates.is_empty() {
@@ -478,30 +468,25 @@ impl Store {
             .collect();
         // The stored blob is a canonical A2A Task serialization (the
         // surface serves `task_json` as the wire Task), with the
-        // wrkspc delivery envelope riding in `metadata.delivery`.
-        let payload = serde_json::json!({
-            "id": task_id,
-            "contextId": request.recipient_host,
-            "status": {"state": "TASK_STATE_SUBMITTED"},
-            "metadata": {
-                "delivery": {
-                    "kind": "delivery",
-                    "message_id": request.message_id,
-                    "origin_message_id": request.origin_message_id,
-                    "conversation_id": request.conversation_id,
-                    "sender_peer": request.sender_peer,
-                    "sender_name": request.sender_name,
-                    "sender_class": request.sender_class,
-                    "sender_host": request.sender_host,
-                    "recipient_peer": request.recipient_peer,
-                    "recipient_name": request.recipient_name,
-                    "recipient_class": request.recipient_class,
-                    "content": request.content,
-                    "execution_requested": request.execution_requested,
-                    "guidance": guidance,
-                },
-            },
-        });
+        // wrkspc delivery envelope riding in `metadata.delivery` — the
+        // ONE typed schema (C2) every reader decodes.
+        let payload = DeliveryEnvelope {
+            kind: "delivery".to_string(),
+            message_id: request.message_id.to_string(),
+            origin_message_id: request.origin_message_id.map(str::to_string),
+            conversation_id: request.conversation_id.to_string(),
+            sender_peer: request.sender_peer.to_string(),
+            sender_name: request.sender_name.to_string(),
+            sender_class: request.sender_class.to_string(),
+            sender_host: request.sender_host.to_string(),
+            recipient_peer: request.recipient_peer.to_string(),
+            recipient_name: request.recipient_name.to_string(),
+            recipient_class: request.recipient_class.to_string(),
+            content: request.content.to_string(),
+            execution_requested: request.execution_requested,
+            guidance,
+        }
+        .to_task_json(&task_id, request.recipient_host);
         // The insertion carries the cancellation fence IN THE SAME
         // statement: the WHERE clause reads the committed intent state
         // atomically with the insert, so an operator cancel that
@@ -895,13 +880,13 @@ struct DeliveryGateKeys {
 /// The message/recipient identity, or `None` when the blob is not a
 /// well-formed delivery payload.
 fn parse_delivery_gate_keys(task_json: &str) -> Option<DeliveryGateKeys> {
-    let payload: serde_json::Value = serde_json::from_str(task_json).ok()?;
-    let delivery = payload.get("metadata")?.get("delivery")?;
-    if delivery.get("kind")?.as_str()? != "delivery" {
+    // C2: the typed envelope.
+    let envelope = DeliveryEnvelope::from_task_json(task_json)?;
+    if envelope.kind != "delivery" {
         return None;
     }
     Some(DeliveryGateKeys {
-        message_id: delivery.get("message_id")?.as_str()?.to_string(),
-        recipient_peer: delivery.get("recipient_peer")?.as_str()?.to_string(),
+        message_id: envelope.message_id,
+        recipient_peer: envelope.recipient_peer,
     })
 }

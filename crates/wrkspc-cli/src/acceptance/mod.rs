@@ -267,13 +267,13 @@ async fn accept_rest(
             }
             next.run(request).await
         }
-        // /rest/tasks/{id} (+ legacy /cancel and /subscribe suffixes):
-        // every action on a task is host-queue-scoped. Canonical
-        // action spellings (/rest/tasks/{id}:cancel, /rest/tasks/{id}:subscribe)
-        // carry the suffix INSIDE the id segment: strip only the two
-        // recognized suffixes for the ownership lookup, while the
-        // original URI still reaches the SDK (whose own router strips
-        // them inside its handlers).
+        // /rest/tasks/{id} and its action spellings (/cancel and
+        // /subscribe suffixes, plus the canonical
+        // /rest/tasks/{id}:cancel and /rest/tasks/{id}:subscribe
+        // forms): every action on a task is host-queue-scoped. Strip
+        // only the two recognized suffixes for the ownership lookup,
+        // while the original URI still reaches the SDK (whose own
+        // router strips them inside its handlers).
         ["tasks", id, ..] => {
             let id = strip_task_action_suffix(id).to_string();
             if !task_owned_by(state, &id, host).await {
@@ -286,11 +286,11 @@ async fn accept_rest(
             let _ = method;
             next.run(request).await
         }
-        // POST /rest/message:send and /rest/message/send: the same
-        // verified-identity acceptance as the JSON-RPC surface. The
-        // legacy slash spelling splits into two segments — match it as
-        // ["message", "send"], never as a single segment containing
-        // the unsplit path.
+        // POST /rest/message:send and the slash spelling
+        // /rest/message/send: the same verified-identity acceptance as
+        // the JSON-RPC surface. The slash spelling splits into two
+        // segments — match it as ["message", "send"], never as a
+        // single segment containing the unsplit path.
         ["message:send"] | ["message", "send"] => {
             if method != axum::http::Method::POST {
                 return next.run(request).await;

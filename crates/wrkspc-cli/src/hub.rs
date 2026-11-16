@@ -584,22 +584,19 @@ struct HubCancel {
 }
 
 impl wrkspc_ui::CancelRequester for HubCancel {
-    fn request_cancel(
-        &self,
-        message_id: &str,
-        recipient_id: &str,
-        set_by: &str,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<CancelOutcome, String>> + Send + '_>> {
+    fn request_cancel<'a>(
+        &'a self,
+        message_id: &'a str,
+        recipient_id: &'a str,
+        set_by: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<CancelOutcome, String>> + Send + 'a>> {
         let store = self.store.clone();
-        let message_id = message_id.to_string();
-        let recipient_id = recipient_id.to_string();
-        let set_by = set_by.to_string();
         Box::pin(async move {
             // The hub-side intent (queued → canceled, with the feed
             // event). A mail-only message has no intent and nothing to
             // cancel here.
             let outcome = match store
-                .request_cancel(&message_id, &recipient_id, &set_by)
+                .request_cancel(message_id, recipient_id, set_by)
                 .await
             {
                 Ok(outcome) => outcome,
@@ -611,7 +608,7 @@ impl wrkspc_ui::CancelRequester for HubCancel {
             };
             // The delivery task the node polls: canceling it stops an
             // unclaimed delivery from ever executing.
-            let task_id = wrkspc_core::tasks::delivery_task_id(&message_id, &recipient_id);
+            let task_id = wrkspc_core::tasks::delivery_task_id(message_id, recipient_id);
             store
                 .task_mark_canceled(&task_id)
                 .await

@@ -51,16 +51,15 @@ pub(crate) async fn cancel_enveloped_work(store: &Store, task_id: &str) -> Resul
         // The row-level cancel below reports the not-found verdict.
         return Ok(());
     };
-    let blob: serde_json::Value = serde_json::from_str(&row.task_json)
-        .map_err(|error| A2AError::internal(error.to_string()))?;
-    let Some(message_id) = blob["metadata"]["delivery"]["message_id"].as_str() else {
-        return Ok(()); // no wrkspc delivery envelope: nothing to cancel
-    };
-    let Some(recipient) = blob["metadata"]["delivery"]["recipient_peer"].as_str() else {
+    // C2: the typed envelope — a blob without one carries nothing to
+    // cancel.
+    let Some(envelope) = wrkspc_core::DeliveryEnvelope::from_task_json(&row.task_json) else {
         return Ok(());
     };
+    let message_id = envelope.message_id;
+    let recipient = envelope.recipient_peer;
     match store
-        .request_cancel(message_id, recipient, "a2a-cancel")
+        .request_cancel(&message_id, &recipient, "a2a-cancel")
         .await
     {
         Ok(CancelOutcome::IntentCanceled) => {
@@ -154,9 +153,7 @@ impl AgentExecutor for WrkspcExecutor {
                     message_id: a2a::new_message_id(),
                     task_id: Some(ctx.task_id.clone()),
                     context_id: Some(ctx.context_id.clone()),
-                    parts: vec![Part::text(
-                        "accepted; awaiting wrkspc routing (pilot dispatcher, unit 5)".to_string(),
-                    )],
+                    parts: vec![Part::text("accepted; awaiting wrkspc routing".to_string())],
                     metadata: None,
                     extensions: None,
                     reference_task_ids: None,

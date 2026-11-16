@@ -130,12 +130,12 @@ mod tests {
     struct NoCancel;
 
     impl crate::api::CancelRequester for NoCancel {
-        fn request_cancel(
-            &self,
-            _message_id: &str,
-            _recipient_id: &str,
-            _set_by: &str,
-        ) -> Pin<Box<dyn Future<Output = Result<CancelOutcome, String>> + Send + '_>> {
+        fn request_cancel<'a>(
+            &'a self,
+            _message_id: &'a str,
+            _recipient_id: &'a str,
+            _set_by: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<CancelOutcome, String>> + Send + 'a>> {
             Box::pin(async { Ok(CancelOutcome::IntentCanceled) })
         }
     }

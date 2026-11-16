@@ -39,10 +39,15 @@ pub(crate) async fn delivery_claim(
         .await
     {
         Ok(wrkspc_core::DeliveryClaimOutcome::Claimed) => {
-            let payload: serde_json::Value =
-                serde_json::from_str(&task.task_json).unwrap_or_default();
-            if let Some(conversation_id) =
-                payload["metadata"]["delivery"]["conversation_id"].as_str()
+            let conversation_id = wrkspc_core::DeliveryEnvelope::from_task_json(&task.task_json)
+                .map(|envelope| envelope.conversation_id);
+            // Which peer's delivery this is. Every agent on a host
+            // presents the same client certificate, so the host alone
+            // cannot say whose mail was consumed — the envelope says.
+            let recipient_peer = wrkspc_core::DeliveryEnvelope::from_task_json(&task.task_json)
+                .map(|envelope| envelope.recipient_peer)
+                .unwrap_or_default();
+            if let Some(conversation_id) = conversation_id.as_deref()
                 && let Err(error) = state
                     .store
                     .append_event(
@@ -51,13 +56,7 @@ pub(crate) async fn delivery_claim(
                         &serde_json::json!({
                             "task_id": body.task_id,
                             "host": host,
-                            // Which peer's delivery this is. Every agent on a
-                            // host presents the same client certificate, so the
-                            // host alone cannot say whose mail was consumed.
-                            "recipient_peer": payload["metadata"]["delivery"]
-                                ["recipient_peer"]
-                                .as_str()
-                                .unwrap_or_default(),
+                            "recipient_peer": recipient_peer,
                         }),
                     )
                     .await
@@ -141,17 +140,18 @@ pub(crate) async fn delivery_ack(
         Ok(task) => task,
         Err((code, message)) => return (code, message).into_response(),
     };
+    // C2: the typed envelope — a payload without one is not a delivery
+    // task.
+    let Some(envelope) = wrkspc_core::DeliveryEnvelope::from_task_json(&task.task_json) else {
+        return (StatusCode::CONFLICT, "not a delivery task").into_response();
+    };
+    // The ack mutates the stored blob in place (status + acked_at), so
+    // the parsed shell is kept alongside the typed envelope.
     let payload: serde_json::Value = match serde_json::from_str(&task.task_json) {
-        Ok(value) => value,
+        Ok(payload) => payload,
         Err(_) => {
             return (StatusCode::CONFLICT, "task payload is not valid JSON").into_response();
         }
-    };
-    let Some(delivery) = payload
-        .get("metadata")
-        .and_then(|metadata| metadata.get("delivery"))
-    else {
-        return (StatusCode::CONFLICT, "not a delivery task").into_response();
     };
     if task.context_id != host {
         tracing::warn!(task_id = %body.task_id, %host, "delivery ack host mismatch");
@@ -165,10 +165,7 @@ pub(crate) async fn delivery_ack(
     // (execution_requested=false) create no attempt by design, so for
     // them receipt IS completion; executable deliveries stay working
     // until the node reports the attempt outcome.
-    let execution_requested = delivery
-        .get("execution_requested")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let execution_requested = envelope.execution_requested;
     if task.state == "working" {
         // Idempotent re-ack after a crash between the ack write and the
         // node's local processed marker.
@@ -214,22 +211,11 @@ pub(crate) async fn delivery_ack(
         }
     }
 
-    let (Some(message_id), Some(recipient_peer), Some(conversation_id)) = (
-        delivery
-            .get("message_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        delivery
-            .get("recipient_peer")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        delivery
-            .get("conversation_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-    ) else {
-        return (StatusCode::CONFLICT, "delivery payload is incomplete").into_response();
-    };
+    let (message_id, recipient_peer, conversation_id) = (
+        envelope.message_id,
+        envelope.recipient_peer,
+        envelope.conversation_id,
+    );
 
     // The fence: only after the delivery is durably recorded hub-side do
     // we transition the task. mark_delivered is idempotent, so a crashed
@@ -424,7 +410,9 @@ pub(crate) async fn delivery_report(
     // the status transitions.
     let mut reported = payload;
     reported["status"]["state"] = serde_json::Value::String(match body.state.as_str() {
-        "completed" => wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Completed).to_string(),
+        "completed" => {
+            wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Completed).to_string()
+        }
         "failed" => wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Failed).to_string(),
         _ => wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Canceled).to_string(),
     });

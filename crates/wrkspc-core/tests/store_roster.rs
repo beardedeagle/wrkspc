@@ -236,7 +236,10 @@ async fn presence_updates_name_and_pins_class() {
         .unwrap();
     assert_eq!(outcome, wrkspc_core::PresenceOutcome::Updated);
     let entry = store.roster_entry("codex").await.unwrap().unwrap();
-    assert_eq!(entry.name, "codex pro", "the binding's display name shows up");
+    assert_eq!(
+        entry.name, "codex pro",
+        "the binding's display name shows up"
+    );
 
     // Class drift: recorded, not applied.
     let outcome = store
@@ -248,7 +251,10 @@ async fn presence_updates_name_and_pins_class() {
     assert_eq!(entry.class, "harness", "class is authority-pinned");
 
     let log = store.moderation_log(10).await.unwrap();
-    assert!(log.iter().any(|event| event.action == "rename"), "rename is audited");
+    assert!(
+        log.iter().any(|event| event.action == "rename"),
+        "rename is audited"
+    );
     assert!(
         log.iter().any(|event| event.action == "class drift"),
         "class drift is audited"

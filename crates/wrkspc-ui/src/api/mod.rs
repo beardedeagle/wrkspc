@@ -36,12 +36,16 @@ pub(crate) mod peers;
 /// Cancellation seam into the dispatcher (the live session interrupt).
 pub trait CancelRequester: Send + Sync + 'static {
     /// Requests cancellation of a message's execution for a recipient.
-    fn request_cancel(
-        &self,
-        message_id: &str,
-        recipient_id: &str,
-        set_by: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<CancelOutcome, String>> + Send + '_>>;
+    ///
+    /// The explicit lifetime ties the future to the borrows so
+    /// implementors can capture the arguments by reference instead of
+    /// cloning (C16).
+    fn request_cancel<'a>(
+        &'a self,
+        message_id: &'a str,
+        recipient_id: &'a str,
+        set_by: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CancelOutcome, String>> + Send + 'a>>;
 }
 
 impl CancelRequester for DispatcherHandle {

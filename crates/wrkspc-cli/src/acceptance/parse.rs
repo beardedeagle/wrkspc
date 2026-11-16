@@ -60,10 +60,11 @@ pub(crate) fn parse_send(parsed: &serde_json::Value) -> Result<Option<ParsedSend
     for part in &message.parts {
         match &part.content {
             a2a::PartContent::Text(_) => {
-                if let Some(media_type) = part.media_type.as_deref() {
-                    if !media_type.is_empty() && !contract.iter().any(|mode| mode == media_type) {
-                        return Err(format!("unsupported text media type: {media_type}"));
-                    }
+                if let Some(media_type) = part.media_type.as_deref()
+                    && !media_type.is_empty()
+                    && !contract.iter().any(|mode| mode == media_type)
+                {
+                    return Err(format!("unsupported text media type: {media_type}"));
                 }
             }
             _ => {
@@ -201,7 +202,6 @@ mod tests {
             .is_ok()
         );
     }
-
 
     fn send_with_recipients(recipients: serde_json::Value) -> serde_json::Value {
         serde_json::json!({

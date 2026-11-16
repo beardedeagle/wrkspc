@@ -53,77 +53,52 @@ impl Delivery {
     /// The delivery, or `None` when the row is not a well-formed
     /// delivery payload.
     pub fn from_task_row(task: &TaskRow) -> Option<Self> {
-        let payload: serde_json::Value = match serde_json::from_str(&task.task_json) {
-            Ok(payload) => payload,
-            Err(error) => {
-                // Corrupt JSON must be visible to the operator, not
-                // silently skipped like a non-delivery row: a delivery
-                // this node should have mirrored is otherwise lost
-                // without a trace.
-                tracing::warn!(
-                    %error,
-                    task_id = %task.task_id,
-                    "delivery task payload is not valid JSON; skipping",
-                );
-                return None;
-            }
+        // C2: the typed envelope — a corrupt blob is visible to the
+        // operator, never silently skipped like a non-delivery row: a
+        // delivery this node should have mirrored is otherwise lost
+        // without a trace. A blob without the envelope or the delivery
+        // kind is malformed, never a different legitimate task type:
+        // log it so a wedged row is distinguishable from an empty
+        // queue.
+        let Some(envelope) = wrkspc_core::DeliveryEnvelope::from_task_json(&task.task_json) else {
+            tracing::warn!(
+                task_id = %task.task_id,
+                "delivery task payload carries no delivery envelope; skipping",
+            );
+            return None;
         };
-        let delivery = payload
-            .get("metadata")
-            .and_then(|metadata| metadata.get("delivery"))?;
-        if delivery.get("kind").and_then(|k| k.as_str()) != Some("delivery") {
-            // A row in this host's delivery queue that does not parse
-            // as a delivery is malformed, never a different legitimate
-            // task type: log it so a wedged row is distinguishable
-            // from an empty queue.
+        if envelope.kind != "delivery" {
             tracing::warn!(
                 task_id = %task.task_id,
                 "delivery task payload carries no delivery kind; skipping",
             );
             return None;
         }
-        let field = |key: &str| {
-            delivery
-                .get(key)
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        };
         Some(Self {
             task_id: task.task_id.clone(),
-            message_id: field("message_id")?,
-            origin_message_id: delivery
-                .get("origin_message_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            conversation_id: field("conversation_id")?,
-            sender_peer: field("sender_peer")?,
-            sender_name: field("sender_name").unwrap_or_default(),
-            sender_class: field("sender_class").unwrap_or_default(),
-            sender_host: field("sender_host")?,
-            recipient_peer: field("recipient_peer")?,
-            recipient_name: field("recipient_name").unwrap_or_default(),
-            recipient_class: field("recipient_class").unwrap_or_default(),
-            content: field("content").unwrap_or_default(),
-            execution_requested: delivery
-                .get("execution_requested")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            guidance: delivery
-                .get("guidance")
-                .and_then(|v| v.as_array())
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter_map(|entry| {
-                            Some((
-                                entry.get("id")?.as_str()?.to_string(),
-                                entry.get("author_id")?.as_str()?.to_string(),
-                                entry.get("text")?.as_str()?.to_string(),
-                            ))
-                        })
-                        .collect()
+            message_id: envelope.message_id,
+            origin_message_id: envelope.origin_message_id,
+            conversation_id: envelope.conversation_id,
+            sender_peer: envelope.sender_peer,
+            sender_name: envelope.sender_name,
+            sender_class: envelope.sender_class,
+            sender_host: envelope.sender_host,
+            recipient_peer: envelope.recipient_peer,
+            recipient_name: envelope.recipient_name,
+            recipient_class: envelope.recipient_class,
+            content: envelope.content,
+            execution_requested: envelope.execution_requested,
+            guidance: envelope
+                .guidance
+                .iter()
+                .filter_map(|entry| {
+                    Some((
+                        entry.get("id")?.as_str()?.to_string(),
+                        entry.get("author_id")?.as_str()?.to_string(),
+                        entry.get("text")?.as_str()?.to_string(),
+                    ))
                 })
-                .unwrap_or_default(),
+                .collect(),
         })
     }
 }
