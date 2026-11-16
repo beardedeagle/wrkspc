@@ -60,6 +60,44 @@ impl Store {
                 if status_is_ejected(&status) {
                     return Ok(PresenceOutcome::Ejected { status });
                 }
+                // C5: the node re-reports its binding every presence
+                // tick, and the docs make `harness` the display name —
+                // a changed binding shows up, with an audit row. The
+                // class is authority-pinned: a node only ever reports
+                // `harness`, so a different class is an anomaly —
+                // record the drift and change nothing.
+                let (stored_name, stored_class): (String, String) =
+                    sqlx::query_as("SELECT name, class FROM peers WHERE id = ?")
+                        .bind(peer_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                if stored_name != name {
+                    sqlx::query("UPDATE peers SET name = ? WHERE id = ?")
+                        .bind(name)
+                        .bind(peer_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    Self::log_moderation(
+                        &mut tx,
+                        peer_id,
+                        "system",
+                        "rename",
+                        Some(&stored_name),
+                        Some(name),
+                    )
+                    .await?;
+                }
+                if stored_class != class {
+                    Self::log_moderation(
+                        &mut tx,
+                        peer_id,
+                        "system",
+                        "class drift",
+                        Some(&stored_class),
+                        Some(class),
+                    )
+                    .await?;
+                }
                 // A deleted cohort entry stays deleted. The node re-reports
                 // its bindings every few seconds, so re-materialising on
                 // presence made delete look broken: the entry came back
