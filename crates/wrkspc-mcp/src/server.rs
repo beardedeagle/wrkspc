@@ -90,10 +90,112 @@ pub struct ReportWorkParams {
 /// stdio connections are bound by process ownership, HTTP connections by
 /// the listener's token allowlist. The store's own membership checks still
 /// enforce conversation boundaries.
+/// Peer-scoped store handle (C1-B): the compile-time surface one MCP
+/// server may touch for ITS authenticated peer. The docs promise an
+/// agent can do "exactly the tool surface wrkspc registers" — this
+/// type IS that promise, and it hosts the member-checked reads (C15)
+/// so membership and data access share one transaction.
 #[derive(Debug, Clone)]
-pub struct McpServer {
+pub struct PeerStore {
     store: Store,
     peer_id: String,
+}
+
+impl PeerStore {
+    /// Builds the peer-scoped handle.
+    pub fn new(store: Store, peer_id: impl Into<String>) -> Self {
+        Self {
+            store,
+            peer_id: peer_id.into(),
+        }
+    }
+
+    /// Posts a message under the bound peer's identity, through the
+    /// store's readiness fence (mirror-only in hub mode).
+    pub async fn accept_post(
+        &self,
+        conversation_id: &str,
+        idempotency_key: &str,
+        content: &str,
+        execution_requested: bool,
+        recipients: &[wrkspc_core::RecipientRequest],
+        hub_connected: bool,
+    ) -> wrkspc_core::Result<wrkspc_core::AcceptOutcome> {
+        if hub_connected {
+            self.store
+                .accept_message_mirror_only(
+                    conversation_id,
+                    &self.peer_id,
+                    idempotency_key,
+                    content,
+                    execution_requested,
+                    recipients,
+                )
+                .await
+        } else {
+            self.store
+                .accept_message(
+                    conversation_id,
+                    &self.peer_id,
+                    idempotency_key,
+                    content,
+                    execution_requested,
+                    recipients,
+                )
+                .await
+        }
+    }
+
+    /// The committed recipient list for one message.
+    pub async fn message_recipients(&self, message_id: &str) -> wrkspc_core::Result<Vec<String>> {
+        self.store.message_recipients(message_id).await
+    }
+
+    /// Membership-checked event read (C15): the check and the read
+    /// share one transaction.
+    pub async fn events_since(
+        &self,
+        conversation_id: &str,
+        after_seq: i64,
+        limit: i64,
+    ) -> wrkspc_core::Result<Vec<wrkspc_core::Event>> {
+        self.store
+            .events_since_for_member(conversation_id, &self.peer_id, after_seq, limit)
+            .await
+    }
+
+    /// Membership-checked event append (C15): the check and the write
+    /// share one transaction.
+    pub async fn append_event(
+        &self,
+        conversation_id: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> wrkspc_core::Result<i64> {
+        self.store
+            .append_event_as_member(conversation_id, &self.peer_id, kind, payload)
+            .await
+    }
+
+    /// The mirrored cohort roster (no membership gate).
+    pub async fn roster(&self) -> wrkspc_core::Result<Vec<wrkspc_core::RosterEntry>> {
+        self.store.roster().await
+    }
+
+    /// One peer's class for the routing summary.
+    pub async fn peer_class_of(&self, peer: &str) -> wrkspc_core::Result<Option<String>> {
+        self.store.peer_class_of(peer).await
+    }
+
+    /// The bound peer's id (payload attribution).
+    pub fn peer_id(&self) -> &str {
+        &self.peer_id
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServer {
+    store: PeerStore,
     /// A node running with `--hub` must not execute local work before
     /// hub acceptance: posts mirror locally (no execution intents) and
     /// execution happens only when the hub echoes a delivery this node
@@ -108,8 +210,7 @@ impl McpServer {
     /// local execution behind hub acceptance and delivery claims.
     pub fn new(store: Store, peer_id: impl Into<String>, hub_connected: bool) -> Self {
         Self {
-            store,
-            peer_id: peer_id.into(),
+            store: PeerStore::new(store, peer_id),
             hub_connected,
         }
     }
@@ -128,23 +229,9 @@ impl McpServer {
         Ok(())
     }
 
-    /// Asserts this peer is a conversation member before read/report access.
-    ///
-    /// # Errors
-    ///
-    /// Returns the rejection message when the peer is not a member.
-    async fn require_member(&self, conversation_id: &str) -> Result<(), String> {
-        let members = self
-            .store
-            .conversation_members(conversation_id)
-            .await
-            .map_err(store_error)?;
-        if !members.iter().any(|m| m == &self.peer_id) {
-            return Err(format!(
-                "peer is not a member of conversation {conversation_id}"
-            ));
-        }
-        Ok(())
+    /// The bound peer's id.
+    pub fn peer_id(&self) -> &str {
+        &self.store.peer_id
     }
 }
 
@@ -174,7 +261,7 @@ fn store_error(error: StoreError) -> String {
 /// message reached, and `execution_requested` says whether the caller asked
 /// for execution.
 async fn routing_summary(
-    store: &wrkspc_core::Store,
+    store: &PeerStore,
     verb: &str,
     message_id: &str,
     delivered: &[String],
@@ -249,35 +336,23 @@ impl McpServer {
                 execution_requested: params.execution_requested,
             })
             .collect::<Vec<_>>();
-        let outcome = if self.hub_connected {
-            // Hub mode: no local execution intents. The message mirrors
-            // locally and syncs to the hub; execution happens only when
-            // the hub accepts it (fences) and this node claims the
-            // echoed delivery.
-            self.store
-                .accept_message_mirror_only(
-                    &params.conversation_id,
-                    &self.peer_id,
-                    &params.idempotency_key,
-                    &params.content,
-                    params.execution_requested,
-                    &recipient_requests,
-                )
-                .await
-                .map_err(store_error)?
-        } else {
-            self.store
-                .accept_message(
-                    &params.conversation_id,
-                    &self.peer_id,
-                    &params.idempotency_key,
-                    &params.content,
-                    params.execution_requested,
-                    &recipient_requests,
-                )
-                .await
-                .map_err(store_error)?
-        };
+        // The peer-scoped handle posts under the bound identity and
+        // picks mirror-only in hub mode, where no local execution
+        // intents are created — execution happens only when the hub
+        // accepts the message (fences) and this node claims the echoed
+        // delivery.
+        let outcome = self
+            .store
+            .accept_post(
+                &params.conversation_id,
+                &params.idempotency_key,
+                &params.content,
+                params.execution_requested,
+                &recipient_requests,
+                self.hub_connected,
+            )
+            .await
+            .map_err(store_error)?;
         let (verb, message_id) = match outcome {
             AcceptOutcome::Accepted { message_id } => ("accepted", message_id),
             AcceptOutcome::Replay { message_id } => ("replay", message_id),
@@ -325,7 +400,7 @@ impl McpServer {
                 params.after_seq
             ));
         }
-        self.require_member(&params.conversation_id).await?;
+        // Membership and the read share one transaction (C15).
         let events = self
             .store
             .events_since(&params.conversation_id, params.after_seq, params.limit)
@@ -359,11 +434,11 @@ impl McpServer {
     )]
     async fn report_work(&self, params: Parameters<ReportWorkParams>) -> Result<String, String> {
         let Parameters(params) = params;
-        self.require_member(&params.conversation_id).await?;
         let payload = serde_json::json!({
-            "peer_id": self.peer_id,
+            "peer_id": self.store.peer_id(),
             "summary": params.summary,
         });
+        // Membership and the write share one transaction (C15).
         let seq = self
             .store
             .append_event(&params.conversation_id, "work.report", &payload)
@@ -456,7 +531,7 @@ impl HttpListener {
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let addr = listener.local_addr()?;
-        tracing::info!(%addr, peer = %self.server.peer_id, "wrkspc MCP http listener bound");
+        tracing::info!(%addr, peer = %self.server.peer_id(), "wrkspc MCP http listener bound");
 
         // Streamable HTTP: a tower service mounted at /mcp. Older clients
         // keep managed sessions; newer protocol versions are stateless. Each
