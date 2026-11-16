@@ -58,6 +58,14 @@ fn supported_interfaces(base_url: &str) -> Vec<AgentInterface> {
     ]
 }
 
+/// The surface contract — the ONE list feeding the card, the handler's
+/// content-type gate and the hub's acceptance parse (C11). A text part
+/// declaring a media type off this list, or any non-text part, is
+/// refused loudly instead of silently dropped.
+pub fn surface_contract() -> Vec<String> {
+    vec!["text/plain".to_string(), "text/markdown".to_string()]
+}
+
 /// Builds the pilot's v1.0 agent card.
 ///
 /// * `base_url` — the externally reachable base URL (scheme + host + port),
@@ -100,8 +108,8 @@ pub fn build_agent_card(base_url: &str, mtls: bool) -> AgentCard {
             output_modes: None,
             security_requirements: None,
         }],
-        default_input_modes: vec!["text/plain".to_string()],
-        default_output_modes: vec!["text/plain".to_string()],
+        default_input_modes: surface_contract(),
+        default_output_modes: surface_contract(),
         supported_interfaces: supported_interfaces(base_url),
         security_schemes,
         security_requirements,
@@ -154,8 +162,8 @@ pub fn build_peer_card(base_url: &str, entry: &wrkspc_core::RosterEntry, mtls: b
             output_modes: None,
             security_requirements: None,
         }],
-        default_input_modes: vec!["text/plain".to_string()],
-        default_output_modes: vec!["text/plain".to_string()],
+        default_input_modes: surface_contract(),
+        default_output_modes: surface_contract(),
         supported_interfaces: supported_interfaces(base_url),
         security_schemes,
         security_requirements,
@@ -435,10 +443,16 @@ impl A2aSurface {
     ///
     /// The router (JSON-RPC + REST + agent card).
     pub fn into_router(self, base_url: &str) -> axum::Router {
-        let handler = Arc::new(DefaultRequestHandler::new(
-            WrkspcExecutor::new(self.store.clone()),
-            WrkspcTaskStore::new(self.store),
-        ));
+        let handler = Arc::new(
+            DefaultRequestHandler::new(
+                WrkspcExecutor::new(self.store.clone()),
+                WrkspcTaskStore::new(self.store),
+            )
+            // C11: the handler enforces the same surface contract the
+            // cards advertise — a declared media type off the list is
+            // refused on the A2A leg, matching the hub's own parse.
+            .with_default_input_modes(surface_contract()),
+        );
         let card_producer = Arc::new(StaticAgentCard::new(build_agent_card(base_url, self.mtls)));
 
         axum::Router::new()

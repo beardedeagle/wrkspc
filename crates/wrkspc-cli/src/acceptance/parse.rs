@@ -50,6 +50,27 @@ pub(crate) fn parse_send(parsed: &serde_json::Value) -> Result<Option<ParsedSend
         .and_then(|value| value.as_str())
         .ok_or("message metadata is missing the sender peerId")?
         .to_string();
+    // C11: the surface contract is enforced at acceptance — a message
+    // with a non-text part, or a text part declaring a media type off
+    // the contract list, is refused loudly. Silently dropping those
+    // parts leaves the sender believing they arrived; a refusal tells
+    // it. The node's own sends declare no media type and are
+    // unaffected.
+    let contract = wrkspc_a2a::server::surface_contract();
+    for part in &message.parts {
+        match &part.content {
+            a2a::PartContent::Text(_) => {
+                if let Some(media_type) = part.media_type.as_deref() {
+                    if !media_type.is_empty() && !contract.iter().any(|mode| mode == media_type) {
+                        return Err(format!("unsupported text media type: {media_type}"));
+                    }
+                }
+            }
+            _ => {
+                return Err("messages may carry only text parts".to_string());
+            }
+        }
+    }
     let content = message
         .parts
         .iter()
@@ -124,6 +145,63 @@ pub(crate) fn host_from_identity(identity: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn send_with_parts(parts: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "SendMessage",
+            "params": {
+                "message": {
+                    "messageId": "m-1",
+                    "role": "ROLE_USER",
+                    "contextId": "conv-1",
+                    "parts": parts,
+                    "metadata": {
+                        "peerId": "node-test-1",
+                        "recipients": ["codex"],
+                        "executionRequested": true,
+                    },
+                },
+            },
+        })
+    }
+
+    /// C11: the surface contract is enforced at acceptance — a
+    /// non-text part and an unlisted declared media type are refused,
+    /// while the node's own sends (no declared type) stay accepted.
+    #[test]
+    fn surface_contract_gate_refuses_and_admits() {
+        // Non-text part: refused.
+        assert!(
+            parse_send(&send_with_parts(serde_json::json!([
+                {"kind": "file", "bytes": "aGk="},
+            ])))
+            .is_err()
+        );
+        // Text with an unlisted declared media type: refused.
+        assert!(
+            parse_send(&send_with_parts(serde_json::json!([
+                {"text": "hello", "mediaType": "application/json"},
+            ])))
+            .is_err()
+        );
+        // Text with a contracted media type: accepted.
+        assert!(
+            parse_send(&send_with_parts(serde_json::json!([
+                {"text": "hello", "mediaType": "text/markdown"},
+            ])))
+            .is_ok()
+        );
+        // No declared media type (the node's own send shape): accepted.
+        assert!(
+            parse_send(&send_with_parts(serde_json::json!([
+                {"text": "hello"},
+            ])))
+            .is_ok()
+        );
+    }
+
 
     fn send_with_recipients(recipients: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
