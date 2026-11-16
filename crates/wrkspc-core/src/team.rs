@@ -577,13 +577,17 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`StoreError::Db`] on failure.
-    pub async fn set_hub_unknown_decision(&self, attempt_id: &str, decision: &str) -> Result<bool> {
+    pub async fn set_hub_unknown_decision(
+        &self,
+        attempt_id: &str,
+        decision: crate::model::Reconciliation,
+    ) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE hub_unknown_attempts
              SET decision = ?, updated_at = ?
              WHERE attempt_id = ?",
         )
-        .bind(decision)
+        .bind(decision.as_str())
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(attempt_id)
         .execute(self.pool())
@@ -689,12 +693,26 @@ pub struct HubUnknownView {
     /// The dispatcher-recorded reason (redacted at the display boundary).
     pub stop_reason: String,
     /// The queued operator decision, when one exists.
-    pub decision: Option<String>,
+    pub decision: Option<crate::model::Reconciliation>,
 }
 
 /// Maps a `hub_unknown_attempts` row onto its view struct — the single
 /// mapper every mirror read shares.
 fn hub_unknown_view(row: sqlx::sqlite::SqliteRow) -> HubUnknownView {
+    let decision: Option<String> = row.get("decision");
+    // C4: decode the canonical literal at the row boundary; a value
+    // off the list must surface as None plus a loud log, never as a
+    // guess that reaches the poll queue.
+    let decision = match decision.as_deref() {
+        None => None,
+        Some(literal) => match crate::model::Reconciliation::from_literal(literal) {
+            Some(decision) => Some(decision),
+            None => {
+                tracing::warn!(%literal, "unknown reconciliation literal in hub_unknown_attempts");
+                None
+            }
+        },
+    };
     HubUnknownView {
         attempt_id: row.get("attempt_id"),
         task_id: row.get("task_id"),
@@ -702,7 +720,7 @@ fn hub_unknown_view(row: sqlx::sqlite::SqliteRow) -> HubUnknownView {
         recipient_id: row.get("recipient_id"),
         conversation_id: row.get("conversation_id"),
         stop_reason: row.get("stop_reason"),
-        decision: row.get("decision"),
+        decision,
     }
 }
 

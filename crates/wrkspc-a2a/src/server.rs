@@ -243,8 +243,8 @@ impl A2aSurface {
     /// * `listener` — a bound TCP listener.
     /// * `acceptor` — a configured [`tokio_rustls::TlsAcceptor`]; require
     ///   client certificates via rustls `WebPkiClientVerifier` for mTLS,
-    ///   or use [`crate::OptionalClientVerifier`] to request them without
-    ///   requiring them.
+    ///   or build one with `allow_unauthenticated()` to request them
+    ///   without requiring them (the hub's browser-bearing surface).
     /// * `base_url` — the externally reachable base URL with scheme
     ///   (e.g. `https://hub.example:8443`); the agent card derives from
     ///   it, so it must match the served transport. The card always

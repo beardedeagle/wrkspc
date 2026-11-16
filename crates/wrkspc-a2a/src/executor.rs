@@ -199,14 +199,18 @@ impl AgentExecutor for WrkspcExecutor {
             snapshot.insert(
                 "status".to_string(),
                 serde_json::json!({
-                    "state": "TASK_STATE_CANCELED",
+                    "state": crate::state_mapping::task_state_literal(&TaskState::Canceled),
                     "timestamp": chrono::Utc::now(),
                 }),
             );
             let canceled_json = serde_json::to_string(&snapshot)
                 .map_err(|error| A2AError::internal(error.to_string()))?;
             match store
-                .task_begin_cancel(&task_id, "TASK_STATE_CANCELED", &canceled_json)
+                .task_begin_cancel(
+                    &task_id,
+                    crate::state_mapping::task_state_literal(&TaskState::Canceled),
+                    &canceled_json,
+                )
                 .await
             {
                 Ok(_) => {}
@@ -214,7 +218,7 @@ impl AgentExecutor for WrkspcExecutor {
                 // when the store adapter already persisted the canceled
                 // state, this leg is idempotent.
                 Err(wrkspc_core::StoreError::TaskTerminal { state, .. })
-                    if state == "TASK_STATE_CANCELED" => {}
+                    if state == crate::state_mapping::task_state_literal(&TaskState::Canceled) => {}
                 Err(wrkspc_core::StoreError::TaskTerminal { task_id, state, .. }) => {
                     return Err(A2AError::task_not_cancelable(&format!(
                         "task {task_id} is terminal ({state}) and cannot be canceled"

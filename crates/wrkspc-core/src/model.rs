@@ -77,7 +77,7 @@ impl IntentState {
 /// Attempt lifecycle. Terminal states are immutable: re-applying the same
 /// terminal state is allowed (idempotent re-emission), a different state is
 /// rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AttemptState {
     Claimed,
     Dispatched,
@@ -112,13 +112,46 @@ impl AttemptState {
 }
 
 /// Operator decision resolving an unknown attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Carried typed end-to-end (C4): the API boundary parses the
+/// operator's decision into this enum exactly once, the queue and the
+/// poll wire carry the enum, and the DB stores only its canonical
+/// literal — garbage never reaches the reconciliation queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Reconciliation {
     /// The attempt is closed as failed and the intent returns to `queued`,
     /// allowing a fresh attempt under explicit operator authorization.
     Retry,
     /// The attempt is closed with the given terminal state.
     Close { state: AttemptState },
+}
+
+impl Reconciliation {
+    /// Returns the canonical DB literal for this decision.
+    pub fn as_str(self) -> String {
+        match self {
+            Reconciliation::Retry => "retry".to_string(),
+            Reconciliation::Close { state } => format!("close:{}", state.as_str()),
+        }
+    }
+
+    /// Parses a stored DB literal, refusing anything off the canonical
+    /// list instead of guessing.
+    pub fn from_literal(literal: &str) -> Option<Self> {
+        match literal {
+            "retry" => Some(Reconciliation::Retry),
+            "close:failed" => Some(Reconciliation::Close {
+                state: AttemptState::Failed,
+            }),
+            "close:completed" => Some(Reconciliation::Close {
+                state: AttemptState::Completed,
+            }),
+            "close:canceled" => Some(Reconciliation::Close {
+                state: AttemptState::Canceled,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Moderation fence kinds.

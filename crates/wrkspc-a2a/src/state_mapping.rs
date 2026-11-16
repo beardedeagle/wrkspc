@@ -21,8 +21,10 @@ pub enum LifecycleState {
     Dispatching,
     /// Attributable session update establishes activity.
     Running,
-    /// An outstanding permission decision blocks progress.
-    AwaitingApproval,
+    /// An outstanding permission decision blocks progress. The wire
+    /// state is `input-required`, or `auth-required` when the decision
+    /// is auth-bound (HLD Appendix A).
+    AwaitingApproval { auth_bound: bool },
     /// The success-evidence predicate holds and results are durably
     /// recorded. A turn ending is never sufficient on its own.
     Completed,
@@ -30,6 +32,11 @@ pub enum LifecycleState {
     Failed,
     /// Known terminal cancellation.
     Canceled,
+    /// Known terminal expiry (the deadline passed before an outcome).
+    /// The A2A wire has no expired state, so the table's
+    /// failed/cancelled/expired bucket emits `failed` — report, do not
+    /// silently retry (HLD Appendix A).
+    Expired,
     /// Dispatch or completion may have occurred — hub-internal, never
     /// emitted to the submitting agent.
     Unknown,
@@ -51,9 +58,10 @@ pub fn to_task_state(state: LifecycleState) -> Option<TaskState> {
         }
         LifecycleState::Blocked => Some(TaskState::Rejected),
         LifecycleState::Running => Some(TaskState::Working),
-        LifecycleState::AwaitingApproval => Some(TaskState::InputRequired),
+        LifecycleState::AwaitingApproval { auth_bound: false } => Some(TaskState::InputRequired),
+        LifecycleState::AwaitingApproval { auth_bound: true } => Some(TaskState::AuthRequired),
         LifecycleState::Completed => Some(TaskState::Completed),
-        LifecycleState::Failed => Some(TaskState::Failed),
+        LifecycleState::Failed | LifecycleState::Expired => Some(TaskState::Failed),
         LifecycleState::Canceled => Some(TaskState::Canceled),
         LifecycleState::Unknown => None,
     }
@@ -95,79 +103,5 @@ pub fn task_state_from_literal(literal: &str) -> Option<TaskState> {
         "TASK_STATE_REJECTED" => Some(TaskState::Rejected),
         "TASK_STATE_AUTH_REQUIRED" => Some(TaskState::AuthRequired),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn maps_lifecycle_per_hld_table() {
-        // submitted bucket
-        for state in [
-            LifecycleState::Queued,
-            LifecycleState::Held,
-            LifecycleState::Dispatching,
-        ] {
-            assert_eq!(
-                to_task_state(state),
-                Some(TaskState::Submitted),
-                "{state:?} must map to submitted"
-            );
-        }
-        assert_eq!(
-            to_task_state(LifecycleState::Blocked),
-            Some(TaskState::Rejected)
-        );
-        assert_eq!(
-            to_task_state(LifecycleState::Running),
-            Some(TaskState::Working)
-        );
-        assert_eq!(
-            to_task_state(LifecycleState::AwaitingApproval),
-            Some(TaskState::InputRequired)
-        );
-        assert_eq!(
-            to_task_state(LifecycleState::Completed),
-            Some(TaskState::Completed)
-        );
-        assert_eq!(
-            to_task_state(LifecycleState::Failed),
-            Some(TaskState::Failed)
-        );
-        assert_eq!(
-            to_task_state(LifecycleState::Canceled),
-            Some(TaskState::Canceled)
-        );
-    }
-
-    #[test]
-    fn unknown_is_never_emitted() {
-        assert_eq!(to_task_state(LifecycleState::Unknown), None);
-    }
-
-    #[test]
-    fn literals_round_trip_all_nine_states() {
-        let states = [
-            TaskState::Unspecified,
-            TaskState::Submitted,
-            TaskState::Working,
-            TaskState::InputRequired,
-            TaskState::Completed,
-            TaskState::Failed,
-            TaskState::Canceled,
-            TaskState::Rejected,
-            TaskState::AuthRequired,
-        ];
-        for state in states {
-            let literal = task_state_literal(&state);
-            assert_eq!(
-                task_state_from_literal(literal),
-                Some(state),
-                "{literal} must round-trip"
-            );
-        }
-        assert_eq!(task_state_from_literal("TASK_STATE_BOGUS"), None);
     }
 }

@@ -443,10 +443,15 @@ fn build_acceptor(
     for root in rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(ca)?)) {
         roots.add(root?)?;
     }
-    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
-    let verifier = wrkspc_a2a::OptionalClientVerifier::new(verifier);
+    // Requests but does not require client certificates: presented
+    // chains are verified against the CA roots, and connections with
+    // none complete unauthenticated. Route-level policy (the hub's
+    // stamp gate) still decides what those may reach.
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .allow_unauthenticated()
+        .build()?;
     let config = rustls::ServerConfig::builder()
-        .with_client_cert_verifier(Arc::new(verifier))
+        .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)?;
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }

@@ -95,13 +95,10 @@ pub(crate) async fn reconcile_attempt(
         .into_iter()
         .any(|view| view.attempt_id == attempt_id);
     if mirrored {
-        let decision_string = match decision {
-            Reconciliation::Retry => "retry".to_string(),
-            Reconciliation::Close { state } => format!("close:{}", state.as_str()),
-        };
+        // C4: the typed decision is stored, not a re-encoded string.
         let updated = state
             .store
-            .set_hub_unknown_decision(&attempt_id, &decision_string)
+            .set_hub_unknown_decision(&attempt_id, decision)
             .await
             .map_err(store_error)?;
         if !updated {

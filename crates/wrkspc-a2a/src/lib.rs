@@ -24,12 +24,6 @@ pub use server::{
 pub use state_mapping::LifecycleState;
 pub use store_adapter::WrkspcTaskStore;
 
-use rustls::DistinguishedName;
-use rustls::client::danger::HandshakeSignatureValid;
-use rustls::pki_types::{CertificateDer, UnixTime};
-use rustls::server::danger::ClientCertVerifier;
-use rustls::{DigitallySignedStruct, SignatureScheme};
-use std::sync::Arc;
 
 /// The per-connection policy verdict from the serve-loop callback.
 ///
@@ -46,70 +40,4 @@ pub enum PeerDecision {
     /// Serve the connection, stamping every request with this
     /// identity.
     Stamped(String),
-}
-
-/// A client-certificate verifier that requests but does not require a
-/// certificate: connections presenting a chain are verified against
-/// `inner`'s trust anchors, and connections presenting none complete
-/// the handshake unauthenticated.
-///
-/// The hub uses this so its TLS surface can serve both the mTLS A2A
-/// routes and the browser UI; route-level policy (the hub's stamp
-/// gate) still decides what an unauthenticated connection may reach.
-#[derive(Debug)]
-pub struct OptionalClientVerifier {
-    inner: Arc<dyn ClientCertVerifier>,
-}
-
-impl OptionalClientVerifier {
-    /// Wraps `inner`, the verifier used for presented chains.
-    pub fn new(inner: Arc<dyn ClientCertVerifier>) -> Self {
-        Self { inner }
-    }
-}
-
-impl ClientCertVerifier for OptionalClientVerifier {
-    fn offer_client_auth(&self) -> bool {
-        true
-    }
-
-    fn client_auth_mandatory(&self) -> bool {
-        false
-    }
-
-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        self.inner.root_hint_subjects()
-    }
-
-    fn verify_client_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        now: UnixTime,
-    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        self.inner
-            .verify_client_cert(end_entity, intermediates, now)
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.inner.supported_verify_schemes()
-    }
 }

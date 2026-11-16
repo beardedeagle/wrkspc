@@ -51,6 +51,14 @@ pub struct NodeRunArgs {
     /// silently clamped zero would hammer the hub with no warning.
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
     pub poll_interval_secs: u64,
+    /// Seconds one session lookup may take (spawn, initialize, model
+    /// pin) before the dispatcher records an unknown attempt. Harness
+    /// cold start differs by harness and machine, so the default is a
+    /// generous guess; lower it on fast local drills. Too low a value
+    /// produces unknown attempts that block the recipient until
+    /// reconciliation. Zero is rejected at parse time.
+    #[arg(long, default_value_t = 45, value_parser = clap::value_parser!(u64).range(1..))]
+    pub lookup_timeout_secs: u64,
     /// This node's operator-identity name: the Keychain account key for
     /// its UI token (`wrkspc.<name>`). Defaults to the bare host name,
     /// or `default`. Distinct nodes on one machine need distinct names
@@ -167,7 +175,14 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
         args.hub.is_some(),
     ));
     let (dispatcher, dispatcher_handle) =
-        Dispatcher::new(store.clone(), provider.clone(), DispatcherConfig::default());
+        Dispatcher::new(
+            store.clone(),
+            provider.clone(),
+            DispatcherConfig {
+                lookup_timeout: std::time::Duration::from_secs(args.lookup_timeout_secs),
+                ..DispatcherConfig::default()
+            },
+        );
 
     // Operator token: an explicit `--ui-token-file` wins (the deploy
     // wrapper's tmpfs handoff), then WRKSPC_UI_TOKEN, then the

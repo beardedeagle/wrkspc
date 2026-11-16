@@ -1,6 +1,7 @@
 //! The claim and ack route handlers.
 
 use super::{AckRequest, DeliveryReport, DeliveryState, delivery_task, stamped_host};
+use a2a::TaskState;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -252,7 +253,9 @@ pub(crate) async fn delivery_ack(
     acked["metadata"]["delivery"]["acked_at"] =
         serde_json::Value::String(chrono::Utc::now().to_rfc3339());
     if execution_requested {
-        acked["status"]["state"] = serde_json::Value::String("TASK_STATE_WORKING".to_string());
+        acked["status"]["state"] = serde_json::Value::String(
+            wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Working).to_string(),
+        );
         if let Err(error) = state
             .store
             .task_update(&body.task_id, "working", false, &acked.to_string())
@@ -262,7 +265,9 @@ pub(crate) async fn delivery_ack(
             return (StatusCode::INTERNAL_SERVER_ERROR, "delivery ack failed").into_response();
         }
     } else {
-        acked["status"]["state"] = serde_json::Value::String("TASK_STATE_COMPLETED".to_string());
+        acked["status"]["state"] = serde_json::Value::String(
+            wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Completed).to_string(),
+        );
         if let Err(error) = state
             .store
             .task_update(&body.task_id, "completed", true, &acked.to_string())
@@ -419,9 +424,9 @@ pub(crate) async fn delivery_report(
     // the status transitions.
     let mut reported = payload;
     reported["status"]["state"] = serde_json::Value::String(match body.state.as_str() {
-        "completed" => "TASK_STATE_COMPLETED".to_string(),
-        "failed" => "TASK_STATE_FAILED".to_string(),
-        _ => "TASK_STATE_CANCELED".to_string(),
+        "completed" => wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Completed).to_string(),
+        "failed" => wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Failed).to_string(),
+        _ => wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Canceled).to_string(),
     });
     reported["metadata"]["attempt"] = serde_json::json!({
         "attempt_id": body.attempt_id,

@@ -329,24 +329,10 @@ pub async fn run_poll_loop(
                     }
                 };
                 for decision in decisions {
-                    let Some(encoded) = decision.decision.as_deref() else {
-                        continue;
-                    };
-                    let reconciliation = match encoded {
-                        "retry" => Some(wrkspc_core::Reconciliation::Retry),
-                        "close:failed" => Some(wrkspc_core::Reconciliation::Close {
-                            state: wrkspc_core::AttemptState::Failed,
-                        }),
-                        "close:completed" => Some(wrkspc_core::Reconciliation::Close {
-                            state: wrkspc_core::AttemptState::Completed,
-                        }),
-                        "close:canceled" => Some(wrkspc_core::Reconciliation::Close {
-                            state: wrkspc_core::AttemptState::Canceled,
-                        }),
-                        _ => None,
-                    };
-                    let Some(reconciliation) = reconciliation else {
-                        tracing::warn!(%encoded, attempt_id = %decision.attempt_id, "unknown reconciliation decision");
+                    // C4: the decision is typed on the wire — the parse
+                    // happened once at the API boundary; an undecided
+                    // mirror simply has no decision yet.
+                    let Some(reconciliation) = decision.decision else {
                         continue;
                     };
                     match store

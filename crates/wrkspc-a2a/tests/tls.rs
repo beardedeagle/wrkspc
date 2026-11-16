@@ -92,11 +92,11 @@ fn mtls_acceptor(pki: &TestPki) -> tokio_rustls::TlsAcceptor {
 fn optional_acceptor(pki: &TestPki) -> tokio_rustls::TlsAcceptor {
     let (server_cert, server_key, roots) = acceptor_material(pki);
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .allow_unauthenticated()
         .build()
         .unwrap();
-    let verifier = wrkspc_a2a::OptionalClientVerifier::new(verifier);
     let config = rustls::ServerConfig::builder()
-        .with_client_cert_verifier(Arc::new(verifier))
+        .with_client_cert_verifier(verifier)
         .with_single_cert(vec![server_cert], server_key)
         .unwrap();
     tokio_rustls::TlsAcceptor::from(Arc::new(config))

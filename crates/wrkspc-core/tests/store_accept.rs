@@ -891,7 +891,12 @@ async fn hub_unknown_mirror_round_trip() {
 
     assert!(
         store
-            .set_hub_unknown_decision("att-1", "close:failed")
+            .set_hub_unknown_decision(
+                "att-1",
+                wrkspc_core::Reconciliation::Close {
+                    state: wrkspc_core::AttemptState::Failed,
+                },
+            )
             .await
             .unwrap()
     );
@@ -900,7 +905,12 @@ async fn hub_unknown_mirror_round_trip() {
         .await
         .unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].decision.as_deref(), Some("close:failed"));
+    assert_eq!(
+        pending[0].decision,
+        Some(wrkspc_core::Reconciliation::Close {
+            state: wrkspc_core::AttemptState::Failed,
+        }),
+    );
 
     // The terminal report consumes the mirror, scoped to the (attempt,
     // task, host) tuple the reporting node presented.
@@ -914,7 +924,7 @@ async fn hub_unknown_mirror_round_trip() {
     assert!(store.hub_unknowns().await.unwrap().is_empty());
     assert!(
         !store
-            .set_hub_unknown_decision("att-1", "retry")
+            .set_hub_unknown_decision("att-1", wrkspc_core::Reconciliation::Retry)
             .await
             .unwrap(),
         "a consumed mirror row has no decision to set"
