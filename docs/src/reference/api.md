@@ -4,7 +4,7 @@ The operator API is the hub's management surface: conversations,
 moderation, and inspection. `POST /api/login` is the one exception to
 the token rule — it exchanges the bearer token (pasted from the login
 card) for the HttpOnly session cookie; every other route requires the
-operator bearer token or that cookie. On the node and the standalone
+operator bearer token or that cookie; a cookie-authenticated unsafe request must also carry the `X-Wrkspc-Request: 1` guard header (the embedded SPA always sends it). On the node and the standalone
 hub `--ui` listener that is a loopback HTTP gate; on the hub's TLS
 listener the UI rides HTTPS with the browser's client certificate
 optional. `POST /api/conversations` is hub-only (the node role 404s

@@ -274,7 +274,7 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                             let denied = certs
                                 .first()
                                 .and_then(cert_serial_hex)
-                                .is_some_and(|serial| read_deny(&denied).contains(&serial));
+                                .is_some_and(|serial| serial_denied(&denied, &serial));
                             if denied {
                                 wrkspc_a2a::PeerDecision::Deny
                             } else {
@@ -344,7 +344,7 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                                                     .headers()
                                                     .get("x-wrkspc-serial")
                                                     .and_then(|value| value.to_str().ok())
-                                                    && read_deny(&revoked).contains(serial)
+                                                    && serial_denied(&revoked, serial)
                                                 {
                                                     return match axum::response::Response::builder()
                                                         .status(axum::http::StatusCode::FORBIDDEN)
@@ -412,16 +412,19 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
 ///
 /// Poison here is an unrecoverable invariant violation — a writer
 /// panicked mid-update — and reading possibly torn set state could
-/// MISS a revoked serial (allowing a denied peer), so the read panics
-/// deliberately instead of recovering. This is the hub's single
-/// reviewed invariant-panic site.
-#[allow(clippy::panic)]
-fn read_deny(
-    denied: &wrkspc_ui::RevocationSet,
-) -> std::sync::RwLockReadGuard<'_, std::collections::HashSet<String>> {
+/// Fails CLOSED on a poisoned deny lock: a torn set must never let a
+/// revoked serial through, so poison means deny-all plus a loud log,
+/// never a panic. The next re-sync clears the poison (self-healing).
+fn serial_denied(denied: &wrkspc_ui::RevocationSet, serial: &str) -> bool {
     match denied.live.read() {
-        Ok(guard) => guard,
-        Err(poisoned) => panic!("deny lock poisoned: {poisoned}"),
+        Ok(guard) => guard.contains(serial),
+        Err(poisoned) => {
+            tracing::error!(
+                %poisoned,
+                "deny lock poisoned — denying all certificate clients until the next re-sync",
+            );
+            true
+        }
     }
 }
 

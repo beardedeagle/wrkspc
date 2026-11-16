@@ -157,15 +157,21 @@ pub(crate) async fn patch_peer(
                     let mut set: std::collections::HashSet<String> =
                         deny.floor.iter().cloned().collect();
                     set.extend(serials);
-                    // The set is rebuilt in full below, so recovering a
-                    // poisoned guard is safe: any partially-mutated
-                    // content is replaced wholesale.
-                    let mut live = deny
-                        .live
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    live.clear();
-                    live.extend(set);
+                    // Whole-value assignment: the finished set is built
+                    // off-lock above, then swapped in ONE step, so no
+                    // code that could panic runs under the write lock
+                    // and no partially-mutated content can ever exist.
+                    {
+                        let mut live = deny
+                            .live
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *live = set;
+                    }
+                    // Self-healing: the re-sync clears a poisoned flag,
+                    // so deny-all (the fail-closed read) ends with the
+                    // next operator action instead of a restart.
+                    deny.live.clear_poison();
                 }
                 Err(error) => {
                     tracing::warn!(%error, "deny-set re-sync failed; the live set may lag the store");

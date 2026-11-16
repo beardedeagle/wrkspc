@@ -88,3 +88,83 @@ async fn serves_the_static_ui() {
     );
     let _ = ui.shutdown.send(());
 }
+
+/// C17: a cookie-authenticated unsafe request without the SPA guard
+/// header is refused (a cross-site page cannot forge the header without
+/// a preflight, and no CORS layer exists to approve one); the same
+/// request with the header succeeds, and bearer clients are untouched.
+#[tokio::test]
+async fn cookie_unsafe_requests_require_the_guard_header() {
+    let ui = spawn_ui_hub().await;
+    // Login: capture the HttpOnly SameSite cookie.
+    let login = ui
+        .client()
+        .post(format!("{}/api/login", ui.base))
+        .json(&serde_json::json!({ "token": TOKEN }))
+        .send()
+        .await
+        .unwrap();
+    assert!(login.status().is_success(), "got {}", login.status());
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Setup as bearer: one conversation to post into.
+    let created = ui
+        .client()
+        .post(format!("{}/api/conversations", ui.base))
+        .bearer_auth(TOKEN)
+        .json(&serde_json::json!({ "members": ["operator"] }))
+        .send()
+        .await
+        .unwrap();
+    assert!(created.status().is_success(), "got {}", created.status());
+    let conversation_id = created
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let url = format!("{}/api/conversations/{conversation_id}/messages", ui.base);
+
+    // Cookie without the guard header: refused.
+    let refused = ui
+        .client()
+        .post(&url)
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "content": "no guard", "recipients": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Cookie WITH the guard header: accepted.
+    let accepted = ui
+        .client()
+        .post(&url)
+        .header("cookie", &cookie)
+        .header("X-Wrkspc-Request", "1")
+        .json(&serde_json::json!({ "content": "guarded", "recipients": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert!(accepted.status().is_success(), "got {}", accepted.status());
+
+    // Bearer without the header: untouched by the gate.
+    let bearer = ui
+        .client()
+        .post(&url)
+        .bearer_auth(TOKEN)
+        .json(&serde_json::json!({ "content": "bearer path", "recipients": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert!(bearer.status().is_success(), "got {}", bearer.status());
+
+    let _ = ui.shutdown.send(());
+}

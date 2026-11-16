@@ -240,6 +240,48 @@ impl UiServer {
                             }
                         };
                     }
+                    // C17: a cookie-authenticated UNSAFE request must
+                    // carry the SPA guard header — a cross-site page
+                    // cannot add it without a preflight, and no CORS
+                    // layer exists to approve one. The Sec-Fetch-Site
+                    // check is the second layer, so a future CORS
+                    // mistake cannot reopen the hole. Bearer clients
+                    // and safe methods are untouched.
+                    let cookie_only = cookie_ok && !header_ok;
+                    let unsafe_method = !matches!(
+                        request.method(),
+                        &axum::http::Method::GET
+                            | &axum::http::Method::HEAD
+                            | &axum::http::Method::OPTIONS
+                    );
+                    if cookie_only && unsafe_method {
+                        let guarded = request
+                            .headers()
+                            .get("x-wrkspc-request")
+                            .and_then(|value| value.to_str().ok())
+                            == Some("1");
+                        let fetch_site_ok = request
+                            .headers()
+                            .get("sec-fetch-site")
+                            .map(|value| {
+                                let value = value.to_str().unwrap_or_default();
+                                value.eq_ignore_ascii_case("same-origin")
+                                    || value.eq_ignore_ascii_case("none")
+                            })
+                            .unwrap_or(true);
+                        if !guarded || !fetch_site_ok {
+                            let response = axum::response::Response::builder()
+                                .status(axum::http::StatusCode::FORBIDDEN)
+                                .header("content-type", "text/plain; charset=utf-8")
+                                .body(axum::body::Body::from("cross-site request refused"));
+                            return match response {
+                                Ok(response) => response,
+                                Err(error) => {
+                                    unreachable!("static forbidden response failed: {error}")
+                                }
+                            };
+                        }
+                    }
                     // Authenticated API payloads (cookie-authed
                     // transcripts, rosters) must not be heuristically
                     // cached by a shared cache or the browser: the
