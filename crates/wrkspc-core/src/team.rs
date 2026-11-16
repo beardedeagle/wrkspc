@@ -136,18 +136,68 @@ impl Store {
                 id: request.sender_peer.to_string(),
             })?;
         let mut queued = 0;
+        // C6-B: batch the per-recipient probes into chunked IN queries
+        // — one canceled-intent probe, one peer lookup, and one task
+        // probe per CHUNK instead of per recipient. The create below
+        // still runs only for genuinely new remote tasks.
+        let mut canceled: std::collections::HashSet<String> = Default::default();
+        let mut details: std::collections::HashMap<String, (String, String, String)> =
+            Default::default();
+        let mut existing_tasks: std::collections::HashSet<String> = Default::default();
+        for chunk in request.recipients.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+
+            let sql = format!(
+                "SELECT recipient_id FROM execution_intents
+                 WHERE message_id = ? AND state = 'canceled'
+                   AND recipient_id IN ({placeholders})",
+            );
+            let mut query =
+                sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(request.message_id);
+            for peer in chunk {
+                query = query.bind(peer);
+            }
+            for peer in query.fetch_all(self.pool()).await? {
+                canceled.insert(peer);
+            }
+
+            let sql = format!(
+                "SELECT id, name, class, host_id FROM peers WHERE id IN ({placeholders})",
+            );
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for peer in chunk {
+                query = query.bind(peer);
+            }
+            for row in query.fetch_all(self.pool()).await? {
+                details.insert(
+                    row.get("id"),
+                    (row.get("name"), row.get("class"), row.get("host_id")),
+                );
+            }
+
+            let task_ids: Vec<String> = chunk
+                .iter()
+                .map(|peer| crate::tasks::delivery_task_id(request.message_id, peer))
+                .collect();
+            let sql = format!(
+                "SELECT task_id FROM a2a_tasks WHERE task_id IN ({})",
+                vec!["?"; task_ids.len()].join(", "),
+            );
+            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
+            for task_id in &task_ids {
+                query = query.bind(task_id);
+            }
+            for task_id in query.fetch_all(self.pool()).await? {
+                existing_tasks.insert(task_id);
+            }
+        }
         for peer_id in request.recipients {
             // An operator-canceled intent must not be fanned out (the
             // delivery task is the node's execution channel).
-            if self
-                .recipient_intent_canceled(request.message_id, peer_id)
-                .await?
-            {
+            if canceled.contains(peer_id) {
                 continue;
             }
-            let Some((recipient_name, recipient_class, peer_host)) =
-                self.peer_details(peer_id).await?
-            else {
+            let Some((recipient_name, recipient_class, peer_host)) = details.get(peer_id) else {
                 continue;
             };
             if peer_host == request.local_host {
@@ -159,14 +209,14 @@ impl Store {
             // count as one (the documented return is the number of
             // delivery tasks created).
             let task_id = crate::tasks::delivery_task_id(request.message_id, peer_id);
-            if self.task_get(&task_id).await?.is_some() {
+            if existing_tasks.contains(&task_id) {
                 continue;
             }
             self.task_create_delivery(DeliveryTaskRequest {
-                recipient_host: &peer_host,
+                recipient_host: peer_host,
                 recipient_peer: peer_id,
-                recipient_name: &recipient_name,
-                recipient_class: &recipient_class,
+                recipient_name,
+                recipient_class,
                 message_id: request.message_id,
                 origin_message_id: request.origin_message_id,
                 conversation_id: request.conversation_id,
@@ -204,44 +254,137 @@ impl Store {
     ///
     /// Returns [`StoreError::Db`] on failure.
     pub async fn repair_remote_fanout(&self, local_host: &str) -> Result<usize> {
-        let rows = sqlx::query(
-            "SELECT m.id AS message_id, m.idempotency_key, m.conversation_id,
-                    m.sender_id, m.content, m.execution_requested, r.peer_id,
-                    p.name AS recipient_name, p.class AS recipient_class,
-                    p.host_id AS recipient_host
-             FROM message_recipients r
-             JOIN messages m ON m.id = r.message_id
-             JOIN peers p ON p.id = r.peer_id
-             WHERE p.host_id != ?",
-        )
-        .bind(local_host)
-        .fetch_all(self.pool())
-        .await?;
+        // C6-C: the scan pages over the (message_id, peer_id) keyset —
+        // the repair cost no longer grows with history in one
+        // unbounded fetch — and each page reuses the batched probes.
+        let page_size: i64 = 400;
+        let mut last_message: String = String::new();
+        let mut last_peer: String = String::new();
         let mut repaired = 0;
-        for row in rows {
-            let message_id: String = row.get("message_id");
-            let recipient_peer: String = row.get("peer_id");
-            // An operator-canceled turn must never be re-created by a
-            // repair pass (H-10): the fan-out is the execution channel,
-            // and a canceled intent means the recipient must not run it.
-            if self
-                .recipient_intent_canceled(&message_id, &recipient_peer)
-                .await?
-            {
-                continue;
+        loop {
+            let rows = sqlx::query(
+                "SELECT m.id AS message_id, m.idempotency_key, m.conversation_id,
+                        m.sender_id, m.content, m.execution_requested, r.peer_id,
+                        p.name AS recipient_name, p.class AS recipient_class,
+                        p.host_id AS recipient_host
+                 FROM message_recipients r
+                 JOIN messages m ON m.id = r.message_id
+                 JOIN peers p ON p.id = r.peer_id
+                 WHERE p.host_id != ?
+                   AND (r.message_id, r.peer_id) > (?, ?)
+                 ORDER BY r.message_id, r.peer_id
+                 LIMIT ?",
+            )
+            .bind(local_host)
+            .bind(&last_message)
+            .bind(&last_peer)
+            .bind(page_size)
+            .fetch_all(self.pool())
+            .await?;
+            if rows.is_empty() {
+                break;
             }
-            let task_id = crate::tasks::delivery_task_id(&message_id, &recipient_peer);
-            if self.task_get(&task_id).await?.is_some() {
-                continue;
+            let page_last = rows.last().expect("non-empty page has a last row");
+            last_message = page_last.get("message_id");
+            last_peer = page_last.get("peer_id");
+
+            // Batched probes for the page: canceled intents grouped by
+            // message, deterministic task ids, and the distinct
+            // senders' details.
+            let mut canceled: std::collections::HashSet<(String, String)> = Default::default();
+            let mut by_message: std::collections::HashMap<
+                String,
+                Vec<String>,
+            > = Default::default();
+            for row in &rows {
+                by_message
+                    .entry(row.get::<String, _>("message_id"))
+                    .or_default()
+                    .push(row.get("peer_id"));
             }
-            let sender_peer: String = row.get("sender_id");
-            let (sender_name, sender_class, sender_host) = self
-                .peer_details(&sender_peer)
-                .await?
-                .ok_or_else(|| StoreError::NotFound {
-                entity: "peer",
-                id: sender_peer.clone(),
-            })?;
+            for (message_id, peers) in &by_message {
+                let placeholders = vec!["?"; peers.len()].join(", ");
+                let sql = format!(
+                    "SELECT recipient_id FROM execution_intents
+                     WHERE message_id = ? AND state = 'canceled'
+                       AND recipient_id IN ({placeholders})",
+                );
+                let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
+                    .bind(message_id);
+                for peer in peers {
+                    query = query.bind(peer);
+                }
+                for peer in query.fetch_all(self.pool()).await? {
+                    canceled.insert((message_id.clone(), peer));
+                }
+            }
+            let task_ids: Vec<String> = rows
+                .iter()
+                .map(|row| {
+                    crate::tasks::delivery_task_id(
+                        &row.get::<String, _>("message_id"),
+                        &row.get::<String, _>("peer_id"),
+                    )
+                })
+                .collect();
+            let mut existing: std::collections::HashSet<String> = Default::default();
+            let sql = format!(
+                "SELECT task_id FROM a2a_tasks WHERE task_id IN ({})",
+                vec!["?"; task_ids.len()].join(", "),
+            );
+            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
+            for task_id in &task_ids {
+                query = query.bind(task_id);
+            }
+            for task_id in query.fetch_all(self.pool()).await? {
+                existing.insert(task_id);
+            }
+            let senders: Vec<String> = {
+                let mut set: std::collections::HashSet<String> = Default::default();
+                for row in &rows {
+                    set.insert(row.get("sender_id"));
+                }
+                set.into_iter().collect()
+            };
+            let mut sender_details: std::collections::HashMap<String, (String, String, String)> =
+                Default::default();
+            let placeholders = vec!["?"; senders.len()].join(", ");
+            let sql = format!(
+                "SELECT id, name, class, host_id FROM peers WHERE id IN ({placeholders})",
+            );
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for sender in &senders {
+                query = query.bind(sender);
+            }
+            for row in query.fetch_all(self.pool()).await? {
+                sender_details.insert(
+                    row.get("id"),
+                    (row.get("name"), row.get("class"), row.get("host_id")),
+                );
+            }
+
+            for row in &rows {
+                let message_id: String = row.get("message_id");
+                let recipient_peer: String = row.get("peer_id");
+                // An operator-canceled turn must never be re-created by
+                // a repair pass (H-10): the fan-out is the execution
+                // channel, and a canceled intent means the recipient
+                // must not run it.
+                if canceled.contains(&(message_id.clone(), recipient_peer.clone())) {
+                    continue;
+                }
+                let task_id = crate::tasks::delivery_task_id(&message_id, &recipient_peer);
+                if existing.contains(&task_id) {
+                    continue;
+                }
+                let sender_peer: String = row.get("sender_id");
+                let (sender_name, sender_class, sender_host) = sender_details
+                    .get(&sender_peer)
+                    .cloned()
+                    .ok_or_else(|| StoreError::NotFound {
+                        entity: "peer",
+                        id: sender_peer.clone(),
+                    })?;
             // The sender wire-message identity survives in
             // `messages.idempotency_key` for node-originated sends (the
             // A2A acceptance key IS the node's wire message id). A
@@ -253,31 +396,32 @@ impl Store {
             // UI) have no node-side origin: their key is a fresh
             // acceptance id, not a wire identity, and must not ride as
             // the origin.
-            let origin_message_id =
-                (sender_host != local_host).then(|| row.get::<String, _>("idempotency_key"));
-            let recipient_host: String = row.get("recipient_host");
-            let recipient_name: String = row.get("recipient_name");
-            let recipient_class: String = row.get("recipient_class");
-            let conversation_id: String = row.get("conversation_id");
-            let content: String = row.get("content");
-            let execution_requested: bool = row.get("execution_requested");
-            self.task_create_delivery(DeliveryTaskRequest {
-                recipient_host: &recipient_host,
-                recipient_peer: &recipient_peer,
-                recipient_name: &recipient_name,
-                recipient_class: &recipient_class,
-                message_id: &message_id,
-                origin_message_id: origin_message_id.as_deref(),
-                conversation_id: &conversation_id,
-                sender_peer: &sender_peer,
-                sender_name: &sender_name,
-                sender_class: &sender_class,
-                sender_host: &sender_host,
-                content: &content,
-                execution_requested,
-            })
-            .await?;
-            repaired += 1;
+                let origin_message_id =
+                    (sender_host != local_host).then(|| row.get::<String, _>("idempotency_key"));
+                let recipient_host: String = row.get("recipient_host");
+                let recipient_name: String = row.get("recipient_name");
+                let recipient_class: String = row.get("recipient_class");
+                let conversation_id: String = row.get("conversation_id");
+                let content: String = row.get("content");
+                let execution_requested: bool = row.get("execution_requested");
+                self.task_create_delivery(DeliveryTaskRequest {
+                    recipient_host: &recipient_host,
+                    recipient_peer: &recipient_peer,
+                    recipient_name: &recipient_name,
+                    recipient_class: &recipient_class,
+                    message_id: &message_id,
+                    origin_message_id: origin_message_id.as_deref(),
+                    conversation_id: &conversation_id,
+                    sender_peer: &sender_peer,
+                    sender_name: &sender_name,
+                    sender_class: &sender_class,
+                    sender_host: &sender_host,
+                    content: &content,
+                    execution_requested,
+                })
+                .await?;
+                repaired += 1;
+            }
         }
         Ok(repaired)
     }
