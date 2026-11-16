@@ -91,7 +91,7 @@ fn node_identity(node_name: Option<&str>, host_id: Option<&str>) -> String {
     }
 }
 
-/// Runs the pilot node until ctrl-c.
+/// Runs the node until ctrl-c.
 ///
 /// Takes `args`, the parsed run arguments.
 ///
@@ -106,7 +106,7 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
     let db = canonical_db_path(&args.db)?;
     let store = Store::open(&db, "wrkspc-node").await?;
 
-    // Enrolled peers + the pilot conversation (fresh databases only).
+    // Enrolled peers + the starter conversation (fresh databases only).
     store.ensure_peer("operator", "operator", "human").await?;
     let mut peer_ids = vec!["operator".to_string()];
     for binding in &bindings.binding {
@@ -118,7 +118,7 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
     if store.list_conversations().await?.is_empty() {
         let refs: Vec<&str> = peer_ids.iter().map(String::as_str).collect();
         let conversation_id = store.create_conversation(&refs).await?;
-        tracing::info!(%conversation_id, "created pilot conversation");
+        tracing::info!(%conversation_id, "created starter conversation");
     }
 
     // Components share one shutdown signal; ctrl-c flips it and the
@@ -132,9 +132,9 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
         }
     };
 
-    // Team mode: the node's BINDING peers cut over from the pilot host
+    // Team mode: the node's BINDING peers cut over from the local host
     // marker to the node's real host id (append-only host assignment;
-    // idempotent — the pilot assignment stays as history). The operator
+    // idempotent — the local assignment stays as history). The operator
     // is NOT a local peer: its host stays the hub's, or the node would
     // treat every hub-originated operator message as locally owned and
     // re-send it back to the hub forever. Runs before any mirroring so
@@ -142,7 +142,7 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
     if let Some(host_id) = args.host_id.as_deref() {
         for binding in &bindings.binding {
             let peer_id = &binding.peer_id;
-            if store.peer_host(peer_id).await?.as_deref() == Some(wrkspc_core::PILOT_HOST_ID) {
+            if store.peer_host(peer_id).await?.as_deref() == Some(wrkspc_core::LOCAL_HOST_ID) {
                 let assigned = store.assign_peer_host(peer_id, host_id).await?;
                 tracing::info!(%peer_id, %host_id, %assigned, "team-mode host cutover");
             }
@@ -274,7 +274,7 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
 
     // Team mode: dial the hub over mTLS and pull this host's delivery
     // queue into the local store. Mirrors + records + acks; the local
-    // dispatcher then drives execution exactly as in the pilot.
+    // dispatcher then drives execution exactly as in single-machine mode.
     let poll_task = match &args.hub {
         Some(hub_url) => {
             let host_id = args

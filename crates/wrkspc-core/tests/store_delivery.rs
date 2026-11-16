@@ -1,5 +1,5 @@
 //! The D-6 delivery contract's store half: pollable delivery tasks,
-//! append-only host assignments, the pilot cutover, per-instance
+//! append-only host assignments, the local-host cutover, per-instance
 //! claims, remote fanout, and the hub outbound ledger.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -122,9 +122,9 @@ async fn host_assignments_are_append_only_with_transactional_projection() {
         Err(wrkspc_core::StoreError::NotFound { .. })
     ));
 }
-/// The pilot cutover is an append-only reassignment event and a second run is a no-op.
+/// The local-host cutover is an append-only reassignment event and a second run is a no-op.
 #[tokio::test]
-async fn pilot_cutover_is_a_reassignment_event_and_idempotent() {
+async fn local_cutover_is_a_reassignment_event_and_idempotent() {
     let store = Store::open_in_memory("cutover-test").await.unwrap();
     store
         .ensure_peer("operator", "operator", "human")
@@ -135,10 +135,10 @@ async fn pilot_cutover_is_a_reassignment_event_and_idempotent() {
         .await
         .unwrap();
 
-    // Team-mode start: cut over pilot-marker peers to the real host id
+    // Team-mode start: cut over local-marker peers to the real host id
     // (the run_node loop, inlined).
     for peer in ["operator", "codex"] {
-        if store.peer_host(peer).await.unwrap().as_deref() == Some(wrkspc_core::PILOT_HOST_ID) {
+        if store.peer_host(peer).await.unwrap().as_deref() == Some(wrkspc_core::LOCAL_HOST_ID) {
             assert!(store.assign_peer_host(peer, "node-test-1").await.unwrap());
         }
     }
@@ -150,16 +150,16 @@ async fn pilot_cutover_is_a_reassignment_event_and_idempotent() {
         store.peer_host("codex").await.unwrap().as_deref(),
         Some("node-test-1")
     );
-    // The pilot assignment stays as history — the peer WAS on the pilot
+    // The local assignment stays as history — the peer WAS on the local
     // host.
     let assignments = store.peer_assignments("codex").await.unwrap();
     assert_eq!(assignments.len(), 2);
-    assert_eq!(assignments[0].0, wrkspc_core::PILOT_HOST_ID);
+    assert_eq!(assignments[0].0, wrkspc_core::LOCAL_HOST_ID);
     assert_eq!(assignments[1].0, "node-test-1");
 
     // A second start is a no-op: no new assignments.
     for peer in ["operator", "codex"] {
-        if store.peer_host(peer).await.unwrap().as_deref() == Some(wrkspc_core::PILOT_HOST_ID) {
+        if store.peer_host(peer).await.unwrap().as_deref() == Some(wrkspc_core::LOCAL_HOST_ID) {
             store.assign_peer_host(peer, "node-test-1").await.unwrap();
         }
     }
@@ -211,7 +211,7 @@ async fn delivery_claims_are_first_wins_per_instance_and_releasable() {
             sender_peer: "operator",
             sender_name: "operator",
             sender_class: "human",
-            sender_host: wrkspc_core::PILOT_HOST_ID,
+            sender_host: wrkspc_core::LOCAL_HOST_ID,
             content: "hello",
             execution_requested: false,
         })
@@ -303,7 +303,7 @@ async fn queue_remote_deliveries_targets_only_remote_hosts() {
     // own host queue.
     let queued = store
         .queue_remote_deliveries(wrkspc_core::RemoteFanoutRequest {
-            local_host: wrkspc_core::PILOT_HOST_ID,
+            local_host: wrkspc_core::LOCAL_HOST_ID,
             conversation_id: &conversation,
             message_id: "m-1",
             origin_message_id: None,
@@ -329,7 +329,7 @@ async fn queue_remote_deliveries_targets_only_remote_hosts() {
     // dispatcher path owns it).
     let queued = store
         .queue_remote_deliveries(wrkspc_core::RemoteFanoutRequest {
-            local_host: wrkspc_core::PILOT_HOST_ID,
+            local_host: wrkspc_core::LOCAL_HOST_ID,
             conversation_id: &conversation,
             message_id: "m-2",
             origin_message_id: None,
@@ -455,7 +455,7 @@ async fn seeded_hub_delivery(label: &str) -> (Store, String, String, String) {
     };
     let queued = store
         .queue_remote_deliveries(wrkspc_core::RemoteFanoutRequest {
-            local_host: wrkspc_core::PILOT_HOST_ID,
+            local_host: wrkspc_core::LOCAL_HOST_ID,
             conversation_id: &conversation,
             message_id: &message_id,
             origin_message_id: None,
@@ -659,7 +659,7 @@ async fn canceled_delivery_task_is_terminal_and_not_claimable() {
             sender_peer: "operator",
             sender_name: "operator",
             sender_class: "human",
-            sender_host: wrkspc_core::PILOT_HOST_ID,
+            sender_host: wrkspc_core::LOCAL_HOST_ID,
             content: "work to cancel",
             execution_requested: true,
         })
@@ -749,7 +749,7 @@ async fn fanout_and_repair_skip_canceled_intents() {
     // The fan-out must skip the canceled recipient.
     let queued = store
         .queue_remote_deliveries(wrkspc_core::RemoteFanoutRequest {
-            local_host: wrkspc_core::PILOT_HOST_ID,
+            local_host: wrkspc_core::LOCAL_HOST_ID,
             conversation_id: &conversation,
             message_id: &message_id,
             origin_message_id: None,
@@ -766,7 +766,7 @@ async fn fanout_and_repair_skip_canceled_intents() {
     // either.
     assert_eq!(
         store
-            .repair_remote_fanout(wrkspc_core::PILOT_HOST_ID)
+            .repair_remote_fanout(wrkspc_core::LOCAL_HOST_ID)
             .await
             .unwrap(),
         0,
@@ -1196,7 +1196,7 @@ async fn orphan_delivery_tasks_are_not_claimable() {
             sender_peer: "operator",
             sender_name: "operator",
             sender_class: "human",
-            sender_host: wrkspc_core::PILOT_HOST_ID,
+            sender_host: wrkspc_core::LOCAL_HOST_ID,
             content: "deleted work",
             execution_requested: true,
         })
@@ -1285,7 +1285,7 @@ async fn cancellation_racing_fanout_and_claim_stays_unexecutable() {
             sender_peer: "operator",
             sender_name: "operator",
             sender_class: "human",
-            sender_host: wrkspc_core::PILOT_HOST_ID,
+            sender_host: wrkspc_core::LOCAL_HOST_ID,
             content: "cancel me",
             execution_requested: true,
         })
@@ -1297,7 +1297,7 @@ async fn cancellation_racing_fanout_and_claim_stays_unexecutable() {
     );
     assert_eq!(
         store
-            .repair_remote_fanout(wrkspc_core::PILOT_HOST_ID)
+            .repair_remote_fanout(wrkspc_core::LOCAL_HOST_ID)
             .await
             .unwrap(),
         0,
@@ -1342,7 +1342,7 @@ async fn cancellation_racing_fanout_and_claim_stays_unexecutable() {
             sender_peer: "operator",
             sender_name: "operator",
             sender_class: "human",
-            sender_host: wrkspc_core::PILOT_HOST_ID,
+            sender_host: wrkspc_core::LOCAL_HOST_ID,
             content: "late cancel",
             execution_requested: true,
         })
@@ -1449,7 +1449,7 @@ async fn repair_preserves_the_sender_wire_origin_identity() {
     // Hub crash before fan-out: the repair rebuilds the envelope WITH
     // the recovered origin.
     assert_eq!(
-        hub.repair_remote_fanout(wrkspc_core::PILOT_HOST_ID)
+        hub.repair_remote_fanout(wrkspc_core::LOCAL_HOST_ID)
             .await
             .unwrap(),
         1
@@ -1469,7 +1469,7 @@ async fn repair_preserves_the_sender_wire_origin_identity() {
     );
     // Idempotent: a second repair creates nothing.
     assert_eq!(
-        hub.repair_remote_fanout(wrkspc_core::PILOT_HOST_ID)
+        hub.repair_remote_fanout(wrkspc_core::LOCAL_HOST_ID)
             .await
             .unwrap(),
         0
@@ -1478,7 +1478,7 @@ async fn repair_preserves_the_sender_wire_origin_identity() {
     // deterministic INSERT OR IGNORE) — the origin survives verbatim.
     let _ = hub
         .queue_remote_deliveries(wrkspc_core::RemoteFanoutRequest {
-            local_host: wrkspc_core::PILOT_HOST_ID,
+            local_host: wrkspc_core::LOCAL_HOST_ID,
             conversation_id: &conversation,
             message_id: &hub_message_id,
             origin_message_id: Some(&local_id),
@@ -1565,7 +1565,7 @@ async fn repair_preserves_the_sender_wire_origin_identity() {
         other => panic!("expected acceptance, got {other:?}"),
     };
     assert_eq!(
-        hub.repair_remote_fanout(wrkspc_core::PILOT_HOST_ID)
+        hub.repair_remote_fanout(wrkspc_core::LOCAL_HOST_ID)
             .await
             .unwrap(),
         1

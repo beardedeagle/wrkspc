@@ -475,7 +475,7 @@ async fn oversized_fanout_room_post_is_refused_with_400() {
 #[tokio::test]
 async fn hub_mention_only_post_fans_out_from_committed_routing() {
     let ui = spawn_ui_hub().await;
-    // A member on a REMOTE host: the pilot-host skip in
+    // A member on a REMOTE host: the local-host skip in
     // queue_remote_deliveries would mask the fan-out for a local peer.
     ui.store
         .ensure_peer_on_host("remote-agent", "Remote Agent", "harness", "remote-host-7")

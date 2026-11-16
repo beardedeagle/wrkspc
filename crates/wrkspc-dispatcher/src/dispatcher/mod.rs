@@ -7,7 +7,7 @@
 //! Any driver error marks the attempt unknown — the conservative contract:
 //! when the outcome is undeterminable, the session is blocked until the
 //! operator reconciles. On startup, open attempts from a previous run are
-//! marked unknown for the same reason (the pilot runs one dispatcher per
+//! marked unknown for the same reason (the hub runs one dispatcher per
 //! process; a restart means no turns are in flight).
 //!
 //! The central run loop never awaits adapter work: claim-and-drive tasks
@@ -241,7 +241,7 @@ impl Dispatcher {
     /// Builds a dispatcher over a store and session provider.
     ///
     /// * `store` — the transactional store (the dispatcher owns the
-    ///   exclusive lock for the pilot).
+    ///   exclusive lock for the hub).
     /// * `provider` — resolves peers to bound sessions.
     /// * `config` — tuning.
     ///

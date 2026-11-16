@@ -70,7 +70,7 @@ impl Store {
     }
 
     /// Acknowledges a fence (the team-mode fence-ack seam; the single-host
-    /// pilot acks locally).
+    /// the hub acks locally).
     ///
     /// # Errors
     ///

@@ -6,7 +6,7 @@
 //! network.
 //!
 //! Execution hops (dispatcher → harness) are deliberately not driven
-//! here (`execution_requested: false`); they are covered by the pilot
+//! here (`execution_requested: false`); they are covered by the
 //! dispatcher tests. The node binary's CLI arg wiring is covered by the
 //! unit tests; driving the binary itself would additionally require an
 //! ACP-speaking child process for the bindings, which is not this
@@ -189,7 +189,7 @@ async fn seed_hub_db(db: &Path) -> (String, String) {
             sender_peer: "operator",
             sender_name: "operator",
             sender_class: "human",
-            sender_host: wrkspc_core::PILOT_HOST_ID,
+            sender_host: wrkspc_core::LOCAL_HOST_ID,
             content: "hello from the hub",
             execution_requested: false,
         })

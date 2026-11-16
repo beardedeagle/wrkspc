@@ -51,7 +51,7 @@ impl AcceptanceState {
 /// sender from the stamped header, and commits accepted sends.
 ///
 /// Flow: (1) requests without the stamped header pass through untouched
-/// (plain-TCP pilot serving); (2) the REST subtree gets the same
+/// (plain-TCP single-machine serving); (2) the REST subtree gets the same
 /// authorization + send translation via its own path/query shapes;
 /// (3) on `/jsonrpc`, task methods (`GetTask`/`CancelTask`/
 /// `SubscribeToTask`/`ListTasks`) are checked against the presenting

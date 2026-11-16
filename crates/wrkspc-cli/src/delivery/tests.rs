@@ -50,7 +50,7 @@ async fn seeded_delivery(store: &Store) -> (String, String) {
             sender_peer: "operator",
             sender_name: "operator",
             sender_class: "human",
-            sender_host: wrkspc_core::PILOT_HOST_ID,
+            sender_host: wrkspc_core::LOCAL_HOST_ID,
             content: "hello from the hub",
             execution_requested: true,
         })
@@ -470,7 +470,7 @@ async fn outcome_report_validation() {
 async fn terminal_report_mirrors_the_outcome_onto_the_accepted_task() {
     let store = Store::open_in_memory("report-mirror").await.unwrap();
     store
-        .ensure_peer_on_host("operator", "operator", "human", wrkspc_core::PILOT_HOST_ID)
+        .ensure_peer_on_host("operator", "operator", "human", wrkspc_core::LOCAL_HOST_ID)
         .await
         .unwrap();
     store
@@ -517,7 +517,7 @@ async fn terminal_report_mirrors_the_outcome_onto_the_accepted_task() {
             sender_peer: "operator",
             sender_name: "operator",
             sender_class: "human",
-            sender_host: wrkspc_core::PILOT_HOST_ID,
+            sender_host: wrkspc_core::LOCAL_HOST_ID,
             content: "hello from the hub",
             execution_requested: true,
         })

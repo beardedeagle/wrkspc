@@ -45,7 +45,7 @@ async fn delivery_is_mirrored_dispatched_and_acked() {
         .ensure_peer("codex", "codex", "harness")
         .await
         .unwrap();
-    // The sender is pre-enrolled under the pilot marker: the mirror
+    // The sender is pre-enrolled under the local marker: the mirror
     // must replay the hub's real host assignment instead of leaving
     // the stale projection.
     store

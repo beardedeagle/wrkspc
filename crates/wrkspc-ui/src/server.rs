@@ -31,7 +31,7 @@ pub struct UiConfig {
     pub token: Option<String>,
     /// Hub mode: operator posts also queue pollable delivery tasks for
     /// recipients on remote hosts (the hub's own host is
-    /// `PILOT_HOST_ID`). The node role leaves this `false` — its
+    /// `LOCAL_HOST_ID`). The node role leaves this `false` — its
     /// harness peers are local and its deliveries come from the hub.
     pub queue_remote_deliveries: bool,
     /// Hub mode: the operator surface that owns the shared store

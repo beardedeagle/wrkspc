@@ -1,5 +1,5 @@
 //! The event feed cursor, the fence set/ack/clear lifecycle, and
-//! the seeded pilot host row.
+//! the seeded local host row.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -7,7 +7,7 @@ mod common;
 use common::{key, pool_for, seeded, temp_db_path};
 use sqlx::Row;
 use uuid::Uuid;
-use wrkspc_core::{FenceKind, PILOT_HOST_ID, Store};
+use wrkspc_core::{FenceKind, LOCAL_HOST_ID, Store};
 
 /// The event feed resumes from a cursor with monotonic sequence numbers.
 #[tokio::test]
@@ -97,19 +97,19 @@ async fn fence_set_ack_clear_lifecycle() {
     );
 }
 
-/// A fresh database seeds the pilot host row.
+/// A fresh database seeds the local host row.
 #[tokio::test]
-async fn pilot_host_is_seeded() {
+async fn local_host_is_seeded() {
     let path = temp_db_path();
     let store = Store::open(&path, "proc-a").await.unwrap();
     let pool = pool_for(&path).await;
     let row = sqlx::query("SELECT host_id FROM hosts WHERE host_id = ?")
-        .bind(PILOT_HOST_ID)
+        .bind(LOCAL_HOST_ID)
         .fetch_one(&pool)
         .await
         .unwrap();
     let host_id: String = row.get("host_id");
-    assert_eq!(host_id, PILOT_HOST_ID);
+    assert_eq!(host_id, LOCAL_HOST_ID);
     store.release_lock().await.unwrap();
     std::fs::remove_file(&path).ok();
     let _ = std::fs::remove_file(path.with_extension("db-wal"));

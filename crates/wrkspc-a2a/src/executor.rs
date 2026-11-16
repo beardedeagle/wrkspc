@@ -1,4 +1,4 @@
-//! The pilot executor: accepts inbound A2A work without claiming success.
+//! The hub executor: accepts inbound A2A work without claiming success.
 //!
 //! The executor records acceptance as a `submitted` status update (a
 //! continuation keeps its existing non-terminal state) and ends its event
@@ -14,7 +14,7 @@ use futures::stream;
 use futures::stream::BoxStream;
 use wrkspc_core::{CancelOutcome, Store};
 
-/// The pilot executor: acceptance only, no completion claims.
+/// The hub executor: acceptance only, no completion claims.
 #[derive(Debug, Clone)]
 pub struct WrkspcExecutor {
     store: Store,

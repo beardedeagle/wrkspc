@@ -222,7 +222,7 @@ pub(crate) async fn post_message(
                 if let Err(error) = state
                     .store
                     .queue_remote_deliveries(wrkspc_core::RemoteFanoutRequest {
-                        local_host: wrkspc_core::PILOT_HOST_ID,
+                        local_host: wrkspc_core::LOCAL_HOST_ID,
                         conversation_id: &id,
                         message_id: &message_id,
                         // Operator posts have no node-side origin.

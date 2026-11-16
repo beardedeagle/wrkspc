@@ -24,7 +24,7 @@ enum Recorded {
 
 /// Records an agent message chunk as a committed `turn.chunk` event.
 ///
-/// Non-text chunks are skipped (the pilot records message output, not
+/// Non-text chunks are skipped (wrkspc records message output, not
 /// tool-call internals) but reported as [`Recorded::SkippedNonText`]
 /// so the drive can mark the gap when a turn produced no storable
 /// text at all. The chunk's ACP `message_id` is kept (null when the

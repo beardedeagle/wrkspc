@@ -463,7 +463,7 @@ deploy-node $host="":
         # be gone AND a NEW process must OWN the UI listener — an
         # unrelated process (a hub, another node) serving the port must
         # never certify this deploy. lsof names the listener owner; the
-        # node's default UI port is 8081 and this pilot's nodes bind
+        # node's default UI port is 8081 and this machine's nodes bind
         # 8083, so both are checked.
         serving_pid() {
             lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -1

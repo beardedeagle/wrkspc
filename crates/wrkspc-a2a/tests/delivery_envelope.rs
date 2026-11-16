@@ -15,7 +15,7 @@ fn envelope_shell_parses_as_a2a_task_and_round_trips() {
         sender_peer: "operator".to_string(),
         sender_name: "operator".to_string(),
         sender_class: "human".to_string(),
-        sender_host: "pilot-host".to_string(),
+        sender_host: "local-host".to_string(),
         recipient_peer: "codex".to_string(),
         recipient_name: "codex".to_string(),
         recipient_class: "harness".to_string(),

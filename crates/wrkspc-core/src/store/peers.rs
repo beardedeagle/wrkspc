@@ -2,25 +2,25 @@
 
 use super::Store;
 use crate::error::{Result, StoreError};
-use crate::model::PILOT_HOST_ID;
+use crate::model::LOCAL_HOST_ID;
 use chrono::Utc;
 use sqlx::Row;
 
 impl Store {
-    /// Enrols a peer on the pilot host, creating the host and peer
+    /// Enrols a peer on the local host, creating the host and peer
     /// rows if needed.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Db`] on failure.
     pub async fn ensure_peer(&self, peer_id: &str, name: &str, class: &str) -> Result<()> {
-        self.ensure_peer_on_host(peer_id, name, class, PILOT_HOST_ID)
+        self.ensure_peer_on_host(peer_id, name, class, LOCAL_HOST_ID)
             .await
     }
 
     /// Enrols a peer on a specific host (team-mode enrolment; the
-    /// pilot-only [`ensure_peer`](Store::ensure_peer) delegates here
-    /// with [`PILOT_HOST_ID`]). Idempotent: an existing row is left
+    /// single-machine [`ensure_peer`](Store::ensure_peer) delegates here
+    /// with [`LOCAL_HOST_ID`]). Idempotent: an existing row is left
     /// untouched, so a re-enrolment never rewrites `host_id`.
     ///
     /// * `peer_id` — the peer to enrol.

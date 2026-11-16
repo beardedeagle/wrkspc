@@ -1,6 +1,6 @@
 //! The hub role: coordinator without harness control (D-13).
 //!
-//! Runs the A2A surface over a hub-owned store — plain TCP for pilot
+//! Runs the A2A surface over a hub-owned store — plain TCP for single-machine
 //! parity or mutual TLS (rustls `WebPkiClientVerifier`, optional serial
 //! deny-list) for team mode — plus an optional operator UI. No ACP, no
 //! dispatcher, no harness spawning: remote coordination, never remote
@@ -82,7 +82,7 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
             "operator",
             "operator",
             "human",
-            wrkspc_core::PILOT_HOST_ID,
+            wrkspc_core::LOCAL_HOST_ID,
             "connected",
         )
         .await?;
@@ -93,7 +93,7 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
     // (H-5 — a crash between acceptance and fan-out must not lose the
     // delivery).
     let repaired = store
-        .repair_remote_fanout(wrkspc_core::PILOT_HOST_ID)
+        .repair_remote_fanout(wrkspc_core::LOCAL_HOST_ID)
         .await?;
     if repaired > 0 {
         tracing::warn!(repaired, "repaired incomplete remote fan-out at startup");
@@ -198,7 +198,7 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                 .unwrap_or_else(|| format!("https://{addr}"));
             let acceptance = crate::acceptance::AcceptanceState::new(
                 store.clone(),
-                wrkspc_core::PILOT_HOST_ID.to_string(),
+                wrkspc_core::LOCAL_HOST_ID.to_string(),
             );
             let delivery = crate::delivery::DeliveryState::new(store.clone());
             let presence =

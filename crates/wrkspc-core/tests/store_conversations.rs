@@ -344,7 +344,7 @@ async fn delete_conversation_cleans_delivery_tasks_and_claims() {
                 sender_peer: "operator",
                 sender_name: "operator",
                 sender_class: "human",
-                sender_host: wrkspc_core::PILOT_HOST_ID,
+                sender_host: wrkspc_core::LOCAL_HOST_ID,
                 content: &format!("work {n}"),
                 execution_requested: true,
             })
@@ -436,7 +436,7 @@ async fn delete_conversation_cleans_tasks_committed_while_it_holds_the_write_loc
             sender_peer: "operator",
             sender_name: "operator",
             sender_class: "human",
-            sender_host: wrkspc_core::PILOT_HOST_ID,
+            sender_host: wrkspc_core::LOCAL_HOST_ID,
             content: "before",
             execution_requested: false,
         })

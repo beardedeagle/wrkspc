@@ -66,7 +66,7 @@ pub fn surface_contract() -> Vec<String> {
     vec!["text/plain".to_string(), "text/markdown".to_string()]
 }
 
-/// Builds the pilot's v1.0 agent card.
+/// Builds the hub's v1.0 agent card.
 ///
 /// * `base_url` — the externally reachable base URL (scheme + host + port),
 ///   e.g. `https://hub.example:8443`. Interface URLs derive from it.

@@ -3,7 +3,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 use super::Store;
 use crate::error::{Result, StoreError};
-use crate::model::PILOT_HOST_ID;
+use crate::model::LOCAL_HOST_ID;
 use chrono::Utc;
 use std::path::Path;
 use std::time::Duration;
@@ -114,11 +114,11 @@ impl Store {
 
     async fn migrate(&self) -> Result<()> {
         sqlx::migrate!("./migrations").run(&self.pool).await?;
-        // Seed the constant pilot host (D-6 host_id day-1 requirement).
+        // Seed the constant local host (D-6 host_id day-1 requirement).
         let now = Utc::now().to_rfc3339();
         sqlx::query("INSERT OR IGNORE INTO hosts (host_id, name, created_at) VALUES (?, ?, ?)")
-            .bind(PILOT_HOST_ID)
-            .bind("pilot host (single-machine)")
+            .bind(LOCAL_HOST_ID)
+            .bind("local host (single-machine)")
             .bind(&now)
             .execute(&self.pool)
             .await?;

@@ -98,7 +98,7 @@ async fn roster_mirror_replaces_fully() {
             name: "operator".to_string(),
             alias: None,
             class: "human".to_string(),
-            host_id: wrkspc_core::PILOT_HOST_ID.to_string(),
+            host_id: wrkspc_core::LOCAL_HOST_ID.to_string(),
             status: "enrolled".to_string(),
             state: "connected".to_string(),
             updated_at: chrono::Utc::now().to_rfc3339(),

@@ -5,9 +5,9 @@
 //! Keep both in sync deliberately.
 
 /// The host identity stamped on every record. Constant for the single-host
-/// pilot (D-6's day-1 requirement); team mode stamps real host identities
+/// local host (D-6's day-1 requirement); team mode stamps real host identities
 /// with zero schema migration.
-pub const PILOT_HOST_ID: &str = "wrkspc-pilot-host";
+pub const LOCAL_HOST_ID: &str = "wrkspc-local-host";
 
 /// The presence live-state vocabulary (HLD rev0.9 first cut; idle/busy
 /// arrive with dispatcher in-flight wiring).

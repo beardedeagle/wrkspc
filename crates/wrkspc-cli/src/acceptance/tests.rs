@@ -25,7 +25,7 @@ async fn seeded() -> (Store, String) {
 /// Builds the router under test: the A2A surface plus the acceptance
 /// layer, with the hub as the local host.
 async fn router_under_test(store: Store) -> axum::Router {
-    router_with_local_host(store, wrkspc_core::PILOT_HOST_ID.to_string()).await
+    router_with_local_host(store, wrkspc_core::LOCAL_HOST_ID.to_string()).await
 }
 
 /// Builds the router with an explicit local-host id (the fan-out
@@ -307,7 +307,7 @@ async fn attributed_send_commits_and_queues_remote_delivery() {
     // The operator (hub host) sends to codex on a remote host.
     let (status, body) = post(
         router,
-        Some("wrkspc-pilot-host"),
+        Some("wrkspc-local-host"),
         &send_body("m-1", &conversation, "operator", &["codex"]),
     )
     .await;
@@ -334,7 +334,7 @@ async fn attributed_send_commits_and_queues_remote_delivery() {
     let router = router_under_test(store.clone()).await;
     let (status, _) = post(
         router,
-        Some("wrkspc-pilot-host"),
+        Some("wrkspc-local-host"),
         &send_body("m-1", &conversation, "operator", &["codex"]),
     )
     .await;
@@ -400,7 +400,7 @@ async fn jsonrpc_error_envelope_is_not_translated() {
     // must honor that verdict instead of translating the send.
     let (status, body) = post_versioned(
         router,
-        Some("wrkspc-pilot-host"),
+        Some("wrkspc-local-host"),
         &send_body("m-noversion", &conversation, "operator", &["codex"]),
         None,
     )
@@ -430,7 +430,7 @@ async fn jsonrpc_batch_bodies_are_rejected_on_the_stamped_surface() {
         }),
     ])
     .to_string();
-    let (status, _body) = post(router, Some("wrkspc-pilot-host"), &batch).await;
+    let (status, _body) = post(router, Some("wrkspc-local-host"), &batch).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
     assert_eq!(accepted_events(&store, &conversation).await, 0);
 }
@@ -482,7 +482,7 @@ async fn send_without_sender_metadata_is_rejected() {
         },
     })
     .to_string();
-    let (status, _) = post(router, Some("wrkspc-pilot-host"), &body).await;
+    let (status, _) = post(router, Some("wrkspc-local-host"), &body).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
     assert_eq!(accepted_events(&store, &conversation).await, 0);
 }
@@ -563,7 +563,7 @@ async fn seeded_delivery(
             sender_peer: "operator",
             sender_name: "operator",
             sender_class: "human",
-            sender_host: wrkspc_core::PILOT_HOST_ID,
+            sender_host: wrkspc_core::LOCAL_HOST_ID,
             content: "private delivery content",
             execution_requested: true,
         })
@@ -743,7 +743,7 @@ async fn rest_unary_send_spellings_run_full_acceptance() {
     ] {
         let (status, text) = rest_post(
             router.clone(),
-            Some("wrkspc-pilot-host"),
+            Some("wrkspc-local-host"),
             path,
             &rest_send_body(message_id, &conversation, "operator", &["codex"], true),
         )
@@ -791,7 +791,7 @@ async fn streaming_sends_are_refused_before_the_sdk() {
     for path in ["/rest/message:stream", "/rest/message/stream"] {
         let (status, text) = rest_post(
             router.clone(),
-            Some("wrkspc-pilot-host"),
+            Some("wrkspc-local-host"),
             path,
             &rest_send_body("m-rest-stream", &conversation, "operator", &["codex"], true),
         )
@@ -806,7 +806,7 @@ async fn streaming_sends_are_refused_before_the_sdk() {
 
     let (status, text) = post(
         router,
-        Some("wrkspc-pilot-host"),
+        Some("wrkspc-local-host"),
         &send_body_full(
             "SendStreamingMessage",
             "m-jsonrpc-stream",
@@ -1096,7 +1096,7 @@ async fn replay_fanout_uses_committed_authority_not_the_retry_flag() {
     let router = router_with_local_host(store.clone(), "node-test-1".to_string()).await;
     let (status, text) = post(
         router,
-        Some("wrkspc-pilot-host"),
+        Some("wrkspc-local-host"),
         &send_body_full(
             "SendMessage",
             "m-exec",
@@ -1124,7 +1124,7 @@ async fn replay_fanout_uses_committed_authority_not_the_retry_flag() {
     let router = router_under_test(store.clone()).await;
     let (status, text) = post(
         router,
-        Some("wrkspc-pilot-host"),
+        Some("wrkspc-local-host"),
         &send_body_full(
             "SendMessage",
             "m-exec",
@@ -1158,7 +1158,7 @@ async fn replay_fanout_uses_committed_authority_not_the_retry_flag() {
 async fn sender_subscribes_to_its_own_accepted_task() {
     let store = Store::open_in_memory("acceptance-subscribe").await.unwrap();
     store
-        .ensure_peer_on_host("operator", "operator", "human", wrkspc_core::PILOT_HOST_ID)
+        .ensure_peer_on_host("operator", "operator", "human", wrkspc_core::LOCAL_HOST_ID)
         .await
         .unwrap();
     store

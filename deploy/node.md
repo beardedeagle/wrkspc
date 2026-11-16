@@ -31,7 +31,7 @@ work. On the node, the recipe:
 4. moves the new binary into place and restarts the node — under the
    launcher by stopping it (the launcher starts it again), under launchd
    with `launchctl kickstart -k` — then waits up to 150 s for a NEW node
-   process to own its UI listener (default port 8081; this pilot's
+   process to own its UI listener (default port 8081; this machine's
    nodes bind 8083, so both are checked, and the listener owner is
    verified with lsof — an unrelated process on the port never
    certifies the deploy).
