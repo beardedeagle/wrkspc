@@ -940,7 +940,9 @@ async fn replay_cannot_accumulate_recipients_past_the_cap() {
     let store = Store::open_in_memory("test").await.unwrap();
     let (operator, _agent, _seeded_conversation) = seeded(&store).await;
     let mut member_ids: Vec<String> = vec![operator.clone()];
-    for index in 0..32 {
+    // 33 harness members, so rotating the replay list past 32 is
+    // actually possible with real members.
+    for index in 0..33 {
         let peer_id = format!("peer{index}");
         store
             .ensure_peer(&peer_id, &peer_id, "harness")
@@ -992,10 +994,13 @@ async fn replay_cannot_accumulate_recipients_past_the_cap() {
         .accept_message(&conversation, &operator, &idem, "rotate", false, &overflow)
         .await
         .expect_err("replay rotation past the cumulative cap must be refused");
-    assert!(matches!(
-        error,
-        StoreError::TooManyRecipients { limit: 32, .. }
-    ));
+    assert!(
+        matches!(
+            error,
+            StoreError::TooManyRecipients { limit: 32, .. }
+        ),
+        "got {error:?}"
+    );
 }
 
 /// Duplicates INSIDE one replay list count once: with 31 committed,

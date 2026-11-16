@@ -456,7 +456,8 @@ impl Store {
         // recipient after the first reaches this branch: enrol it
         // and raise its intent here, or the peer silently never
         // runs.
-        self.assert_member(&mut tx, conversation_id, sender_id).await?;
+        self.assert_member(&mut tx, conversation_id, sender_id)
+            .await?;
         // Execution authority is committed at first acceptance: a
         // mail-only message can never become executable via a retry.
         // The check covers BOTH channels a replay can smuggle
@@ -478,46 +479,25 @@ impl Store {
         // caller rotating lists under one idempotency key could
         // otherwise accumulate unbounded recipients on one message.
         // Two guards on the count: the incoming list may name the same
-        // peer twice (INSERT OR IGNORE would dedupe), and a legacy
-        // message committed before the cap may already exceed it — a
-        // pure re-ack that adds NOBODY must always pass, or an upgrade
-        // strands outstanding deliveries in process_deliveries' replay
-        // acks. The refusal fires only when the replay GROWS the set
-        // past the ceiling.
+        // peer twice (INSERT OR IGNORE would dedupe), and a pure
+        // re-ack that adds NOBODY must always pass (the delivery
+        // loop's own replay acks rely on it). The refusal fires only
+        // when the replay GROWS the set past the ceiling.
         let committed_ids: Vec<String> =
             sqlx::query_scalar("SELECT peer_id FROM message_recipients WHERE message_id = ?")
                 .bind(existing_id)
                 .fetch_all(&mut *tx)
                 .await?;
-        // A replay must honor the SAME recipient filters as first
-        // acceptance (resolve_recipients): the caller names its list
-        // explicitly, so an ejected peer is refused loudly, while
-        // self-addresses, duplicates, and human-class peers are
-        // skipped — a retry cannot smuggle a banned target or a
-        // human execution intent past the resolution gate.
-        let mut filtered: Vec<&RecipientRequest> = Vec::with_capacity(recipients.len());
-        for recipient in recipients {
-            if recipient.peer_id == sender_id {
-                continue;
-            }
-            if self.peer_class(&mut tx, &recipient.peer_id).await?.as_deref() == Some(HUMAN_CLASS) {
-                continue;
-            }
-            let status: Option<String> =
-                sqlx::query_scalar("SELECT status FROM peers WHERE id = ?")
-                    .bind(&recipient.peer_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            if let Some(status) = status
-                && status != "enrolled"
-            {
-                return Err(StoreError::PeerEjected {
-                    peer_id: recipient.peer_id.clone(),
-                    status,
-                });
-            }
-            filtered.push(recipient);
-        }
+        // A replay must honor the SAME recipient filter as first
+        // acceptance — the shared filter_recipients, with explicit =
+        // true: a non-member is refused by the membership assert, an
+        // ejected peer is refused loudly, and self-addresses,
+        // duplicates, and member human-class peers are skipped — a
+        // retry cannot smuggle a banned target or a human execution
+        // intent past the resolution gate.
+        let filtered = self
+            .filter_recipients(&mut tx, conversation_id, sender_id, recipients, true)
+            .await?;
         let mut new_unique_ids: Vec<&str> = Vec::new();
         for recipient in &filtered {
             if !committed_ids.iter().any(|id| id == &recipient.peer_id)
@@ -535,8 +515,6 @@ impl Store {
             });
         }
         for recipient in &filtered {
-            self.assert_member(&mut tx, conversation_id, &recipient.peer_id)
-                .await?;
             sqlx::query(
                 "INSERT OR IGNORE INTO message_recipients
                    (message_id, peer_id, delivery_state)
@@ -642,8 +620,35 @@ impl Store {
             routing.requests.to_vec()
         };
 
+        // The ONE filter both acceptance paths share (C3).
+        self.filter_recipients(
+            tx,
+            conversation_id,
+            sender_id,
+            &candidates,
+            !routing.requests.is_empty(),
+        )
+        .await
+    }
+
+    /// The ONE recipient filter both acceptance paths share (C3).
+    ///
+    /// Membership is asserted FIRST, then the self skip, the duplicate
+    /// skip, the human-class skip, and the ejected refusal for explicit
+    /// addresses — a mention never wakes a booted or banned peer, an
+    /// explicit address is refused loudly instead of silently reaching
+    /// nobody. The replay leg runs the identical filter, so a retry
+    /// cannot smuggle a banned target or a human execution intent past
+    /// the resolution gate.
+    async fn filter_recipients(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        conversation_id: &str,
+        sender_id: &str,
+        candidates: &[RecipientRequest],
+        explicit: bool,
+    ) -> Result<Vec<RecipientRequest>> {
         let mut resolved: Vec<RecipientRequest> = Vec::with_capacity(candidates.len());
-        let explicit = !routing.requests.is_empty();
         for candidate in candidates {
             // An explicit recipient must be a member; the check stays so a
             // typo fails loudly instead of silently reaching nobody.
@@ -670,13 +675,13 @@ impl Store {
             {
                 if explicit {
                     return Err(StoreError::PeerEjected {
-                        peer_id: candidate.peer_id,
+                        peer_id: candidate.peer_id.clone(),
                         status,
                     });
                 }
                 continue;
             }
-            resolved.push(candidate);
+            resolved.push(candidate.clone());
         }
         Ok(resolved)
     }
