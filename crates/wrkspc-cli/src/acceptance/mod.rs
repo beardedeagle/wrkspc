@@ -649,11 +649,9 @@ async fn committed_execution_authority(
     conversation_id: &str,
     message_id: &str,
 ) -> Result<bool, Box<Response>> {
-    match state.store.list_messages(conversation_id).await {
-        Ok(messages) => {
-            if let Some(committed) = messages.iter().find(|message| message.id == message_id) {
-                return Ok(committed.execution_requested);
-            }
+    match state.store.message_execution_requested(message_id).await {
+        Ok(Some(execution_requested)) => Ok(execution_requested),
+        Ok(None) => {
             tracing::error!(%message_id, %conversation_id, "committed message row missing on replay");
             Err(Box::new(rpc_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,

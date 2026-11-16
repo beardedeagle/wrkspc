@@ -245,15 +245,15 @@ impl Store {
         // unclaimed delivery envelope rides to a node, its guidance
         // snapshot is brought up to date with the conversation's
         // current pending guidance (guidance added after
-        // the task was queued must still reach the next prompt).
-        for task in &mut tasks {
-            self.refresh_unclaimed_delivery_guidance(task).await?;
-        }
+        // the task was queued must still reach the next prompt). The
+        // refresh batches ONE claims probe and ONE guidance fetch per
+        // poll, never two queries per row.
+        self.refresh_unclaimed_delivery_guidance(&mut tasks).await?;
         Ok((tasks, total))
     }
 
-    /// Refreshes the guidance snapshot in an unclaimed, non-terminal
-    /// delivery envelope.
+    /// Refreshes the guidance snapshots of every unclaimed, non-terminal
+    /// delivery envelope in one poll.
     ///
     /// `task_create_delivery` snapshots pending guidance only at
     /// creation time; operator guidance added while a delivery waits
@@ -265,89 +265,171 @@ impl Store {
     /// immutable. The row's version is untouched (no state
     /// transition); only the envelope and `updated_at` change.
     ///
-    /// * `row` — the task row to refresh; replaced in place on change.
+    /// The claims probe and the guidance fetch each run ONCE per poll
+    /// as `IN`-batched queries, so the poll's query count is O(1) in
+    /// the page size, not O(rows).
+    ///
+    /// * `tasks` — the polled rows; refreshed in place on change.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Db`] on failure.
-    async fn refresh_unclaimed_delivery_guidance(&self, row: &mut TaskRow) -> Result<()> {
-        if row.terminal {
-            return Ok(());
+    async fn refresh_unclaimed_delivery_guidance(&self, tasks: &mut [TaskRow]) -> Result<()> {
+        /// One refresh candidate: the row index and the envelope's
+        /// conversation, captured in a single preparse pass.
+        struct Candidate {
+            index: usize,
+            task_id: String,
+            conversation_id: String,
         }
-        let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&row.task_json) else {
-            return Ok(());
-        };
-        let Some(delivery) = payload
-            .get_mut("metadata")
-            .and_then(|metadata| metadata.get_mut("delivery"))
-            .and_then(|delivery| delivery.as_object_mut())
-        else {
-            return Ok(());
-        };
-        if delivery.get("kind").and_then(|kind| kind.as_str()) != Some("delivery") {
-            return Ok(());
-        }
-        let Some(conversation_id) = delivery
-            .get("conversation_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-        else {
-            return Ok(());
-        };
-        let claimed: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM delivery_claims WHERE task_id = ?")
-                .bind(&row.task_id)
-                .fetch_optional(self.pool())
-                .await?;
-        if claimed.is_some() {
-            // Frozen at the claim: the handoff already happened under
-            // the previously served envelope.
-            return Ok(());
-        }
-        let pending = self.undelivered_guidance(&conversation_id).await?;
-        let current_ids: Vec<&str> = delivery
-            .get("guidance")
-            .and_then(|guidance| guidance.as_array())
-            .map_or_default(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
-                    .collect()
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for (index, row) in tasks.iter().enumerate() {
+            if row.terminal {
+                continue;
+            }
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&row.task_json) else {
+                continue;
+            };
+            let Some(delivery) = payload
+                .get("metadata")
+                .and_then(|metadata| metadata.get("delivery"))
+                .and_then(|delivery| delivery.as_object())
+            else {
+                continue;
+            };
+            if delivery.get("kind").and_then(|kind| kind.as_str()) != Some("delivery") {
+                continue;
+            }
+            let Some(conversation_id) = delivery
+                .get("conversation_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            candidates.push(Candidate {
+                index,
+                task_id: row.task_id.clone(),
+                conversation_id,
             });
-        let pending_ids: Vec<&str> = pending
-            .iter()
-            .map(|guidance| guidance.id.as_str())
-            .collect();
-        if current_ids == pending_ids {
+        }
+        if candidates.is_empty() {
             return Ok(());
         }
-        let guidance: Vec<serde_json::Value> = pending
-            .iter()
-            .map(|g| {
-                serde_json::json!({
-                    "id": g.id,
-                    "author_id": g.author_id,
-                    "text": g.text,
+
+        // ONE claims probe across every candidate task (chunked under
+        // SQLite's variable-number limit).
+        let mut claimed = std::collections::HashSet::new();
+        for chunk in candidates.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql =
+                format!("SELECT task_id FROM delivery_claims WHERE task_id IN ({placeholders})");
+            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
+            for candidate in chunk {
+                query = query.bind(&candidate.task_id);
+            }
+            for task_id in query.fetch_all(self.pool()).await? {
+                claimed.insert(task_id);
+            }
+        }
+
+        // ONE guidance fetch for every candidate conversation (same
+        // semantics and ordering as [`Store::undelivered_guidance`]).
+        let mut pending_by_conversation: std::collections::HashMap<
+            String,
+            Vec<crate::moderation::Guidance>,
+        > = std::collections::HashMap::new();
+        for chunk in candidates.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT id, conversation_id, author_id, text, created_at \
+                 FROM guidance WHERE conversation_id IN ({placeholders}) \
+                 AND delivered = 0 ORDER BY created_at ASC"
+            );
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for candidate in chunk {
+                query = query.bind(&candidate.conversation_id);
+            }
+            let rows = query.fetch_all(self.pool()).await?;
+            for row in rows {
+                let conversation_id: String = row.get("conversation_id");
+                pending_by_conversation
+                    .entry(conversation_id)
+                    .or_default()
+                    .push(crate::moderation::Guidance {
+                        id: row.get("id"),
+                        conversation_id: row.get("conversation_id"),
+                        author_id: row.get("author_id"),
+                        text: row.get("text"),
+                        created_at: row.get("created_at"),
+                    });
+            }
+        }
+
+        for candidate in &candidates {
+            let row = &mut tasks[candidate.index];
+            if claimed.contains(&candidate.task_id) {
+                // Frozen at the claim: the handoff already happened
+                // under the previously served envelope.
+                continue;
+            }
+            let Some(pending) = pending_by_conversation.get(&candidate.conversation_id) else {
+                continue;
+            };
+            let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&row.task_json) else {
+                continue;
+            };
+            let Some(delivery) = payload
+                .get_mut("metadata")
+                .and_then(|metadata| metadata.get_mut("delivery"))
+                .and_then(|delivery| delivery.as_object_mut())
+            else {
+                continue;
+            };
+            let current_ids: Vec<&str> = delivery
+                .get("guidance")
+                .and_then(|guidance| guidance.as_array())
+                .map_or_default(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
+                        .collect()
+                });
+            let pending_ids: Vec<&str> = pending
+                .iter()
+                .map(|guidance| guidance.id.as_str())
+                .collect();
+            if current_ids == pending_ids {
+                continue;
+            }
+            let guidance: Vec<serde_json::Value> = pending
+                .iter()
+                .map(|g| {
+                    serde_json::json!({
+                        "id": g.id,
+                        "author_id": g.author_id,
+                        "text": g.text,
+                    })
                 })
-            })
-            .collect();
-        delivery.insert("guidance".to_string(), serde_json::Value::Array(guidance));
-        let blob = serde_json::to_string(&payload)
-            .map_err(|error| StoreError::Db(sqlx::Error::Decode(Box::new(error))))?;
-        let now = Utc::now().to_rfc3339();
-        let updated = sqlx::query(
-            "UPDATE a2a_tasks
-             SET task_json = ?, updated_at = ?
-             WHERE task_id = ? AND terminal = 0",
-        )
-        .bind(&blob)
-        .bind(&now)
-        .bind(&row.task_id)
-        .execute(self.pool())
-        .await?;
-        if updated.rows_affected() == 1 {
-            row.task_json = blob;
-            row.updated_at = now;
+                .collect();
+            delivery.insert("guidance".to_string(), serde_json::Value::Array(guidance));
+            let blob = serde_json::to_string(&payload)
+                .map_err(|error| StoreError::Db(sqlx::Error::Decode(Box::new(error))))?;
+            let now = Utc::now().to_rfc3339();
+            let updated = sqlx::query(
+                "UPDATE a2a_tasks
+                 SET task_json = ?, updated_at = ?
+                 WHERE task_id = ? AND terminal = 0",
+            )
+            .bind(&blob)
+            .bind(&now)
+            .bind(&candidate.task_id)
+            .execute(self.pool())
+            .await?;
+            if updated.rows_affected() == 1 {
+                row.task_json = blob;
+                row.updated_at = now;
+            }
         }
         Ok(())
     }

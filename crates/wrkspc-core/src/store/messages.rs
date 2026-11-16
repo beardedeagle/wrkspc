@@ -233,6 +233,32 @@ impl Store {
         Ok(resolved)
     }
 
+    /// Reads one message's committed execution flag by id.
+    ///
+    /// The single-column form of the transcript read: replay authority
+    /// checks need exactly this value, and loading the whole
+    /// conversation to find one row is unbounded work for one column.
+    ///
+    /// # Args
+    ///
+    /// * `message_id` - The message to look up.
+    ///
+    /// # Returns
+    ///
+    /// `Some(execution_requested)` for a committed row, `None` when the
+    /// message does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`] when the query fails.
+    pub async fn message_execution_requested(&self, message_id: &str) -> Result<Option<bool>> {
+        sqlx::query_scalar("SELECT execution_requested FROM messages WHERE id = ?")
+            .bind(message_id)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(Into::into)
+    }
+
     /// Shared fence implementation; `mode` carries the two acceptance
     /// switches (see [`AcceptMode`]).
     async fn accept_message_with(
