@@ -41,7 +41,8 @@ with `lefthook install`.
 - `ci.yml` runs `just ci-rust` on every push and PR.
 - `security.yml` runs `just deny-check`, `just audit`, and
   `just osv` daily and on demand.
-- `docs.yml` builds the book (`just docs`) whenever `docs/**` or the
+- `docs.yml` builds the book (`just docs`, which also embeds the
+  rustdoc API reference at `/rustdoc`) whenever `docs/**` or the
   changelog changes.
 - `codeql.yml` scans the Rust workspace with CodeQL on push, PR, and
   a weekly schedule.
@@ -66,10 +67,14 @@ with `lefthook install`.
 ## Docs
 
 ```console
-$ just docs          # build the book into docs/book/
+$ just docs          # build the book into docs/book/, rustdoc API reference embedded
 $ just docs-serve    # serve it locally with reload
 $ just lint-md       # markdown lint across the repo, pinned CLI
 ```
 
 `CHANGELOG.md` at the repo root is the single source of truth;
-`just docs` copies it into the book at build time.
+`just docs` copies it into the book at build time. The same build
+runs `cargo doc --no-deps --workspace --locked` and embeds the
+result at `/rustdoc` in the published site — the Rust API reference
+frames it as a no-semver, product-internal surface (see
+[Rust API](../reference/rust-api.md)).

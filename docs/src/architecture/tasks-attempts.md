@@ -43,3 +43,22 @@ The node owns the execution itself. The contract between them is
 exactly: claim before mirror, ack the handoff receipt, report the
 outcome after the run — and when the report can't be produced, say
 so (an unknown attempt, blocking new work for that recipient).
+
+## Lifecycle to A2A task states
+
+The submitting agent sees wrkspc's lifecycle through the nine A2A v1.0
+task states (HLD Appendix A). The mapping is a contract test
+(`crates/wrkspc-a2a/tests/state_mapping.rs`); the wire literals are the
+`TASK_STATE_*` strings.
+
+| wrkspc lifecycle | what it means | wire state |
+| --- | --- | --- |
+| queued | message committed, prompt not dispatched | `submitted` |
+| held | committed but moderation-gated | `submitted` with a status marker (never `input-required`) |
+| blocked | rejected at acceptance (policy or moderation) | `rejected` |
+| dispatching | attempt persisted before writing the ACP prompt | `submitted` (in-progress metadata) |
+| running | attributable session update establishes activity | `working` |
+| awaiting approval | an outstanding permission decision blocks progress | `input-required`, or `auth-required` when auth-bound |
+| completed | results durably recorded AND the success-evidence predicate holds | `completed` |
+| failed / cancelled / expired | known terminal outcome | `failed` / `canceled` / `failed` (the wire has no expired state) |
+| unknown | dispatch or completion may have occurred | hub-internal; the submitter sees the last durable state with a staleness marker — never `unspecified` |

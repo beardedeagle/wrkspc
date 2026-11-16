@@ -20,13 +20,11 @@ struct PageToken {
 }
 
 impl PageToken {
-    fn encode(&self) -> String {
-        match serde_json::to_string(self) {
-            Ok(encoded) => encoded,
-            // A PageToken is a flat struct of strings; serialization
-            // cannot fail, and a failure would be a bug in this module.
-            Err(error) => unreachable!("page token serialization failed: {error}"),
-        }
+    /// Serializes the token. The struct is flat strings, so this is
+    /// effectively infallible — but the serving path must never panic,
+    /// so an unexpected failure surfaces as an internal error instead.
+    fn encode(&self) -> Result<String, A2AError> {
+        serde_json::to_string(self).map_err(|e| A2AError::internal(e.to_string()))
     }
 
     fn decode(token: &str) -> Option<Self> {
@@ -42,8 +40,6 @@ pub struct WrkspcTaskStore {
 
 impl WrkspcTaskStore {
     /// Builds the adapter over a wrkspc store.
-    ///
-    /// # Arguments
     ///
     /// * `store` — the transactional store (shared with the dispatcher).
     pub fn new(store: Store) -> Self {
@@ -61,6 +57,17 @@ fn task_from_json(blob: &str) -> Result<Task, A2AError> {
     serde_json::from_str(blob).map_err(|e| A2AError::internal(e.to_string()))
 }
 
+/// Maps a storage failure with no A2A-level shape to a generic internal
+/// error, logging the driver detail server-side.
+///
+/// SQLite error text carries driver paths and schema detail that must
+/// never reach A2A clients; the log keeps it for operators while the
+/// wire gets the generic shape only.
+pub(crate) fn internal_store_error(error: wrkspc_core::StoreError) -> A2AError {
+    tracing::error!(%error, "storage failure");
+    A2AError::internal("storage failure")
+}
+
 /// Maps a wrkspc store error to the closest A2A error.
 fn store_error(error: wrkspc_core::StoreError) -> A2AError {
     match error {
@@ -73,7 +80,7 @@ fn store_error(error: wrkspc_core::StoreError) -> A2AError {
         wrkspc_core::StoreError::AlreadyExists { entity, id } => {
             A2AError::invalid_request(format!("{entity} `{id}` already exists"))
         }
-        other => A2AError::internal(other.to_string()),
+        other => internal_store_error(other),
     }
 }
 
@@ -111,7 +118,7 @@ impl TaskStore for WrkspcTaskStore {
             .store
             .task_get(task_id)
             .await
-            .map_err(|e| A2AError::internal(e.to_string()))?;
+            .map_err(internal_store_error)?;
         row.map(|r| task_from_json(&r.task_json)).transpose()
     }
 
@@ -133,10 +140,16 @@ impl TaskStore for WrkspcTaskStore {
 
         let status_after = req.status_timestamp_after.map(|dt| dt.to_rfc3339());
 
-        // page_size: the handler clamps to MAX_PAGE_SIZE before calling;
-        // default 50 per spec when unset. Request one extra row to detect
-        // another page.
-        let page_size = req.page_size.unwrap_or(50).max(1) as i64;
+        // page_size: resolve through the SDK's shared pagination
+        // contract — absent/zero/negative fall back to 50 and the
+        // result never exceeds 100 — so direct `TaskStore` callers
+        // (tests, embeds) cannot drive an unbounded LIMIT the way
+        // the handler's pre-clamp alone would allow. Request one
+        // extra row to detect another page.
+        let page_size = a2a_server::pagination::resolve_page_size(req.page_size);
+        let limit = i64::try_from(page_size)
+            .unwrap_or(i64::MAX)
+            .saturating_add(1);
         let (rows, total) = self
             .store
             .task_list(
@@ -144,13 +157,13 @@ impl TaskStore for WrkspcTaskStore {
                 status,
                 status_after.as_deref(),
                 page.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
-                page_size + 1,
+                limit,
             )
             .await
-            .map_err(|e| A2AError::internal(e.to_string()))?;
+            .map_err(internal_store_error)?;
 
-        let has_more = rows.len() as i64 > page_size;
-        let page_rows = &rows[..rows.len().min(page_size as usize)];
+        let has_more = rows.len() > page_size;
+        let page_rows = &rows[..rows.len().min(page_size)];
 
         let tasks = page_rows
             .iter()
@@ -172,16 +185,14 @@ impl TaskStore for WrkspcTaskStore {
         };
 
         let next_page_token = if has_more {
-            page_rows
-                .last()
-                .map(|r| {
-                    PageToken {
-                        updated_at: r.updated_at.clone(),
-                        task_id: r.task_id.clone(),
-                    }
-                    .encode()
-                })
-                .unwrap_or_default()
+            match page_rows.last() {
+                Some(row) => PageToken {
+                    updated_at: row.updated_at.clone(),
+                    task_id: row.task_id.clone(),
+                }
+                .encode()?,
+                None => String::new(),
+            }
         } else {
             String::new()
         };
@@ -189,8 +200,8 @@ impl TaskStore for WrkspcTaskStore {
         Ok(ListTasksResponse {
             tasks,
             next_page_token,
-            page_size: page_size as i32,
-            total_size: total as i32,
+            page_size: i32::try_from(page_size).unwrap_or(i32::MAX),
+            total_size: i32::try_from(total).unwrap_or(i32::MAX),
         })
     }
 
@@ -208,7 +219,7 @@ impl TaskStore for WrkspcTaskStore {
             .store
             .task_get(task_id)
             .await
-            .map_err(|e| A2AError::internal(e.to_string()))?
+            .map_err(internal_store_error)?
             .ok_or_else(|| A2AError::task_not_found(task_id))?;
         let mut snapshot: serde_json::Value = serde_json::from_str(&current.task_json)
             .map_err(|e| A2AError::internal(e.to_string()))?;

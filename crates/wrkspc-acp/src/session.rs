@@ -45,7 +45,7 @@ enum Command {
     SetConfigOption {
         session_id: String,
         config_id: String,
-        value: String,
+        value: SessionConfigOptionValue,
         respond: oneshot::Sender<Result<()>>,
     },
     Cancel {
@@ -78,8 +78,6 @@ impl Clone for SessionHandle {
 impl SessionHandle {
     /// Spawns the session task on `transport`.
     ///
-    /// # Arguments
-    ///
     /// * `transport` — the ACP transport (stdio today, HTTP later).
     ///
     /// # Returns
@@ -92,10 +90,7 @@ impl SessionHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         let (ev_tx, ev_rx) = tokio::sync::broadcast::channel::<SessionEvent>(256);
         let task: crate::transport::ConnectionTask = Box::new(move |connection| {
-            Box::pin(async move {
-                run_session_loop(connection, cmd_rx).await;
-                Ok(())
-            })
+            Box::pin(async move { run_session_loop(connection, cmd_rx).await })
         });
         let (closed_tx, closed_rx) = tokio::sync::watch::channel::<Option<String>>(None);
         tokio::spawn(async move {
@@ -142,8 +137,8 @@ impl SessionHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`AcpError::Protocol`](AcpError::Protocol) when the adapter
-    /// rejects the request and [`AcpError::NotRunning`](AcpError::NotRunning)
+    /// Returns [`AcpError::Protocol`] when the adapter
+    /// rejects the request and [`AcpError::NotRunning`]
     /// when the session task is gone.
     pub async fn new_session(&self, cwd: PathBuf) -> Result<String> {
         self.new_session_with_mcp(cwd, Vec::new()).await
@@ -153,78 +148,84 @@ impl SessionHandle {
     /// server injection (ACP `session/new` `mcpServers` — the harness
     /// sees the wrkspc tools from its first turn).
     ///
-    /// # Arguments
-    ///
-    /// * `cwd` — the session's working directory.
+    /// * `cwd` — the session's working directory; relative paths are
+    ///   resolved against the client process cwd before the request is
+    ///   sent (the ACP contract requires an absolute path).
     /// * `mcp_servers` — the MCP servers to inject (stdio today; HTTP when
     ///   the harness advertises `mcp_capabilities.http`).
     ///
     /// # Errors
     ///
-    /// Returns [`AcpError::Protocol`](AcpError::Protocol) when the adapter
-    /// rejects the request and [`AcpError::NotRunning`](AcpError::NotRunning)
+    /// Returns [`AcpError::Protocol`] when the adapter
+    /// rejects the request and [`AcpError::NotRunning`]
     /// when the session task is gone.
     pub async fn new_session_with_mcp(
         &self,
         cwd: PathBuf,
         mcp_servers: Vec<McpServer>,
     ) -> Result<String> {
+        // ACP NewSessionRequest.cwd must be absolute; anchor relative
+        // paths at the client process cwd instead of leaking a bare
+        // relative path to the adapter.
+        let cwd = std::path::absolute(cwd).map_err(|error| {
+            AcpError::Protocol(format!("failed to resolve session cwd: {error}"))
+        })?;
         let (respond, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Command::NewSession {
+        round_trip(
+            &self.cmd_tx,
+            Command::NewSession {
                 cwd,
                 mcp_servers,
                 respond,
-            })
-            .await
-            .map_err(|_| AcpError::NotRunning)?;
-        rx.await.map_err(|_| AcpError::NotRunning)?
+            },
+            rx,
+        )
+        .await
     }
 
     /// Sends a prompt and waits for the turn's stop reason.
-    ///
-    /// # Arguments
     ///
     /// * `session_id` — the target session.
     /// * `blocks` — the prompt content blocks.
     ///
     /// # Errors
     ///
-    /// Returns [`AcpError::Protocol`](AcpError::Protocol) on adapter error
-    /// and [`AcpError::NotRunning`](AcpError::NotRunning) when the session
-    /// task is gone.
+    /// Returns [`AcpError::Protocol`] on adapter error,
+    /// [`AcpError::NotRunning`] when the session task is gone, and
+    /// [`AcpError::QueueFull`] when the serialized prompt queue is at its
+    /// admission bound and the prompt was definitely not sent.
     pub async fn prompt(
         &self,
         session_id: impl Into<String>,
         blocks: Vec<ContentBlock>,
     ) -> Result<StopReason> {
         let (respond, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Command::Prompt {
+        round_trip(
+            &self.cmd_tx,
+            Command::Prompt {
                 session_id: session_id.into(),
                 blocks,
                 respond,
-            })
-            .await
-            .map_err(|_| AcpError::NotRunning)?;
-        rx.await.map_err(|_| AcpError::NotRunning)?
+            },
+            rx,
+        )
+        .await
     }
 
-    /// Sets a session configuration option (ACP `session/set_config_option`).
+    /// Sets a session configuration option to a string value id (ACP
+    /// `session/set_config_option`).
     ///
     /// The antigravity binding uses `config_id = "model"` for D-4b's
     /// mandatory per-session model pinning.
     ///
-    /// # Arguments
-    ///
     /// * `session_id` — the target session.
     /// * `config_id` — the option's config id (e.g. `"model"`).
-    /// * `value` — the option value.
+    /// * `value` — the option's value id.
     ///
     /// # Errors
     ///
-    /// Returns [`AcpError::Protocol`](AcpError::Protocol) when the adapter
-    /// rejects the request and [`AcpError::NotRunning`](AcpError::NotRunning)
+    /// Returns [`AcpError::Protocol`] when the adapter
+    /// rejects the request and [`AcpError::NotRunning`]
     /// when the session task is gone.
     pub async fn set_config_option(
         &self,
@@ -232,17 +233,45 @@ impl SessionHandle {
         config_id: impl Into<String>,
         value: impl Into<String>,
     ) -> Result<()> {
+        self.set_config_option_value(
+            session_id,
+            config_id,
+            SessionConfigOptionValue::value_id(value.into()),
+        )
+        .await
+    }
+
+    /// Sets a session configuration option to a typed value (ACP
+    /// `session/set_config_option`).
+    ///
+    /// * `session_id` — the target session.
+    /// * `config_id` — the option's config id.
+    /// * `value` — the typed option value; [`SessionConfigOptionValue::Boolean`]
+    ///   reaches boolean options that the string form cannot express.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Protocol`] when the adapter
+    /// rejects the request and [`AcpError::NotRunning`]
+    /// when the session task is gone.
+    pub async fn set_config_option_value(
+        &self,
+        session_id: impl Into<String>,
+        config_id: impl Into<String>,
+        value: SessionConfigOptionValue,
+    ) -> Result<()> {
         let (respond, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Command::SetConfigOption {
+        round_trip(
+            &self.cmd_tx,
+            Command::SetConfigOption {
                 session_id: session_id.into(),
                 config_id: config_id.into(),
-                value: value.into(),
+                value,
                 respond,
-            })
-            .await
-            .map_err(|_| AcpError::NotRunning)?;
-        rx.await.map_err(|_| AcpError::NotRunning)?
+            },
+            rx,
+        )
+        .await
     }
 
     /// Requests cancellation of the session's in-flight turn.
@@ -254,7 +283,7 @@ impl SessionHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`AcpError::NotRunning`](AcpError::NotRunning) when the
+    /// Returns [`AcpError::NotRunning`] when the
     /// session task is gone.
     pub async fn cancel(&self, session_id: impl Into<String>) -> Result<()> {
         self.cmd_tx
@@ -267,11 +296,15 @@ impl SessionHandle {
 
     /// Shuts the session task down and tears down the adapter connection.
     ///
+    /// Takes `&self`, so shared handles shut down without an extra clone
+    /// and the handle stays usable to observe [`SessionHandle::closed`]
+    /// after the teardown is ordered.
+    ///
     /// # Errors
     ///
-    /// Returns [`AcpError::NotRunning`](AcpError::NotRunning) when the
+    /// Returns [`AcpError::NotRunning`] when the
     /// session task is already gone.
-    pub async fn shutdown(self) -> Result<()> {
+    pub async fn shutdown(&self) -> Result<()> {
         self.cmd_tx
             .send(Command::Shutdown)
             .await
@@ -279,37 +312,90 @@ impl SessionHandle {
     }
 }
 
-async fn run_session_loop(connection: ConnectionTo<Agent>, mut cmd_rx: mpsc::Receiver<Command>) {
-    // Initialize once, before serving any session command. If the adapter
-    // cannot initialize, fail every command explicitly rather than hang.
-    let init = connection
+/// Sends one command and awaits its oneshot reply; a channel failure on
+/// either leg means the session task is gone, so the request was
+/// definitely not sent.
+async fn round_trip<T>(
+    cmd_tx: &mpsc::Sender<Command>,
+    command: Command,
+    rx: oneshot::Receiver<Result<T>>,
+) -> Result<T> {
+    cmd_tx
+        .send(command)
+        .await
+        .map_err(|_| AcpError::NotRunning)?;
+    rx.await.map_err(|_| AcpError::NotRunning)?
+}
+
+/// One serialized unit of work on the connection. Prompts, session
+/// creation, and config updates share the single in-flight slot: the
+/// loop never awaits an adapter future inline, so Shutdown and Cancel
+/// stay serviceable even while an adapter stalls mid-request — a hung
+/// session/new or session/set_config_option must not wedge teardown
+/// the way a hung prompt previously could not.
+enum Unit {
+    Prompt {
+        session_id: String,
+        blocks: Vec<ContentBlock>,
+        respond: oneshot::Sender<Result<StopReason>>,
+    },
+    NewSession {
+        cwd: PathBuf,
+        mcp_servers: Vec<McpServer>,
+        respond: oneshot::Sender<Result<String>>,
+    },
+    SetConfig {
+        session_id: String,
+        config_id: String,
+        value: SessionConfigOptionValue,
+        respond: oneshot::Sender<Result<()>>,
+    },
+}
+
+async fn run_session_loop(
+    connection: ConnectionTo<Agent>,
+    mut cmd_rx: mpsc::Receiver<Command>,
+) -> std::result::Result<(), agent_client_protocol::Error> {
+    // Initialize once, before serving any session command. A refused
+    // initialize FAILS THE CONNECTION: the loop returns the error, the
+    // transport task tears the child down, and closed() carries the
+    // reason — a half-alive session that answers NotRunning forever
+    // would look connected to the registry and never be evicted.
+    if let Err(error) = connection
         .send_request(InitializeRequest::new(ProtocolVersion::V1))
         .block_task()
-        .await;
-    let initialized = init.is_ok();
-    if let Err(error) = &init {
-        tracing::error!(
-            %error,
-            "adapter initialize failed; session commands will be refused",
-        );
+        .await
+    {
+        // A refused initialize FAILS THE CONNECTION: the error rides
+        // the connection task into with_connection, the child is torn
+        // down, and closed() carries the reason — a half-alive session
+        // that answered NotRunning forever would look connected to the
+        // registry and never be evicted.
+        tracing::error!(%error, "adapter initialize failed");
+        return Err(error);
     }
 
-    // Prompts are serialized (one in-flight turn per session) but cancel and
-    // shutdown are serviced mid-turn: the prompt runs as a subtask while the
-    // loop keeps receiving commands. The pending queue is BOUNDED (E11):
-    // beyond the admission bound, a prompt is rejected as definitely unsent
-    // instead of growing the queue without limit.
-    const MAX_PENDING: usize = 64;
-    let mut pending: std::collections::VecDeque<(
-        String,
-        Vec<ContentBlock>,
-        oneshot::Sender<Result<StopReason>>,
-    )> = std::collections::VecDeque::new();
+    // Serialization: one unit in flight at a time; the unit runs as a
+    // subtask while the loop keeps receiving commands (cancel and
+    // shutdown are serviced mid-turn). The pending queue is BOUNDED
+    // (E11): beyond the admission bound a unit is rejected as
+    // definitely unsent instead of growing the queue without limit.
+    let mut pending: std::collections::VecDeque<Unit> = std::collections::VecDeque::new();
     let mut in_flight = false;
     let mut done_rx: Option<oneshot::Receiver<()>> = None;
 
     loop {
         tokio::select! {
+            // The SDK resolves incoming_closed on clean EOF — the
+            // adapter child exiting closes its stdout even when no
+            // request is in flight. Observing it here is the SDK's
+            // documented pattern for main_fn in connect_with mode;
+            // without it a dead cached adapter stays connected in
+            // presence (decls) until a command or eviction touches it.
+            _ = connection.incoming_closed() => {
+                tracing::info!("ACP adapter connection closed; ending the session loop");
+                break;
+            }
             _ = async {
                 if let Some(rx) = &mut done_rx {
                     let _ = rx.await;
@@ -317,14 +403,14 @@ async fn run_session_loop(connection: ConnectionTo<Agent>, mut cmd_rx: mpsc::Rec
             }, if done_rx.is_some() => {
                 done_rx = None;
                 in_flight = false;
-                // Skip queued prompts whose caller has abandoned them:
-                // a dropped receiver means the prompt was never sent,
+                // Skip queued units whose caller has abandoned them:
+                // a dropped receiver means the request was never sent,
                 // so it must not start later (E11).
-                while let Some((session_id, blocks, respond)) = pending.pop_front() {
-                    if respond.is_closed() {
+                while let Some(unit) = pending.pop_front() {
+                    if unit_abandoned(&unit) {
                         continue;
                     }
-                    start_prompt(&connection, &mut done_rx, session_id, blocks, respond);
+                    start_unit(&connection, &mut done_rx, unit);
                     in_flight = true;
                     break;
                 }
@@ -337,67 +423,39 @@ async fn run_session_loop(connection: ConnectionTo<Agent>, mut cmd_rx: mpsc::Rec
                         cwd,
                         mcp_servers,
                         respond,
-                    } => {
-                        let outcome = if initialized {
-                            connection
-                                .send_request(
-                                    NewSessionRequest::new(cwd).mcp_servers(mcp_servers),
-                                )
-                                .block_task()
-                                .await
-                                .map(|r| r.session_id.to_string())
-                                .map_err(AcpError::from)
-                        } else {
-                            Err(AcpError::NotRunning)
-                        };
-                        let _ = respond.send(outcome);
-                    }
+                    } => submit_unit(
+                        &connection,
+                        &mut done_rx,
+                        &mut pending,
+                        &mut in_flight,
+                        Unit::NewSession { cwd, mcp_servers, respond },
+                    ),
                     Command::Prompt {
                         session_id,
                         blocks,
                         respond,
-                    } => {
-                        if !initialized {
-                            let _ = respond.send(Err(AcpError::NotRunning));
-                        } else if in_flight {
-                            if pending.len() >= MAX_PENDING {
-                                // Definitely unsent: reject loudly instead
-                                // of queueing without bound (E11).
-                                let _ = respond.send(Err(AcpError::QueueFull));
-                            } else {
-                                pending.push_back((session_id, blocks, respond));
-                            }
-                        } else {
-                            start_prompt(&connection, &mut done_rx, session_id, blocks, respond);
-                            in_flight = true;
-                        }
-                    }
+                    } => submit_unit(
+                        &connection,
+                        &mut done_rx,
+                        &mut pending,
+                        &mut in_flight,
+                        Unit::Prompt { session_id, blocks, respond },
+                    ),
                     Command::SetConfigOption {
                         session_id,
                         config_id,
                         value,
                         respond,
-                    } => {
-                        let outcome = if initialized {
-                            connection
-                                .send_request(SetSessionConfigOptionRequest::new(
-                                    session_id,
-                                    SessionConfigId::new(config_id),
-                                    SessionConfigOptionValue::value_id(value),
-                                ))
-                                .block_task()
-                                .await
-                                .map(|_| ())
-                                .map_err(AcpError::from)
-                        } else {
-                            Err(AcpError::NotRunning)
-                        };
-                        let _ = respond.send(outcome);
-                    }
+                    } => submit_unit(
+                        &connection,
+                        &mut done_rx,
+                        &mut pending,
+                        &mut in_flight,
+                        Unit::SetConfig { session_id, config_id, value, respond },
+                    ),
                     Command::Cancel { session_id } => {
-                        if initialized
-                            && let Err(error) =
-                                connection.send_notification(CancelNotification::new(session_id))
+                        if let Err(error) =
+                            connection.send_notification(CancelNotification::new(session_id))
                         {
                             tracing::warn!(%error, "session/cancel notification failed");
                         }
@@ -406,28 +464,116 @@ async fn run_session_loop(connection: ConnectionTo<Agent>, mut cmd_rx: mpsc::Rec
             }
         }
     }
+    Ok(())
 }
 
-/// Spawns one prompt turn as a subtask. On completion the caller's channel
-/// receives the outcome and the serialization slot is released via `done_tx`.
-fn start_prompt(
+/// Whether the caller of a queued unit has gone away.
+fn unit_abandoned(unit: &Unit) -> bool {
+    match unit {
+        Unit::Prompt { respond, .. } => respond.is_closed(),
+        Unit::NewSession { respond, .. } => respond.is_closed(),
+        Unit::SetConfig { respond, .. } => respond.is_closed(),
+    }
+}
+
+/// Routes one unit into the serialization slot: starts it immediately
+/// when the slot is free, queues it (bounded), or rejects it as
+/// definitely unsent when the queue is full (E11).
+fn submit_unit(
     connection: &ConnectionTo<Agent>,
     done_slot: &mut Option<oneshot::Receiver<()>>,
-    session_id: String,
-    blocks: Vec<ContentBlock>,
-    respond: oneshot::Sender<Result<StopReason>>,
+    pending: &mut std::collections::VecDeque<Unit>,
+    in_flight: &mut bool,
+    unit: Unit,
+) {
+    const MAX_PENDING: usize = 64;
+    if *in_flight {
+        if pending.len() >= MAX_PENDING {
+            match unit {
+                Unit::Prompt { respond, .. } => {
+                    let _ = respond.send(Err(AcpError::QueueFull));
+                }
+                Unit::NewSession { respond, .. } => {
+                    let _ = respond.send(Err(AcpError::QueueFull));
+                }
+                Unit::SetConfig { respond, .. } => {
+                    let _ = respond.send(Err(AcpError::QueueFull));
+                }
+            }
+        } else {
+            pending.push_back(unit);
+        }
+    } else {
+        // Fast path: the slot is free. A caller that dropped its
+        // oneshot between enqueueing the command and this dispatch
+        // must not have the request sent — a sent bid with no waiter
+        // would duplicate on timeout-retry (E11).
+        if unit_abandoned(&unit) {
+            return;
+        }
+        *in_flight = true;
+        start_unit(connection, done_slot, unit);
+    }
+}
+
+/// Spawns one unit as a subtask. On completion the caller's channel
+/// receives the outcome and the serialization slot is released via
+/// `done_tx`.
+fn start_unit(
+    connection: &ConnectionTo<Agent>,
+    done_slot: &mut Option<oneshot::Receiver<()>>,
+    unit: Unit,
 ) {
     let connection = connection.clone();
     let (done_tx, done_rx) = oneshot::channel();
     *done_slot = Some(done_rx);
     tokio::spawn(async move {
-        let outcome = connection
-            .send_request(PromptRequest::new(session_id, blocks))
-            .block_task()
-            .await
-            .map(|r| r.stop_reason)
-            .map_err(AcpError::from);
-        let _ = respond.send(outcome);
+        match unit {
+            Unit::Prompt {
+                session_id,
+                blocks,
+                respond,
+            } => {
+                let outcome = connection
+                    .send_request(PromptRequest::new(session_id, blocks))
+                    .block_task()
+                    .await
+                    .map(|r| r.stop_reason)
+                    .map_err(AcpError::from);
+                let _ = respond.send(outcome);
+            }
+            Unit::NewSession {
+                cwd,
+                mcp_servers,
+                respond,
+            } => {
+                let outcome = connection
+                    .send_request(NewSessionRequest::new(cwd).mcp_servers(mcp_servers))
+                    .block_task()
+                    .await
+                    .map(|r| r.session_id.to_string())
+                    .map_err(AcpError::from);
+                let _ = respond.send(outcome);
+            }
+            Unit::SetConfig {
+                session_id,
+                config_id,
+                value,
+                respond,
+            } => {
+                let outcome = connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session_id,
+                        SessionConfigId::new(config_id),
+                        value,
+                    ))
+                    .block_task()
+                    .await
+                    .map(|_| ())
+                    .map_err(AcpError::from);
+                let _ = respond.send(outcome);
+            }
+        }
         let _ = done_tx.send(());
     });
 }

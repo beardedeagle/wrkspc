@@ -17,7 +17,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// attempt does not exist or is not in the `unknown` state.
     pub async fn reconcile_unknown(
         &self,
@@ -25,7 +25,11 @@ impl Store {
         decision: Reconciliation,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        // IMMEDIATE: the reconcile is a read-modify-write over attempts
+        // and intents — the snapshot must not be promotable under a
+        // concurrent writer (deferred reads surface SQLITE_BUSY_SNAPSHOT
+        // on the write upgrade).
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let row = sqlx::query(
             "SELECT a.intent_id, a.state, m.conversation_id
@@ -53,7 +57,21 @@ impl Store {
 
         let decision_label = match &decision {
             Reconciliation::Retry => "retry".to_string(),
-            Reconciliation::Close { state } => format!("close:{}", state.as_str()),
+            Reconciliation::Close { state } => {
+                // A non-terminal Close is a caller bug (the operator
+                // surface only offers terminal states), but it must be a
+                // typed error, never a release-build panic: the
+                // debug_assert below evaporates under --release and the
+                // unreachable arm would fire in production.
+                if !state.is_terminal() {
+                    return Err(StoreError::TerminalState {
+                        attempt: attempt_id.to_string(),
+                        state: "unknown".to_string(),
+                        requested: state.as_str().to_string(),
+                    });
+                }
+                format!("close:{}", state.as_str())
+            }
         };
 
         match decision {
@@ -73,7 +91,6 @@ impl Store {
                     .await?;
             }
             Reconciliation::Close { state } => {
-                debug_assert!(state.is_terminal());
                 sqlx::query(
                     "UPDATE attempts
                      SET state = ?, stop_reason = 'operator-reconciled', terminal_at = ?
@@ -88,7 +105,15 @@ impl Store {
                     AttemptState::Completed => IntentState::Completed,
                     AttemptState::Failed => IntentState::Failed,
                     AttemptState::Canceled => IntentState::Canceled,
-                    _ => unreachable!("terminal assertion above"),
+                    // Unreachable by the typed guard above; a defensive
+                    // error keeps this a no-panic path regardless.
+                    other => {
+                        return Err(StoreError::TerminalState {
+                            attempt: attempt_id.to_string(),
+                            state: "unknown".to_string(),
+                            requested: other.as_str().to_string(),
+                        });
+                    }
                 };
                 sqlx::query("UPDATE execution_intents SET state = ? WHERE id = ?")
                     .bind(intent_state.as_str())

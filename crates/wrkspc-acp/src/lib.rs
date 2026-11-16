@@ -14,5 +14,5 @@ pub mod transport;
 
 pub use error::{AcpError, Result};
 pub use session::{SessionEvent, SessionHandle};
-pub use stop::stop_reason_to_attempt_state;
+pub use stop::{stop_reason_str, stop_reason_to_attempt_state};
 pub use transport::{AcpTransport, StdioTransport};

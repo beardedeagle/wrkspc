@@ -40,11 +40,9 @@ pub struct PresenceBody {
 impl PresenceState {
     /// Builds the state.
     ///
-    /// # Arguments
-    ///
-    /// * `store` — the hub's transactional store.
-    /// * `base_url` — the hub's card base URL (for per-peer cards).
-    /// * `mtls` — whether the hub's TLS surface serves the cards.
+    /// `store` is the hub's transactional store; `base_url` is the hub's
+    /// card base URL (for per-peer cards); `mtls` is whether the hub's
+    /// TLS surface serves the cards.
     pub fn new(store: Store, base_url: String, mtls: bool) -> Self {
         Self {
             store,
@@ -69,6 +67,16 @@ pub async fn presence_upsert(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "unknown presence state" })),
+        )
+            .into_response();
+    }
+    // The class is validated against the same vocabulary discipline as
+    // the state: it is forwarded verbatim into roster cards, so a junk
+    // value (`class: "banana"`) must never persist.
+    if !matches!(body.class.as_str(), "harness" | "human" | "a2a_native") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "unknown peer class" })),
         )
             .into_response();
     }
@@ -128,11 +136,9 @@ pub async fn roster_get(
 /// the rest, so the room set, its members, and the operator's names agree across
 /// machines instead of each store knowing only what it happened to see.
 ///
-/// # Arguments
-///
-/// * `state` — the discovery state holding the hub's store.
-/// * `headers` — the stamped identity headers; a request without a peer stamp
-///   is refused.
+/// `state` is the discovery state holding the hub's store; `headers`
+/// carries the stamped identity — a request without a peer stamp is
+/// refused.
 ///
 /// # Returns
 ///
@@ -319,6 +325,41 @@ mod tests {
             post_presence(&router, None, "codex", "connected").await,
             StatusCode::UNAUTHORIZED
         );
+        assert!(store.roster_entry("codex").await.unwrap().is_none());
+    }
+
+    // A peer class outside the vocabulary is refused like an unknown
+    // state: the class is persisted verbatim into roster cards.
+    #[tokio::test]
+    async fn unknown_presence_class_is_rejected() {
+        let store = Store::open_in_memory("presence-route-class").await.unwrap();
+        let router = router_under_test(PresenceState::new(
+            store.clone(),
+            "https://hub.test".to_string(),
+            true,
+        ));
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/presence")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("x-wrkspc-peer", identity("node-test-1"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "peerId": "codex",
+                            "name": "codex",
+                            "class": "banana",
+                            "state": "connected",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(store.roster_entry("codex").await.unwrap().is_none());
     }
 

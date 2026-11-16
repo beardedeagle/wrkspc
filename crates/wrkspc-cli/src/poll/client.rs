@@ -12,11 +12,9 @@ const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// certificate is verified against `ca`, and the node presents its own
 /// certificate (`cert` + `key`) as the client identity.
 ///
-/// # Arguments
-///
-/// * `ca` — CA PEM that signed the hub certificate.
-/// * `cert` — this node's client certificate PEM.
-/// * `key` — this node's client private key PEM.
+/// `ca` is the CA PEM that signed the hub certificate; `cert` is this
+/// node's client certificate PEM; `key` is this node's client private
+/// key PEM.
 ///
 /// # Returns
 ///
@@ -42,12 +40,10 @@ pub fn build_hub_client(
 /// connection that completes TCP but never finishes TLS wedges the
 /// whole tick silently forever — the poll loop has no other clock.
 ///
-/// # Arguments
-///
-/// * `ca` — CA PEM that signed the hub certificate.
-/// * `cert` — this node's client certificate PEM.
-/// * `key` — this node's client private key PEM.
-/// * `timeout` — total per-request bound (connect + handshake + read).
+/// `ca` is the CA PEM that signed the hub certificate; `cert` is this
+/// node's client certificate PEM; `key` is this node's client private
+/// key PEM; `timeout` is the total per-request bound (connect +
+/// handshake + read).
 ///
 /// # Returns
 ///

@@ -42,12 +42,25 @@ core-foundation = "0.10"
 security-framework = "3"
 security-framework-sys = "2"
 
+[target.'cfg(windows)'.dependencies]
+# Owner-only DACLs on credential files: Windows has no
+# umask, so token files get a current-user-only, inheritance-free ACL
+# through the platform ACL APIs. 0.61 is already in the dependency
+# graph, so this promotes an existing crate rather than adding one.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
 # The workspace lint table, spelled out because Cargo forbids
 # `workspace = true` combined with overrides: the ONLY deviation is
 # the reviewed platform-FFI exception below (T05). Keep this table in
 # sync with the root `[workspace.lints]`.
 [lints.rust]
-unsafe_code = "allow"
+unsafe_code = "deny"
 future_incompatible = { level = "deny", priority = -1 }
 rust_2018_idioms = { level = "warn", priority = -1 }
 unused = { level = "warn", priority = -1 }
@@ -66,12 +79,14 @@ print_stdout = "allow"
 unimplemented = "warn"
 wildcard_dependencies = "deny"
 
-# The reviewed platform-FFI exception: this crate's macOS Keychain
-# integration (src/secrets.rs) and the one geteuid call (src/util.rs,
-# unix-only) are unsafe by nature — security-framework-sys / libc
-# bindings — and live in clearly marked, cfg-gated functions with the
-# policy documented at each site. Every OTHER crate inherits
-# unsafe_code = "forbid" unchanged from the workspace table.
+# The reviewed platform-FFI exception (T05): this crate's macOS Keychain
+# integration (src/secrets.rs), the geteuid/Windows-ACL calls
+# (src/util.rs), the rlimit guard (src/harden.rs), and the harden
+# test's child probe are unsafe by nature — security-framework-sys /
+# libc / windows-sys bindings. Unlike the previous crate-wide `allow`,
+# unsafe_code is DENIED crate-wide (any new unsafe anywhere fails the
+# build) and each reviewed FFI site carries its own scoped
+# `#[allow(unsafe_code)]` — the grep-able exception list.
 
 
 [dev-dependencies]

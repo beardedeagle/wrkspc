@@ -5,46 +5,19 @@
 
 mod common;
 use common::*;
-use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
 use wrkspc_core::Store;
-use wrkspc_ui::{UiConfig, UiServer};
+use wrkspc_ui::UiConfig;
 
-/// Boots a UI surface with the given role flags and returns
-/// (base_url, shutdown sender, server task).
-async fn boot(
-    store: Store,
-    hub_role: bool,
-    hub_connected: bool,
-) -> (String, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
-    let cancel: Arc<FakeCancel> = Arc::new(FakeCancel {
-        calls: Mutex::new(Vec::new()),
-    });
-    let ui = UiServer::new(
-        store,
-        cancel,
-        UiConfig {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            cookie_secure: false,
-            token: Some(TOKEN.to_string()),
-            queue_remote_deliveries: hub_role,
-            hub_role,
-            hub_connected,
-        },
-        None,
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(async move {
-        ui.serve_on(listener, async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .expect("ui serves");
-    });
-    (format!("http://{addr}"), shutdown_tx, server)
+/// The role configuration the wave-5 harness boots with: the pinned
+/// test token, and delivery queueing following the hub role.
+fn wave5_config(hub_role: bool, hub_connected: bool) -> UiConfig {
+    UiConfig {
+        queue_remote_deliveries: hub_role,
+        hub_role,
+        hub_connected,
+        token: Some(TOKEN.to_string()),
+        ..Default::default()
+    }
 }
 
 fn patch(url: &str, body: serde_json::Value) -> reqwest::RequestBuilder {
@@ -68,7 +41,8 @@ async fn alias_can_be_cleared_with_an_explicit_null() {
         .set_peer_alias("codex", Some("Rover"), "operator")
         .await
         .unwrap();
-    let (base, shutdown, server) = boot(store.clone(), true, false).await;
+    let ui = spawn_ui_on(store.clone(), wave5_config(true, false)).await;
+    let base = ui.base.clone();
 
     let res = patch(
         &format!("{base}/api/peers/codex"),
@@ -89,8 +63,7 @@ async fn alias_can_be_cleared_with_an_explicit_null() {
         .expect("peer exists");
     assert!(entry.alias.is_none(), "the alias must be gone: {entry:#?}");
 
-    let _ = shutdown.send(());
-    let _ = server.await;
+    let _ = ui.shutdown.send(());
 }
 
 /// UI-10: an invalid status must not leave a partial alias mutation,
@@ -102,7 +75,8 @@ async fn peer_patch_validates_before_mutating_and_404s_unknown_targets() {
         .upsert_roster_presence("codex", "codex", "harness", "node-test-1", "connected")
         .await
         .unwrap();
-    let (base, shutdown, server) = boot(store.clone(), true, false).await;
+    let ui = spawn_ui_on(store.clone(), wave5_config(true, false)).await;
+    let base = ui.base.clone();
 
     // Valid alias + invalid status: 400 and NO alias change.
     let res = patch(
@@ -134,8 +108,7 @@ async fn peer_patch_validates_before_mutating_and_404s_unknown_targets() {
     .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
 
-    let _ = shutdown.send(());
-    let _ = server.await;
+    let _ = ui.shutdown.send(());
 }
 
 /// UI-18: a room the operator is not a member of cannot be created —
@@ -152,7 +125,8 @@ async fn room_creation_requires_the_operator() {
         .upsert_roster_presence("agy", "agy", "harness", "node-test-1", "connected")
         .await
         .unwrap();
-    let (base, shutdown, server) = boot(store.clone(), true, false).await;
+    let ui = spawn_ui_on(store.clone(), wave5_config(true, false)).await;
+    let base = ui.base.clone();
 
     let res = reqwest::Client::new()
         .post(format!("{base}/api/conversations"))
@@ -167,8 +141,7 @@ async fn room_creation_requires_the_operator() {
         "a room without the operator must be refused"
     );
 
-    let _ = shutdown.send(());
-    let _ = server.await;
+    let _ = ui.shutdown.send(());
 }
 
 /// UI-08: on a hub-connected node, hub-owned mutations (conversation
@@ -189,7 +162,8 @@ async fn connected_node_refuses_hub_owned_mutations() {
         .create_conversation(&["operator", "codex"])
         .await
         .unwrap();
-    let (base, shutdown, server) = boot(store.clone(), false, true).await;
+    let ui = spawn_ui_on(store.clone(), wave5_config(false, true)).await;
+    let base = ui.base.clone();
 
     // Alias: 409 with a clear explanation.
     let res = patch(
@@ -217,6 +191,5 @@ async fn connected_node_refuses_hub_owned_mutations() {
         .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::CONFLICT);
 
-    let _ = shutdown.send(());
-    let _ = server.await;
+    let _ = ui.shutdown.send(());
 }

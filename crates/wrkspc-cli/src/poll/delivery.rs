@@ -46,64 +46,59 @@ pub struct Delivery {
 impl Delivery {
     /// Parses a delivery from a hub task row's payload.
     ///
-    /// # Arguments
-    ///
-    /// * `task` — the hub task row.
+    /// `task` is the hub task row.
     ///
     /// # Returns
     ///
     /// The delivery, or `None` when the row is not a well-formed
     /// delivery payload.
     pub fn from_task_row(task: &TaskRow) -> Option<Self> {
-        let payload: serde_json::Value = serde_json::from_str(&task.task_json).ok()?;
-        let delivery = payload
-            .get("metadata")
-            .and_then(|metadata| metadata.get("delivery"))?;
-        if delivery.get("kind").and_then(|k| k.as_str()) != Some("delivery") {
+        // The typed envelope — a corrupt blob is visible to the
+        // operator, never silently skipped like a non-delivery row: a
+        // delivery this node should have mirrored is otherwise lost
+        // without a trace. A blob without the envelope or the delivery
+        // kind is malformed, never a different legitimate task type:
+        // log it so a wedged row is distinguishable from an empty
+        // queue.
+        let Some(envelope) = wrkspc_core::DeliveryEnvelope::from_task_json(&task.task_json) else {
+            tracing::warn!(
+                task_id = %task.task_id,
+                "delivery task payload carries no delivery envelope; skipping",
+            );
+            return None;
+        };
+        if envelope.kind != "delivery" {
+            tracing::warn!(
+                task_id = %task.task_id,
+                "delivery task payload carries no delivery kind; skipping",
+            );
             return None;
         }
-        let field = |key: &str| {
-            delivery
-                .get(key)
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        };
         Some(Self {
             task_id: task.task_id.clone(),
-            message_id: field("message_id")?,
-            origin_message_id: delivery
-                .get("origin_message_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            conversation_id: field("conversation_id")?,
-            sender_peer: field("sender_peer")?,
-            sender_name: field("sender_name").unwrap_or_default(),
-            sender_class: field("sender_class").unwrap_or_default(),
-            sender_host: field("sender_host")?,
-            recipient_peer: field("recipient_peer")?,
-            recipient_name: field("recipient_name").unwrap_or_default(),
-            recipient_class: field("recipient_class").unwrap_or_default(),
-            content: field("content").unwrap_or_default(),
-            execution_requested: delivery
-                .get("execution_requested")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            guidance: delivery
-                .get("guidance")
-                .and_then(|v| v.as_array())
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter_map(|entry| {
-                            Some((
-                                entry.get("id")?.as_str()?.to_string(),
-                                entry.get("author_id")?.as_str()?.to_string(),
-                                entry.get("text")?.as_str()?.to_string(),
-                            ))
-                        })
-                        .collect()
+            message_id: envelope.message_id,
+            origin_message_id: envelope.origin_message_id,
+            conversation_id: envelope.conversation_id,
+            sender_peer: envelope.sender_peer,
+            sender_name: envelope.sender_name,
+            sender_class: envelope.sender_class,
+            sender_host: envelope.sender_host,
+            recipient_peer: envelope.recipient_peer,
+            recipient_name: envelope.recipient_name,
+            recipient_class: envelope.recipient_class,
+            content: envelope.content,
+            execution_requested: envelope.execution_requested,
+            guidance: envelope
+                .guidance
+                .iter()
+                .filter_map(|entry| {
+                    Some((
+                        entry.get("id")?.as_str()?.to_string(),
+                        entry.get("author_id")?.as_str()?.to_string(),
+                        entry.get("text")?.as_str()?.to_string(),
+                    ))
                 })
-                .unwrap_or_default(),
+                .collect(),
         })
     }
 }
@@ -148,16 +143,13 @@ pub enum ClaimOutcome {
 /// after the ack, so a crash anywhere in the chain re-runs the whole
 /// delivery idempotently on the next poll.
 ///
-/// # Arguments
-///
-/// * `store` — the node's local store.
-/// * `host_id` — this node's host id (its certificate SAN); the
-///   recipient peer is enrolled on it.
-/// * `tasks` — the hub's delivery task rows for this host.
-/// * `claim` — the claim callback (`POST /delivery-claim` over the
-///   mTLS client); returns the hub's claim verdict.
-/// * `ack` — the ack callback (`POST /delivery-ack` over the mTLS
-///   client); returns `true` on success.
+/// `store` is the node's local store; `host_id` is this node's host id
+/// (its certificate SAN), the host the recipient peer is enrolled on;
+/// `tasks` is the hub's delivery task rows for this host; `claim` is
+/// the claim callback (`POST /delivery-claim` over the mTLS client)
+/// returning the hub's claim verdict; `ack` is the ack callback
+/// (`POST /delivery-ack` over the mTLS client) returning `true` on
+/// success.
 ///
 /// # Returns
 ///
@@ -234,19 +226,25 @@ where
         }
         // Replay the hub's host assignment when the local projection is
         // stale: the hub is authoritative for peer records (A2
-        // contract), and assignment is append-only history.
-        if store
-            .peer_host(&delivery.sender_peer)
-            .await
-            .ok()
-            .flatten()
-            .as_deref()
-            != Some(delivery.sender_host.as_str())
-            && let Err(error) = store
-                .assign_peer_host(&delivery.sender_peer, &delivery.sender_host)
-                .await
-        {
-            tracing::warn!(%error, task_id = %delivery.task_id, "sender host assignment replay failed");
+        // contract), and assignment is append-only history. A store
+        // ERROR is not a stale projection — folding it into "mismatch"
+        // would trigger a spurious assignment replay; it fails the
+        // delivery instead (retried next poll).
+        match store.peer_host(&delivery.sender_peer).await {
+            Ok(Some(host)) if host == delivery.sender_host.as_str() => {}
+            Ok(_) => {
+                if let Err(error) = store
+                    .assign_peer_host(&delivery.sender_peer, &delivery.sender_host)
+                    .await
+                {
+                    tracing::warn!(%error, task_id = %delivery.task_id, "sender host assignment replay failed");
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, task_id = %delivery.task_id, "sender host lookup failed");
+                outcome.failed += 1;
+                continue;
+            }
         }
         if let Err(error) = store
             .ensure_peer_on_host(
@@ -261,18 +259,24 @@ where
             outcome.failed += 1;
             continue;
         }
-        if store
-            .peer_host(&delivery.recipient_peer)
-            .await
-            .ok()
-            .flatten()
-            .as_deref()
-            != Some(host_id)
-            && let Err(error) = store
-                .assign_peer_host(&delivery.recipient_peer, host_id)
-                .await
-        {
-            tracing::warn!(%error, task_id = %delivery.task_id, "recipient host assignment replay failed");
+        // The recipient's host projection is replayed the same way: a
+        // store ERROR fails the delivery instead of pretending the
+        // projection is stale (see the sender arm above).
+        match store.peer_host(&delivery.recipient_peer).await {
+            Ok(Some(host)) if host == host_id => {}
+            Ok(_) => {
+                if let Err(error) = store
+                    .assign_peer_host(&delivery.recipient_peer, host_id)
+                    .await
+                {
+                    tracing::warn!(%error, task_id = %delivery.task_id, "recipient host assignment replay failed");
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, task_id = %delivery.task_id, "recipient host lookup failed");
+                outcome.failed += 1;
+                continue;
+            }
         }
         if let Err(error) = store
             .ensure_conversation(
@@ -347,8 +351,53 @@ where
                 }
             }
             Err(error) => {
-                tracing::error!(%error, task_id = %delivery.task_id, "local record failed");
-                outcome.failed += 1;
+                match &error {
+                    // Permanent rejection verdicts (mirrors the acceptance
+                    // translation's mapping): no poll retry can change the
+                    // local store's answer — the hub-side record conflicts
+                    // with committed local state, or policy refuses it.
+                    // Warn, write the local skip marker (the next poll's
+                    // dedup gate passes over the delivery), and leave the
+                    // hub delivery unacked so it stays visible for operator
+                    // reconciliation instead of failing every poll with
+                    // log noise.
+                    wrkspc_core::StoreError::IdempotencyConflict { .. }
+                    | wrkspc_core::StoreError::ExecutionAuthorityConflict { .. }
+                    | wrkspc_core::StoreError::PeerEjected { .. }
+                    | wrkspc_core::StoreError::TooManyRecipients { .. } => {
+                        tracing::warn!(
+                            %error,
+                            task_id = %delivery.task_id,
+                            "delivery rejected permanently; skipping without retry"
+                        );
+                        if let Err(marker_error) = store
+                            .task_create(
+                                &delivery.task_id,
+                                host_id,
+                                "rejected",
+                                true,
+                                &task.task_json,
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                %marker_error,
+                                task_id = %delivery.task_id,
+                                "permanent-rejection marker failed"
+                            );
+                        }
+                    }
+                    // Transient (NotFound races on the mirror leg, Db
+                    // failures, anything else): the delivery stays pollable
+                    // and retries on the next poll — the hub keeps it
+                    // visible as "not enforced".
+                    _ => {
+                        tracing::error!(%error, task_id = %delivery.task_id, "local record failed");
+                        outcome.failed += 1;
+                    }
+                }
+                // Neither rejection path reaches the ack leg: the hub
+                // delivery is not enforced.
                 continue;
             }
         }
@@ -382,4 +431,218 @@ where
         outcome.processed += 1;
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a hub-side delivery task row payload for tests.
+    fn hub_delivery_row(task_id: &str) -> TaskRow {
+        TaskRow {
+            task_id: task_id.to_string(),
+            context_id: "node-test-1".to_string(),
+            state: "submitted".to_string(),
+            terminal: false,
+            version: 1,
+            task_json: serde_json::json!({
+                "id": task_id,
+                "contextId": "node-test-1",
+                "status": {"state": "TASK_STATE_SUBMITTED"},
+                "metadata": {
+                    "delivery": {
+                        "kind": "delivery",
+                        "message_id": "hub-msg-conflict",
+                        "conversation_id": "hub-conv-conflict",
+                        "sender_peer": "operator",
+                        "sender_name": "operator",
+                        "sender_class": "human",
+                        "sender_host": "hub-real-host",
+                        "recipient_peer": "codex",
+                        "recipient_name": "codex",
+                        "recipient_class": "harness",
+                        "content": "hello from the hub",
+                        "execution_requested": true,
+                        "guidance": [],
+                    },
+                },
+            })
+            .to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    /// A permanent acceptance verdict (idempotency conflict with
+    /// committed local state) skips WITHOUT retry: warn-level log, no
+    /// failed counter, no ack, and a local skip marker so the next
+    /// poll's dedup gate passes the delivery over.
+    #[tokio::test]
+    async fn permanent_acceptance_rejection_skips_without_retry() {
+        let store = Store::open_in_memory("poll-permanent").await.unwrap();
+        store
+            .ensure_peer("codex", "codex", "harness")
+            .await
+            .unwrap();
+        store
+            .ensure_peer("operator", "operator", "human")
+            .await
+            .unwrap();
+        // The delivery's idempotency key (`hub-msg-conflict`, the hub
+        // message id — there is no origin id) is already committed
+        // locally with DIFFERENT content: the hub-side record conflicts
+        // and no retry can change that.
+        assert!(
+            store
+                .ensure_conversation("hub-conv-conflict", &["operator"])
+                .await
+                .unwrap(),
+            "the delivery's conversation is created here"
+        );
+        store
+            .accept_message(
+                "hub-conv-conflict",
+                "operator",
+                "hub-msg-conflict",
+                "original local content",
+                false,
+                &[],
+            )
+            .await
+            .expect("seed conflict");
+
+        let row = hub_delivery_row("task-conflict");
+        let mut acked = Vec::new();
+        let outcome = process_deliveries(
+            &store,
+            "node-test-1",
+            std::slice::from_ref(&row),
+            |_| std::future::ready(ClaimOutcome::Claimed),
+            |task_id| {
+                acked.push(task_id.to_string());
+                std::future::ready(true)
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            PollOutcome {
+                processed: 0,
+                failed: 0,
+                gated: 0,
+            },
+            "a permanent rejection is not a retryable failure"
+        );
+        assert!(
+            acked.is_empty(),
+            "a rejected delivery is never acked as enforced"
+        );
+        // The local skip marker exists, so the next poll's dedup gate
+        // passes over the delivery — no claim, no mirror, no retry.
+        let marker = store
+            .task_get("task-conflict")
+            .await
+            .expect("marker read")
+            .expect("marker written");
+        assert!(marker.terminal);
+
+        let mut claims = 0;
+        let outcome = process_deliveries(
+            &store,
+            "node-test-1",
+            std::slice::from_ref(&row),
+            |_| {
+                claims += 1;
+                std::future::ready(ClaimOutcome::Claimed)
+            },
+            |_| std::future::ready(true),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            PollOutcome {
+                processed: 0,
+                failed: 0,
+                gated: 0,
+            }
+        );
+        assert_eq!(
+            claims, 0,
+            "the skip marker must short-circuit the next poll before the claim"
+        );
+    }
+
+    /// A transient acceptance failure (NotFound — the delivery's sender
+    /// is not a member of the already-existing local conversation) is
+    /// retryable: it counts as failed, is never acked, and no skip
+    /// marker is written, so the next poll re-runs it.
+    #[tokio::test]
+    async fn transient_acceptance_failure_retries_on_the_next_poll() {
+        let store = Store::open_in_memory("poll-transient").await.unwrap();
+        store
+            .ensure_peer("codex", "codex", "harness")
+            .await
+            .unwrap();
+        store
+            .ensure_peer("operator", "operator", "human")
+            .await
+            .unwrap();
+        // The conversation already exists locally WITHOUT the sender
+        // as a member; `ensure_conversation` enrols members on creation
+        // only, so acceptance finds a non-member and fails with
+        // NotFound — a transient shape the mirror leg cannot repair
+        // itself.
+        assert!(
+            store
+                .ensure_conversation("hub-conv-conflict", &["codex"])
+                .await
+                .unwrap(),
+            "the conversation is created here"
+        );
+
+        let row = hub_delivery_row("task-transient");
+        let mut acked = Vec::new();
+        let outcome = process_deliveries(
+            &store,
+            "node-test-1",
+            std::slice::from_ref(&row),
+            |_| std::future::ready(ClaimOutcome::Claimed),
+            |task_id| {
+                acked.push(task_id.to_string());
+                std::future::ready(true)
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            PollOutcome {
+                processed: 0,
+                failed: 1,
+                gated: 0,
+            },
+            "a transient acceptance failure stays retryable"
+        );
+        assert!(acked.is_empty(), "an unaccepted delivery is never acked");
+        assert!(
+            store.task_get("task-transient").await.unwrap().is_none(),
+            "no skip marker for a transient failure"
+        );
+
+        // The next poll retries it (the claim runs again): no marker
+        // short-circuits the pass.
+        let mut claims = 0;
+        let outcome = process_deliveries(
+            &store,
+            "node-test-1",
+            std::slice::from_ref(&row),
+            |_| {
+                claims += 1;
+                std::future::ready(ClaimOutcome::Claimed)
+            },
+            |_| std::future::ready(true),
+        )
+        .await;
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(claims, 1, "a transient failure is retried on the next poll");
+    }
 }

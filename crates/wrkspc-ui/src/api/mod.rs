@@ -26,6 +26,8 @@ use std::sync::Arc;
 use wrkspc_core::{CancelOutcome, Store, StoreError};
 use wrkspc_dispatcher::DispatcherHandle;
 
+use crate::UiConfig;
+
 pub(crate) mod attempts;
 pub(crate) mod conversations;
 pub(crate) mod gates;
@@ -34,12 +36,16 @@ pub(crate) mod peers;
 /// Cancellation seam into the dispatcher (the live session interrupt).
 pub trait CancelRequester: Send + Sync + 'static {
     /// Requests cancellation of a message's execution for a recipient.
-    fn request_cancel(
-        &self,
-        message_id: &str,
-        recipient_id: &str,
-        set_by: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<CancelOutcome, String>> + Send + '_>>;
+    ///
+    /// The explicit lifetime ties the future to the borrows so
+    /// implementors can capture the arguments by reference instead of
+    /// cloning.
+    fn request_cancel<'a>(
+        &'a self,
+        message_id: &'a str,
+        recipient_id: &'a str,
+        set_by: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CancelOutcome, String>> + Send + 'a>>;
 }
 
 impl CancelRequester for DispatcherHandle {
@@ -101,34 +107,28 @@ impl std::fmt::Debug for AppState {
 impl AppState {
     /// Builds the state.
     ///
-    /// # Arguments
-    ///
-    /// * `store` — the transactional store.
-    /// * `cancel` — the cancel seam (the dispatcher handle in production).
-    /// * `queue_remote_deliveries` — hub mode: operator posts queue
-    ///   delivery tasks for remote-host recipients.
-    /// * `hub_role` — hub mode: the operator surface that owns the
-    ///   shared store (conversation creation); the node role returns
-    ///   404 for it (a node-created conversation would never reach the
-    ///   hub).
-    /// * `hub_connected` — whether this surface mirrors hub-owned
-    ///   state (connected node): hub-owned mutations refuse loudly.
-    /// * `deny` — the hub's live certificate-serial revocation set,
-    ///   when this surface can moderate TLS identity.
+    /// `store` is the transactional store; `cancel` is the cancel seam
+    /// (the dispatcher handle in production). `config` carries the role
+    /// flags: `queue_remote_deliveries` is hub mode (operator posts
+    /// queue delivery tasks for remote-host recipients); `hub_role` is
+    /// the operator surface that owns the shared store (conversation
+    /// creation — the node role returns 404 for it, a node-created
+    /// conversation would never reach the hub); `hub_connected` marks a
+    /// connected node that mirrors hub-owned state (hub-owned mutations
+    /// refuse loudly). `deny` is the hub's live certificate-serial
+    /// revocation set, when this surface can moderate TLS identity.
     pub fn new(
         store: Store,
         cancel: Arc<dyn CancelRequester>,
-        queue_remote_deliveries: bool,
-        hub_role: bool,
-        hub_connected: bool,
+        config: &UiConfig,
         deny: Option<RevocationSet>,
     ) -> Self {
         Self {
             store,
             cancel,
-            queue_remote_deliveries,
-            hub_role,
-            hub_connected,
+            queue_remote_deliveries: config.queue_remote_deliveries,
+            hub_role: config.hub_role,
+            hub_connected: config.hub_connected,
             deny,
         }
     }
@@ -139,6 +139,7 @@ fn store_error(error: StoreError) -> (StatusCode, Json<Value>) {
     use StoreError::*;
     let status = match error {
         NotFound { .. } => StatusCode::NOT_FOUND,
+        TooManyRecipients { .. } | AmbiguousPeerRef { .. } => StatusCode::BAD_REQUEST,
         TerminalState { .. }
         | IntentTerminal { .. }
         | BlockedByFence { .. }

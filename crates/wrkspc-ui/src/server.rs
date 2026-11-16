@@ -31,7 +31,7 @@ pub struct UiConfig {
     pub token: Option<String>,
     /// Hub mode: operator posts also queue pollable delivery tasks for
     /// recipients on remote hosts (the hub's own host is
-    /// `PILOT_HOST_ID`). The node role leaves this `false` — its
+    /// `LOCAL_HOST_ID`). The node role leaves this `false` — its
     /// harness peers are local and its deliveries come from the hub.
     pub queue_remote_deliveries: bool,
     /// Hub mode: the operator surface that owns the shared store
@@ -67,16 +67,25 @@ impl Default for UiConfig {
     }
 }
 
-/// Constant-time equality for operator credentials: the comparison
-/// time does not depend on how many leading bytes match.
+/// Constant-time equality for operator credentials. Both sides are
+/// hashed first (a fixed-key SipHash — the std default hasher), so the
+/// compared material is fixed-width whatever the token lengths are;
+/// the digest comparison then runs a full-length XOR loop with no
+/// early exit. The comparison time does not depend on token length or
+/// on how many leading bytes match.
 fn ct_equals(a: &str, b: &str) -> bool {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
+    use std::hash::{Hash, Hasher};
+
+    fn digest(value: &str) -> u64 {
+        let mut hasher = std::hash::DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
     }
+
+    let a = digest(a).to_le_bytes();
+    let b = digest(b).to_le_bytes();
     let mut diff = 0u8;
-    for (left, right) in a.iter().zip(b) {
+    for (left, right) in a.iter().zip(b.iter()) {
         diff |= left ^ right;
     }
     diff == 0
@@ -95,7 +104,10 @@ fn set_cookie_value(token: &str, secure: bool) -> String {
 /// The presented login cookie value, if any.
 fn presented_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
     let header = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
-    for part in header.split("; ") {
+    // RFC 6265 makes the whitespace after ';' optional: split on ';'
+    // alone and trim each part before matching the cookie name.
+    for part in header.split(';') {
+        let part = part.trim();
         if let Some(value) = part.strip_prefix(COOKIE_NAME)
             && let Some(value) = value.strip_prefix('=')
         {
@@ -127,15 +139,12 @@ impl std::fmt::Debug for UiServer {
 impl UiServer {
     /// Builds a UI server.
     ///
-    /// # Arguments
-    ///
-    /// * `store` — the transactional store.
-    /// * `cancel` — the cancel seam (the dispatcher handle in production).
-    /// * `config` — bind address and bearer token.
-    /// * `deny` — the hub's live certificate-serial deny set, when this
-    ///   server is embedded on the mTLS surface; operator bans update
-    ///   it so revocations take effect on the next handshake without a
-    ///   hub restart.
+    /// `store` is the transactional store; `cancel` is the cancel seam
+    /// (the dispatcher handle in production); `config` carries the bind
+    /// address and bearer token; `deny` is the hub's live
+    /// certificate-serial deny set, when this server is embedded on the
+    /// mTLS surface — operator bans update it so revocations take
+    /// effect on the next handshake without a hub restart.
     pub fn new(
         store: Store,
         cancel: Arc<dyn crate::api::CancelRequester>,
@@ -165,11 +174,8 @@ impl UiServer {
         }
     }
 
-    /// Binds the configured address and serves until `shutdown` resolves.
-    ///
-    /// # Arguments
-    ///
-    /// * `shutdown` — a future that ends serving when it resolves.
+    /// Binds the configured address and serves until `shutdown`
+    /// resolves (a future that ends serving when it completes).
     ///
     /// # Errors
     ///
@@ -187,22 +193,14 @@ impl UiServer {
     /// listener (e.g. the hub's TLS surface, which routes by path).
     /// [`UiServer::serve_on`] serves exactly this router.
     ///
-    /// # Arguments
-    ///
-    /// * `token` — the resolved bearer token (see [`UiServer::resolve_token`]).
+    /// `token` is the resolved bearer token (see
+    /// [`UiServer::resolve_token`]).
     ///
     /// # Returns
     ///
     /// The complete UI router.
     pub fn into_app(self, token: String) -> axum::Router {
-        let state = AppState::new(
-            self.store,
-            self.cancel,
-            self.config.queue_remote_deliveries,
-            self.config.hub_role,
-            self.config.hub_connected,
-            self.deny,
-        );
+        let state = AppState::new(self.store, self.cancel, &self.config, self.deny);
 
         let cookie_secure = self.config.cookie_secure;
         let middleware_token = token.clone();
@@ -242,7 +240,59 @@ impl UiServer {
                             }
                         };
                     }
-                    next.run(request).await
+                    // A cookie-authenticated UNSAFE request must
+                    // carry the SPA guard header — a cross-site page
+                    // cannot add it without a preflight, and no CORS
+                    // layer exists to approve one. The Sec-Fetch-Site
+                    // check is the second layer, so a future CORS
+                    // mistake cannot reopen the hole. Bearer clients
+                    // and safe methods are untouched.
+                    let cookie_only = cookie_ok && !header_ok;
+                    let unsafe_method = !matches!(
+                        request.method(),
+                        &axum::http::Method::GET
+                            | &axum::http::Method::HEAD
+                            | &axum::http::Method::OPTIONS
+                    );
+                    if cookie_only && unsafe_method {
+                        let guarded = request
+                            .headers()
+                            .get("x-wrkspc-request")
+                            .and_then(|value| value.to_str().ok())
+                            == Some("1");
+                        let fetch_site_ok = request
+                            .headers()
+                            .get("sec-fetch-site")
+                            .map(|value| {
+                                let value = value.to_str().unwrap_or_default();
+                                value.eq_ignore_ascii_case("same-origin")
+                                    || value.eq_ignore_ascii_case("none")
+                            })
+                            .unwrap_or(true);
+                        if !guarded || !fetch_site_ok {
+                            let response = axum::response::Response::builder()
+                                .status(axum::http::StatusCode::FORBIDDEN)
+                                .header("content-type", "text/plain; charset=utf-8")
+                                .body(axum::body::Body::from("cross-site request refused"));
+                            return match response {
+                                Ok(response) => response,
+                                Err(error) => {
+                                    unreachable!("static forbidden response failed: {error}")
+                                }
+                            };
+                        }
+                    }
+                    // Authenticated API payloads (cookie-authed
+                    // transcripts, rosters) must not be heuristically
+                    // cached by a shared cache or the browser: the
+                    // static shell is no-store, and so is every API
+                    // response behind this gate.
+                    let mut response = next.run(request).await;
+                    response.headers_mut().insert(
+                        axum::http::header::CACHE_CONTROL,
+                        axum::http::HeaderValue::from_static("no-store"),
+                    );
+                    response
                 }
             },
         ));
@@ -286,11 +336,9 @@ impl UiServer {
 
     /// Serves on an already-bound `listener` until `shutdown` resolves.
     ///
-    /// # Arguments
-    ///
-    /// * `listener` — a bound TCP listener (tests bind port 0 themselves
-    ///   to discover the address).
-    /// * `shutdown` — a future that ends serving when it resolves.
+    /// `listener` is a bound TCP listener (tests bind port 0 themselves
+    /// to discover the address); `shutdown` is a future that ends
+    /// serving when it resolves.
     ///
     /// # Errors
     ///
@@ -334,5 +382,23 @@ async fn static_index() -> axum::response::Response {
         // Static headers and a static body cannot fail; this arm guards
         // against builder misuse.
         Err(error) => unreachable!("static index response failed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ct_equals_accepts_equal_tokens() {
+        assert!(ct_equals("test-token-1234", "test-token-1234"));
+    }
+
+    #[test]
+    fn ct_equals_rejects_different_tokens_of_any_length() {
+        assert!(!ct_equals("test-token-1234", "test-token-9999"));
+        assert!(!ct_equals("short", "a-much-longer-token"));
+        assert!(!ct_equals("", "x"));
+        assert!(!ct_equals("same-length-a", "same-length-b"));
     }
 }

@@ -98,7 +98,7 @@ async fn roster_mirror_replaces_fully() {
             name: "operator".to_string(),
             alias: None,
             class: "human".to_string(),
-            host_id: wrkspc_core::PILOT_HOST_ID.to_string(),
+            host_id: wrkspc_core::LOCAL_HOST_ID.to_string(),
             status: "enrolled".to_string(),
             state: "connected".to_string(),
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -217,5 +217,46 @@ async fn stale_presence_reads_as_disconnected() {
         store.roster().await.unwrap()[0].state,
         "disconnected",
         "a report from years ago is not a live peer"
+    );
+}
+
+/// A later presence report with a changed binding name updates the
+/// display name with an audit row; a changed class is recorded as
+/// drift and changes nothing (the class is authority-pinned).
+#[tokio::test]
+async fn presence_updates_name_and_pins_class() {
+    let store = Store::open_in_memory("presence-c5").await.unwrap();
+    store
+        .upsert_roster_presence("codex", "codex", "harness", "node-test-1", "connected")
+        .await
+        .unwrap();
+    let outcome = store
+        .upsert_roster_presence("codex", "codex pro", "harness", "node-test-1", "connected")
+        .await
+        .unwrap();
+    assert_eq!(outcome, wrkspc_core::PresenceOutcome::Updated);
+    let entry = store.roster_entry("codex").await.unwrap().unwrap();
+    assert_eq!(
+        entry.name, "codex pro",
+        "the binding's display name shows up"
+    );
+
+    // Class drift: recorded, not applied.
+    let outcome = store
+        .upsert_roster_presence("codex", "codex pro", "human", "node-test-1", "connected")
+        .await
+        .unwrap();
+    assert_eq!(outcome, wrkspc_core::PresenceOutcome::Updated);
+    let entry = store.roster_entry("codex").await.unwrap().unwrap();
+    assert_eq!(entry.class, "harness", "class is authority-pinned");
+
+    let log = store.moderation_log(10).await.unwrap();
+    assert!(
+        log.iter().any(|event| event.action == "rename"),
+        "rename is audited"
+    );
+    assert!(
+        log.iter().any(|event| event.action == "class drift"),
+        "class drift is audited"
     );
 }

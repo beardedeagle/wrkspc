@@ -51,7 +51,7 @@ hosting record:
 | `/ca` (read-only) | `ca.pem` — the CA root(s) client certificates must chain to |
 | `/ops` (read-only, optional) | `revoke.txt` — operator-managed serial deny-list |
 
-Minimal run (plain pilot mode, no TLS — the published port is plain
+Minimal run (plain single-machine mode, no TLS — the published port is plain
 HTTP, for loopback-scale testing only):
 
 ```bash

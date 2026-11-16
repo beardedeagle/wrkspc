@@ -50,7 +50,7 @@ async fn seeded_delivery(store: &Store) -> (String, String) {
             sender_peer: "operator",
             sender_name: "operator",
             sender_class: "human",
-            sender_host: wrkspc_core::PILOT_HOST_ID,
+            sender_host: wrkspc_core::LOCAL_HOST_ID,
             content: "hello from the hub",
             execution_requested: true,
         })
@@ -460,4 +460,124 @@ async fn outcome_report_validation() {
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+}
+
+/// A terminal report mirrors the outcome onto the sender's
+/// accepted task — the envelope's origin IS that task's id — so a
+/// subscribing sender sees the transition the delivery-report leg
+/// produced.
+#[tokio::test]
+async fn terminal_report_mirrors_the_outcome_onto_the_accepted_task() {
+    let store = Store::open_in_memory("report-mirror").await.unwrap();
+    store
+        .ensure_peer_on_host("operator", "operator", "human", wrkspc_core::LOCAL_HOST_ID)
+        .await
+        .unwrap();
+    store
+        .ensure_peer_on_host("codex", "codex", "harness", "node-test-1")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+
+    // The sender's accepted task (the shape the acceptance leg
+    // stored): the delivery envelope's origin names it.
+    let origin_task_id = "node-wire-msg-1";
+    let accepted = serde_json::json!({
+        "id": origin_task_id,
+        "contextId": conversation,
+        "status": {
+            "state": "TASK_STATE_SUBMITTED",
+            "message": { "parts": [{ "text": "accepted; awaiting wrkspc routing" }] },
+        },
+    });
+    store
+        .task_create(
+            origin_task_id,
+            &conversation,
+            "submitted",
+            false,
+            &accepted.to_string(),
+        )
+        .await
+        .unwrap();
+
+    // The delivery task whose envelope carries the origin.
+    let task_id = store
+        .task_create_delivery(wrkspc_core::DeliveryTaskRequest {
+            recipient_host: "node-test-1",
+            recipient_peer: "codex",
+            recipient_name: "codex",
+            recipient_class: "harness",
+            message_id: "hub-msg-1",
+            origin_message_id: Some(origin_task_id),
+            conversation_id: &conversation,
+            sender_peer: "operator",
+            sender_name: "operator",
+            sender_class: "human",
+            sender_host: wrkspc_core::LOCAL_HOST_ID,
+            content: "hello from the hub",
+            execution_requested: true,
+        })
+        .await
+        .unwrap();
+
+    let router = router_under_test(store.clone()).await;
+    let status = post_json(
+        router,
+        "/delivery-report",
+        Some("node-test-1"),
+        serde_json::json!({
+            "taskId": task_id,
+            "instanceId": "i-1",
+            "attemptId": "attempt-1",
+            "state": "completed",
+            "recordedAt": "2026-11-08T00:00:00Z",
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    // The delivery task is terminal (the pre-existing contract).
+    let delivery_row = store.task_get(&task_id).await.unwrap().unwrap();
+    assert!(delivery_row.terminal);
+    assert_eq!(delivery_row.state, "completed");
+
+    // The accepted task now carries the outcome: terminal, completed,
+    // with the status message naming the recipient.
+    let accepted_row = store.task_get(origin_task_id).await.unwrap().unwrap();
+    assert!(accepted_row.terminal, "the sender's task must go terminal");
+    assert_eq!(accepted_row.state, "completed");
+    let blob: serde_json::Value = serde_json::from_str(&accepted_row.task_json).unwrap();
+    assert_eq!(blob["status"]["state"], "TASK_STATE_COMPLETED");
+    let message_text = blob["status"]["message"]["parts"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        message_text.contains("turn outcome recorded for codex: completed"),
+        "got {message_text}"
+    );
+
+    // First outcome wins: a conflicting later report changes nothing
+    // on the accepted task and the delivery report is refused by the
+    // delivery task's own immutability.
+    let router = router_under_test(store.clone()).await;
+    let conflict = post_json(
+        router,
+        "/delivery-report",
+        Some("node-test-1"),
+        serde_json::json!({
+            "taskId": task_id,
+            "instanceId": "i-1",
+            "attemptId": "attempt-2",
+            "state": "failed",
+            "recordedAt": "2026-11-08T00:00:01Z",
+        }),
+    )
+    .await;
+    assert_eq!(conflict, axum::http::StatusCode::CONFLICT);
+    let accepted_row = store.task_get(origin_task_id).await.unwrap().unwrap();
+    assert_eq!(accepted_row.state, "completed", "first outcome stands");
 }

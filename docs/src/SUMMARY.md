@@ -27,6 +27,8 @@
 - [CLI reference](./reference/cli.md)
 - [Hub API](./reference/api.md)
 - [Protocols](./reference/protocols.md)
+- [Rust API](./reference/rust-api.md)
+- [Rust API Docs](./rustdoc/wrkspc_core/index.html)
 
 # Development
 

@@ -8,16 +8,26 @@ pub(crate) struct ParsedSend {
     pub(crate) sender_peer: String,
     pub(crate) content: String,
     pub(crate) execution_requested: bool,
+    /// The explicit recipient list when the wire message carried a
+    /// non-null `recipients` array — including an EMPTY array. `None`
+    /// means the field was absent/null (mention inference is the
+    /// caller's contract). The distinction is load-bearing: a node's
+    /// outbound sync sends its committed recipient set verbatim, and a
+    /// committed-EMPTY set is authoritative — the hub must not
+    /// re-infer mentions for it.
     pub(crate) recipients: Option<Vec<String>>,
+    /// A client-supplied task continuation reference (`taskId`). A
+    /// send naming an existing task must be authorized against the
+    /// presenting host's own queue BEFORE the SDK handler loads and
+    /// mutates that task.
+    pub(crate) task_id: Option<String>,
 }
 
 /// Parses the `message/send` params with the SDK's own types (no
 /// wire-key guessing) and extracts the wrkspc fields from the message
 /// metadata.
 ///
-/// # Arguments
-///
-/// * `parsed` — the JSON-RPC request value.
+/// `parsed` is the JSON-RPC request value.
 ///
 /// # Returns
 ///
@@ -40,6 +50,28 @@ pub(crate) fn parse_send(parsed: &serde_json::Value) -> Result<Option<ParsedSend
         .and_then(|value| value.as_str())
         .ok_or("message metadata is missing the sender peerId")?
         .to_string();
+    // The surface contract is enforced at acceptance — a message
+    // with a non-text part, or a text part declaring a media type off
+    // the contract list, is refused loudly. Silently dropping those
+    // parts leaves the sender believing they arrived; a refusal tells
+    // it. The node's own sends declare no media type and are
+    // unaffected.
+    let contract = wrkspc_a2a::server::surface_contract();
+    for part in &message.parts {
+        match &part.content {
+            a2a::PartContent::Text(_) => {
+                if let Some(media_type) = part.media_type.as_deref()
+                    && !media_type.is_empty()
+                    && !contract.iter().any(|mode| mode == media_type)
+                {
+                    return Err(format!("unsupported text media type: {media_type}"));
+                }
+            }
+            _ => {
+                return Err("messages may carry only text parts".to_string());
+            }
+        }
+    }
     let content = message
         .parts
         .iter()
@@ -89,6 +121,7 @@ pub(crate) fn parse_send(parsed: &serde_json::Value) -> Result<Option<ParsedSend
         content,
         execution_requested,
         recipients,
+        task_id: message.task_id,
     }))
 }
 
@@ -100,9 +133,7 @@ pub(crate) fn parse_send(parsed: &serde_json::Value) -> Result<Option<ParsedSend
 /// already the authenticated host; this function only validates that it
 /// is non-empty.
 ///
-/// # Arguments
-///
-/// * `identity` — the stamped identity header value.
+/// `identity` is the stamped identity header value.
 ///
 /// # Returns
 ///
@@ -115,6 +146,62 @@ pub(crate) fn host_from_identity(identity: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn send_with_parts(parts: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "SendMessage",
+            "params": {
+                "message": {
+                    "messageId": "m-1",
+                    "role": "ROLE_USER",
+                    "contextId": "conv-1",
+                    "parts": parts,
+                    "metadata": {
+                        "peerId": "node-test-1",
+                        "recipients": ["codex"],
+                        "executionRequested": true,
+                    },
+                },
+            },
+        })
+    }
+
+    /// The surface contract is enforced at acceptance — a
+    /// non-text part and an unlisted declared media type are refused,
+    /// while the node's own sends (no declared type) stay accepted.
+    #[test]
+    fn surface_contract_gate_refuses_and_admits() {
+        // Non-text part: refused.
+        assert!(
+            parse_send(&send_with_parts(serde_json::json!([
+                {"kind": "file", "bytes": "aGk="},
+            ])))
+            .is_err()
+        );
+        // Text with an unlisted declared media type: refused.
+        assert!(
+            parse_send(&send_with_parts(serde_json::json!([
+                {"text": "hello", "mediaType": "application/json"},
+            ])))
+            .is_err()
+        );
+        // Text with a contracted media type: accepted.
+        assert!(
+            parse_send(&send_with_parts(serde_json::json!([
+                {"text": "hello", "mediaType": "text/markdown"},
+            ])))
+            .is_ok()
+        );
+        // No declared media type (the node's own send shape): accepted.
+        assert!(
+            parse_send(&send_with_parts(serde_json::json!([
+                {"text": "hello"},
+            ])))
+            .is_ok()
+        );
+    }
 
     fn send_with_recipients(recipients: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
@@ -147,6 +234,76 @@ mod tests {
             parsed.recipients.as_deref(),
             Some(&["codex".to_string()][..])
         );
+    }
+
+    /// An explicit EMPTY recipients array is distinct from an absent
+    /// (or null) field: a node's outbound sync sends its committed
+    /// recipient set verbatim, and a committed-empty list is
+    /// authoritative at the hub — the parse must keep the two states
+    /// apart so acceptance can route them differently.
+    #[test]
+    fn explicit_empty_recipients_are_distinct_from_absent() {
+        // Explicit empty array → Some(empty).
+        let explicit = parse_send(&send_with_recipients(serde_json::json!([])))
+            .unwrap()
+            .unwrap();
+        assert_eq!(explicit.recipients.as_deref(), Some(&[][..]));
+        // Null → None (not explicitly supplied).
+        let nulled = parse_send(&send_with_recipients(serde_json::Value::Null))
+            .unwrap()
+            .unwrap();
+        assert_eq!(nulled.recipients, None);
+        // Absent → None.
+        let absent = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "SendMessage",
+            "params": {
+                "message": {
+                    "messageId": "m-1",
+                    "role": "ROLE_USER",
+                    "contextId": "conv-1",
+                    "parts": [{"text": "hello"}],
+                    "metadata": {
+                        "peerId": "node-test-1",
+                        "executionRequested": true,
+                    },
+                },
+            },
+        });
+        let parsed = parse_send(&absent).unwrap().unwrap();
+        assert_eq!(parsed.recipients, None);
+    }
+
+    /// A client-supplied continuation reference (`taskId`) is retained
+    /// so the acceptance layer can authorize it against the presenting
+    /// host's queue before the SDK handler touches the task.
+    #[test]
+    fn continuation_task_reference_is_retained() {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "SendMessage",
+            "params": {
+                "message": {
+                    "messageId": "m-2",
+                    "role": "ROLE_USER",
+                    "contextId": "conv-1",
+                    "taskId": "task-foreign",
+                    "parts": [{"text": "continue"}],
+                    "metadata": {
+                        "peerId": "node-test-1",
+                        "executionRequested": true,
+                    },
+                },
+            },
+        });
+        let parsed = parse_send(&body).unwrap().unwrap();
+        assert_eq!(parsed.task_id.as_deref(), Some("task-foreign"));
+        let plain = parse_send(&send_with_recipients(serde_json::json!([])))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.task_id, None);
     }
 
     /// Malformed explicit recipients are REJECTED, not silently

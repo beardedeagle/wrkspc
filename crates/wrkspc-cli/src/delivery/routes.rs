@@ -1,6 +1,7 @@
 //! The claim and ack route handlers.
 
 use super::{AckRequest, DeliveryReport, DeliveryState, delivery_task, stamped_host};
+use a2a::TaskState;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -38,12 +39,16 @@ pub(crate) async fn delivery_claim(
         .await
     {
         Ok(wrkspc_core::DeliveryClaimOutcome::Claimed) => {
-            let payload: serde_json::Value =
-                serde_json::from_str(&task.task_json).unwrap_or_default();
-            if let Some(conversation_id) =
-                payload["metadata"]["delivery"]["conversation_id"].as_str()
-            {
-                let _ = state
+            let conversation_id = wrkspc_core::DeliveryEnvelope::from_task_json(&task.task_json)
+                .map(|envelope| envelope.conversation_id);
+            // Which peer's delivery this is. Every agent on a host
+            // presents the same client certificate, so the host alone
+            // cannot say whose mail was consumed — the envelope says.
+            let recipient_peer = wrkspc_core::DeliveryEnvelope::from_task_json(&task.task_json)
+                .map(|envelope| envelope.recipient_peer)
+                .unwrap_or_default();
+            if let Some(conversation_id) = conversation_id.as_deref()
+                && let Err(error) = state
                     .store
                     .append_event(
                         conversation_id,
@@ -51,16 +56,12 @@ pub(crate) async fn delivery_claim(
                         &serde_json::json!({
                             "task_id": body.task_id,
                             "host": host,
-                            // Which peer's delivery this is. Every agent on a
-                            // host presents the same client certificate, so the
-                            // host alone cannot say whose mail was consumed.
-                            "recipient_peer": payload["metadata"]["delivery"]
-                                ["recipient_peer"]
-                                .as_str()
-                                .unwrap_or_default(),
+                            "recipient_peer": recipient_peer,
                         }),
                     )
-                    .await;
+                    .await
+            {
+                tracing::warn!(%error, task_id = %body.task_id, "delivery.claimed feed event failed");
             }
             (
                 StatusCode::OK,
@@ -139,17 +140,18 @@ pub(crate) async fn delivery_ack(
         Ok(task) => task,
         Err((code, message)) => return (code, message).into_response(),
     };
+    // The typed envelope — a payload without one is not a delivery
+    // task.
+    let Some(envelope) = wrkspc_core::DeliveryEnvelope::from_task_json(&task.task_json) else {
+        return (StatusCode::CONFLICT, "not a delivery task").into_response();
+    };
+    // The ack mutates the stored blob in place (status + acked_at), so
+    // the parsed shell is kept alongside the typed envelope.
     let payload: serde_json::Value = match serde_json::from_str(&task.task_json) {
-        Ok(value) => value,
+        Ok(payload) => payload,
         Err(_) => {
             return (StatusCode::CONFLICT, "task payload is not valid JSON").into_response();
         }
-    };
-    let Some(delivery) = payload
-        .get("metadata")
-        .and_then(|metadata| metadata.get("delivery"))
-    else {
-        return (StatusCode::CONFLICT, "not a delivery task").into_response();
     };
     if task.context_id != host {
         tracing::warn!(task_id = %body.task_id, %host, "delivery ack host mismatch");
@@ -163,10 +165,7 @@ pub(crate) async fn delivery_ack(
     // (execution_requested=false) create no attempt by design, so for
     // them receipt IS completion; executable deliveries stay working
     // until the node reports the attempt outcome.
-    let execution_requested = delivery
-        .get("execution_requested")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let execution_requested = envelope.execution_requested;
     if task.state == "working" {
         // Idempotent re-ack after a crash between the ack write and the
         // node's local processed marker.
@@ -212,22 +211,11 @@ pub(crate) async fn delivery_ack(
         }
     }
 
-    let (Some(message_id), Some(recipient_peer), Some(conversation_id)) = (
-        delivery
-            .get("message_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        delivery
-            .get("recipient_peer")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        delivery
-            .get("conversation_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-    ) else {
-        return (StatusCode::CONFLICT, "delivery payload is incomplete").into_response();
-    };
+    let (message_id, recipient_peer, conversation_id) = (
+        envelope.message_id,
+        envelope.recipient_peer,
+        envelope.conversation_id,
+    );
 
     // The fence: only after the delivery is durably recorded hub-side do
     // we transition the task. mark_delivered is idempotent, so a crashed
@@ -251,7 +239,9 @@ pub(crate) async fn delivery_ack(
     acked["metadata"]["delivery"]["acked_at"] =
         serde_json::Value::String(chrono::Utc::now().to_rfc3339());
     if execution_requested {
-        acked["status"]["state"] = serde_json::Value::String("TASK_STATE_WORKING".to_string());
+        acked["status"]["state"] = serde_json::Value::String(
+            wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Working).to_string(),
+        );
         if let Err(error) = state
             .store
             .task_update(&body.task_id, "working", false, &acked.to_string())
@@ -261,7 +251,9 @@ pub(crate) async fn delivery_ack(
             return (StatusCode::INTERNAL_SERVER_ERROR, "delivery ack failed").into_response();
         }
     } else {
-        acked["status"]["state"] = serde_json::Value::String("TASK_STATE_COMPLETED".to_string());
+        acked["status"]["state"] = serde_json::Value::String(
+            wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Completed).to_string(),
+        );
         if let Err(error) = state
             .store
             .task_update(&body.task_id, "completed", true, &acked.to_string())
@@ -276,7 +268,7 @@ pub(crate) async fn delivery_ack(
     if let Err(error) = state.store.release_delivery_claim(&body.task_id).await {
         tracing::warn!(%error, task_id = %body.task_id, "claim cleanup failed");
     }
-    let _ = state
+    if let Err(error) = state
         .store
         .append_event(
             &conversation_id,
@@ -287,7 +279,10 @@ pub(crate) async fn delivery_ack(
                 "recipient_peer": recipient_peer,
             }),
         )
-        .await;
+        .await
+    {
+        tracing::warn!(%error, task_id = %body.task_id, "delivery.acked feed event failed");
+    }
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({"acked": true})),
@@ -344,10 +339,9 @@ pub(crate) async fn delivery_report(
             return (StatusCode::CONFLICT, "task payload is not valid JSON").into_response();
         }
     };
-    let Some(delivery) = payload
-        .get("metadata")
-        .and_then(|metadata| metadata.get("delivery"))
-    else {
+    // The typed envelope — a payload without one is not a delivery
+    // task.
+    let Some(envelope) = wrkspc_core::DeliveryEnvelope::from_task_json(&task.task_json) else {
         return (StatusCode::CONFLICT, "not a delivery task").into_response();
     };
     if task.context_id != host {
@@ -368,18 +362,10 @@ pub(crate) async fn delivery_report(
         )
             .into_response();
     }
-    let (Some(recipient_peer), Some(conversation_id)) = (
-        delivery
-            .get("recipient_peer")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        delivery
-            .get("conversation_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-    ) else {
-        return (StatusCode::CONFLICT, "delivery payload is incomplete").into_response();
-    };
+    let (recipient_peer, conversation_id) = (
+        envelope.recipient_peer.clone(),
+        envelope.conversation_id.clone(),
+    );
 
     if body.state == "unknown" {
         // An outcome the node could not determine: mirror it on the
@@ -415,9 +401,11 @@ pub(crate) async fn delivery_report(
     // the status transitions.
     let mut reported = payload;
     reported["status"]["state"] = serde_json::Value::String(match body.state.as_str() {
-        "completed" => "TASK_STATE_COMPLETED".to_string(),
-        "failed" => "TASK_STATE_FAILED".to_string(),
-        _ => "TASK_STATE_CANCELED".to_string(),
+        "completed" => {
+            wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Completed).to_string()
+        }
+        "failed" => wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Failed).to_string(),
+        _ => wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Canceled).to_string(),
     });
     reported["metadata"]["attempt"] = serde_json::json!({
         "attempt_id": body.attempt_id,
@@ -451,20 +439,92 @@ pub(crate) async fn delivery_report(
             return (StatusCode::INTERNAL_SERVER_ERROR, "delivery report failed").into_response();
         }
     }
+    // The sender's accepted task — when the message came from a
+    // remote node, the envelope's origin IS that task's id on this
+    // hub — must see this terminal outcome: that is the documented
+    // streaming-results path, and the subscribe transport tails it.
+    // The first outcome wins: a later conflicting report can never
+    // rewrite a terminal record, and a mirror failure must not fail
+    // the delivery report itself.
+    if let Some(origin_task_id) = envelope.origin_message_id.as_deref()
+        && origin_task_id != body.task_id
+        && let Some(row) = state.store.task_get(origin_task_id).await.ok().flatten()
+    {
+        let mut accepted: serde_json::Value = match serde_json::from_str(&row.task_json) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, origin_task_id, "accepted task blob corrupt; outcome not mirrored");
+                serde_json::Value::Null
+            }
+        };
+        if !accepted.is_null() {
+            let wire_state = match body.state.as_str() {
+                "completed" => wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Completed),
+                "failed" => wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Failed),
+                _ => wrkspc_a2a::state_mapping::task_state_literal(&TaskState::Canceled),
+            };
+            accepted["status"]["state"] = serde_json::Value::String(wire_state.to_string());
+            accepted["status"]["message"] = serde_json::json!({
+                "parts": [{
+                    "text": format!(
+                        "turn outcome recorded for {}: {}",
+                        recipient_peer, body.state
+                    ),
+                }],
+            });
+            match state
+                .store
+                .task_update(origin_task_id, &body.state, true, &accepted.to_string())
+                .await
+            {
+                Ok(_) => {}
+                // Same-terminal re-emission is idempotent success.
+                Err(wrkspc_core::StoreError::TaskTerminal { state: current, .. })
+                    if current == body.state => {}
+                Err(wrkspc_core::StoreError::TaskTerminal { state: current, .. }) => {
+                    tracing::warn!(
+                        origin_task_id,
+                        current_state = %current,
+                        reported = %body.state,
+                        "first terminal outcome wins; later report not mirrored",
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, origin_task_id, "outcome mirror to the accepted task failed");
+                }
+            }
+        }
+    }
     // A final terminal state completes the reconciliation loop: the
-    // hub's mirrored unknown row (if any) is consumed.
-    let _ = state.store.consume_hub_unknown(&body.attempt_id).await;
+    // hub's mirrored unknown row (if any) is consumed — scoped to the
+    // authorized (task, host) tuple, so a report can never erase
+    // another host's mirror. A failed consumption is logged: the mirror
+    // would otherwise linger indefinitely with no operator-visible
+    // trace.
+    if let Err(error) = state
+        .store
+        .consume_hub_unknown(&body.attempt_id, &body.task_id, &host)
+        .await
+    {
+        tracing::warn!(%error, attempt_id = %body.attempt_id, "unknown mirror consumption failed");
+    }
     // Guidance consumption ack (hub→node propagation loop): the node
     // reports which authoritative rows rode a successful prompt; the
-    // hub marks them delivered. Idempotent — unknown ids (node-local
+    // hub marks them delivered — scoped to THIS delivery's validated
+    // conversation, so a report can never acknowledge another
+    // conversation's guidance. Idempotent — unknown ids (node-local
     // guidance) are no-ops.
     if !body.guidance_delivered.is_empty() {
         let ids: Vec<&str> = body.guidance_delivered.iter().map(String::as_str).collect();
-        if let Err(error) = state.store.mark_guidance_delivered(&ids).await {
+        if let Err(error) = state
+            .store
+            .mark_guidance_delivered_scoped(&conversation_id, &ids)
+            .await
+        {
             tracing::warn!(%error, "guidance consumption ack failed; rows stay pending and re-ride");
         }
     }
-    let _ = state
+    if let Err(error) = state
         .store
         .append_event(
             &conversation_id,
@@ -478,7 +538,10 @@ pub(crate) async fn delivery_report(
                 "instance_id": body.instance_id,
             }),
         )
-        .await;
+        .await
+    {
+        tracing::warn!(%error, attempt_id = %body.attempt_id, "delivery.attempt feed event failed");
+    }
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({"reported": true})),

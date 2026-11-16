@@ -106,32 +106,49 @@ fn failing_pbcopy_fails_the_command() {
     );
 }
 
-/// CU-07: a successful pbcopy with an un-schedulable clearer still
-/// reports the copy but does NOT promise the automatic clear.
+/// CU-07: a copy whose clearer CANNOT be scheduled still reports the
+/// copy but does NOT advertise the automatic clear. PATH points ONLY
+/// at the fake dir: `pbcopy` resolves to the fake, while the clearer's
+/// `sh` does not exist anywhere on PATH, so spawning it fails
+/// deterministically before the token handoff — no timing race. (A
+/// merely non-executable fake `sh` would not do: the spawn's PATH
+/// search skips non-executable candidates and falls through to the
+/// real `/bin/sh`.)
 #[cfg(target_os = "macos")]
 #[test]
 fn unschedulable_clearer_withholds_the_clear_promise() {
     let fake = FakePath::new("pbcopy-noclear");
-    // pbcopy succeeds; `sh` is missing from PATH? We keep the real
-    // PATH, so `sh` exists — instead make the clearer's stdin write
-    // fail by making `sh` a fake that exits immediately.
+    // The fake pbcopy drains its stdin using only shell builtins, so
+    // it works even with PATH stripped to the fake dir (no `cat`);
+    // the clearer's `sh` is simply absent from that PATH.
     let pbcopy = fake.dir.join("pbcopy");
-    std::fs::write(&pbcopy, "#!/bin/sh\ncat > /dev/null\nexit 0\n").unwrap();
-    let sh = fake.dir.join("sh");
-    std::fs::write(&sh, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::write(
+        &pbcopy,
+        "#!/bin/sh\nwhile IFS= read -r line; do :; done\nexit 0\n",
+    )
+    .unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
-        for tool in [&pbcopy, &sh] {
-            std::fs::set_permissions(tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        std::fs::set_permissions(&pbcopy, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let output = fake
-        .command(binary(), &["ui-token"])
+    let mut command = fake.command(binary(), &["ui-token"]);
+    // PATH = the fake dir alone: `pbcopy` resolves to the fake, and
+    // the clearer's `sh` is not found anywhere on PATH.
+    command.env("PATH", fake.dir.display().to_string());
+    let output = command
         .env("WRKSPC_UI_TOKEN", "test-token")
         .output()
         .expect("binary runs");
     assert!(output.status.success(), "the copy itself succeeded");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("copied to the clipboard"), "got: {stdout}");
+    assert!(
+        !stdout.contains("it clears itself in 30s"),
+        "a copy whose clearer failed must NOT advertise an automatic clear: {stdout}"
+    );
+    assert!(
+        stdout.contains("could not be scheduled"),
+        "the withheld clear must be reported honestly: {stdout}"
+    );
 }
