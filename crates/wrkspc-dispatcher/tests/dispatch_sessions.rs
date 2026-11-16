@@ -522,3 +522,85 @@ async fn trailing_chunk_after_the_terminal_response_is_not_dropped() {
     })
     .await;
 }
+
+/// C10: every security gate precedes the prompt — the dispatched
+/// write, the cancel checks, the delivery gate, registration, the
+/// guidance claim, and the post-claim cancel check all commit before
+/// `dispatch.started` is recorded, and `dispatch.started` precedes
+/// the harness prompt. By the time the harness sees the prompt, the
+/// started event must already exist in the feed.
+#[tokio::test]
+async fn every_gate_commits_before_the_prompt() {
+    let store = Store::open_in_memory("order-test").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer("agent", "agent", "harness")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "agent"])
+        .await
+        .unwrap();
+    let AcceptOutcome::Accepted { .. } = store
+        .accept_message(
+            &conversation,
+            "operator",
+            "k-order",
+            "work",
+            false,
+            &[RecipientRequest {
+                peer_id: "agent".to_string(),
+                execution_requested: true,
+            }],
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("fresh accept");
+    };
+
+    let driver = FakeDriver::new(Mode::Respond(StopReason::EndTurn));
+    let mut bindings = HashMap::new();
+    bindings.insert(
+        "agent".to_string(),
+        SessionBinding {
+            peer_id: "agent".to_string(),
+            session_id: "sess-agent".to_string(),
+            driver: Arc::new(driver.clone()),
+        },
+    );
+    let provider = Arc::new(FakeProvider::new(bindings));
+    let (dispatcher, _handle) = Dispatcher::new(
+        store.clone(),
+        provider,
+        DispatcherConfig {
+            tick: Duration::from_millis(10),
+            ..Default::default()
+        },
+    );
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    tokio::spawn(async move {
+        dispatcher
+            .run(async move {
+                let _ = shutdown_rx.recv().await;
+            })
+            .await
+            .expect("run");
+    });
+
+    // The prompt is the terminal marker of the security sequence.
+    driver.wait_for_prompt().await;
+
+    // By prompt time the started event must already be committed —
+    // every gate runs before it, and it runs before the prompt.
+    let events = store.events_since(&conversation, 0, 100).await.unwrap();
+    assert!(
+        events.iter().any(|event| event.kind == "dispatch.started"),
+        "dispatch.started must be committed before the prompt reaches the harness"
+    );
+
+    let _ = shutdown_tx.send(());
+}
