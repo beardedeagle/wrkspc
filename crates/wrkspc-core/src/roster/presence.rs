@@ -60,7 +60,7 @@ impl Store {
                 if status_is_ejected(&status) {
                     return Ok(PresenceOutcome::Ejected { status });
                 }
-                // C5: the node re-reports its binding every presence
+                // The node re-reports its binding every presence
                 // tick, and the docs make `harness` the display name —
                 // a changed binding shows up, with an audit row. The
                 // class is authority-pinned: a node only ever reports

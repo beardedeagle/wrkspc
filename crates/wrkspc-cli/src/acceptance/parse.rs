@@ -50,7 +50,7 @@ pub(crate) fn parse_send(parsed: &serde_json::Value) -> Result<Option<ParsedSend
         .and_then(|value| value.as_str())
         .ok_or("message metadata is missing the sender peerId")?
         .to_string();
-    // C11: the surface contract is enforced at acceptance — a message
+    // The surface contract is enforced at acceptance — a message
     // with a non-text part, or a text part declaring a media type off
     // the contract list, is refused loudly. Silently dropping those
     // parts leaves the sender believing they arrived; a refusal tells
@@ -168,7 +168,7 @@ mod tests {
         })
     }
 
-    /// C11: the surface contract is enforced at acceptance — a
+    /// The surface contract is enforced at acceptance — a
     /// non-text part and an unlisted declared media type are refused,
     /// while the node's own sends (no declared type) stay accepted.
     #[test]

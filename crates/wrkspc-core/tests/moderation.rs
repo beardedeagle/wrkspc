@@ -211,7 +211,7 @@ async fn guidance_flows_undelivered_then_delivered() {
 
 /// Guidance claims are atomic: two CONCURRENT claims for one
 /// conversation partition the pending rows with no overlap, and
-/// releasing a claim returns the rows to the pending queue (C3).
+/// releasing a claim returns the rows to the pending queue.
 #[tokio::test]
 async fn guidance_claims_are_atomic_and_releasable() {
     // A file store with a multi-connection pool: the two claims run on

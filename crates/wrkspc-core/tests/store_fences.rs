@@ -116,7 +116,7 @@ async fn pilot_host_is_seeded() {
     let _ = std::fs::remove_file(path.with_extension("db-shm"));
 }
 
-/// C15: the member-checked event read and append refuse a non-member
+/// The member-checked event read and append refuse a non-member
 /// in the SAME transaction as the data access, so a kicked peer can
 /// never observe or write one page of feed events.
 #[tokio::test]

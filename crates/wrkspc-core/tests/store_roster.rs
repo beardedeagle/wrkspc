@@ -220,7 +220,7 @@ async fn stale_presence_reads_as_disconnected() {
     );
 }
 
-/// C5: a later presence report with a changed binding name updates the
+/// A later presence report with a changed binding name updates the
 /// display name with an audit row; a changed class is recorded as
 /// drift and changes nothing (the class is authority-pinned).
 #[tokio::test]

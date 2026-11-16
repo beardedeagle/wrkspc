@@ -514,7 +514,7 @@ pub(crate) async fn drive_intent(
         }
         Err(error) => {
             // mark_unknown releases any guidance claim in the SAME
-            // transaction as the unknown write (C3): the next usable
+            // transaction as the unknown write: the next usable
             // turn re-rides the guidance instead of a claimed-by-dead
             // attempt row blocking every future claim.
             store
@@ -849,7 +849,7 @@ async fn stage_guidance(
     cancel_flag_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<Option<Vec<wrkspc_core::Guidance>>, String> {
     // Guidance rides the next SUCCESSFUL prompt in the conversation
-    // (E09) — and it is CLAIMED atomically right before the send (C3):
+    // (E09) — and it is CLAIMED atomically right before the send:
     // two concurrent turns in the same conversation cannot both ride
     // the same guidance. The claim is released if the attempt does not
     // resolve successfully, so guidance never vanishes into a dead

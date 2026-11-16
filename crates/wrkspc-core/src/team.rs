@@ -136,7 +136,7 @@ impl Store {
                 id: request.sender_peer.to_string(),
             })?;
         let mut queued = 0;
-        // C6-B: batch the per-recipient probes into chunked IN queries
+        // Batch the per-recipient probes into chunked IN queries
         // — one canceled-intent probe, one peer lookup, and one task
         // probe per CHUNK instead of per recipient. The create below
         // still runs only for genuinely new remote tasks.
@@ -253,7 +253,7 @@ impl Store {
     ///
     /// Returns [`StoreError::Db`] on failure.
     pub async fn repair_remote_fanout(&self, local_host: &str) -> Result<usize> {
-        // C6-C: the scan pages over the (message_id, peer_id) keyset —
+        // The scan pages over the (message_id, peer_id) keyset —
         // the repair cost no longer grows with history in one
         // unbounded fetch — and each page reuses the batched probes.
         let page_size: i64 = 400;
@@ -833,7 +833,7 @@ pub struct HubUnknownView {
 /// mapper every mirror read shares.
 fn hub_unknown_view(row: sqlx::sqlite::SqliteRow) -> HubUnknownView {
     let decision: Option<String> = row.get("decision");
-    // C4: decode the canonical literal at the row boundary; a value
+    // Decode the canonical literal at the row boundary; a value
     // off the list must surface as None plus a loud log, never as a
     // guess that reaches the poll queue.
     let decision = match decision.as_deref() {

@@ -95,7 +95,7 @@ pub(crate) async fn reconcile_attempt(
         .into_iter()
         .any(|view| view.attempt_id == attempt_id);
     if mirrored {
-        // C4: the typed decision is stored, not a re-encoded string.
+        // The typed decision is stored, not a re-encoded string.
         let updated = state
             .store
             .set_hub_unknown_decision(&attempt_id, decision)

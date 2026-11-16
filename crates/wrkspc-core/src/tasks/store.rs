@@ -139,7 +139,7 @@ impl Store {
         Ok(new_version)
     }
 
-    /// The sender host of the message whose origin a task id is (C13):
+    /// The sender host of the message whose origin a task id is:
     /// a delivery envelope whose `origin_message_id` matches `task_id`
     /// carries the sender's host id, and the sender's accepted task is
     /// exactly that origin. `None` when no delivery task links the id —
@@ -319,7 +319,7 @@ impl Store {
             if row.terminal {
                 continue;
             }
-            // C2: the typed envelope — a malformed or foreign blob is
+            // The typed envelope — a malformed or foreign blob is
             // simply not a claimable delivery.
             let Some(envelope) = DeliveryEnvelope::from_task_json(&row.task_json) else {
                 continue;
@@ -499,7 +499,7 @@ impl Store {
         // The stored blob is a canonical A2A Task serialization (the
         // surface serves `task_json` as the wire Task), with the
         // wrkspc delivery envelope riding in `metadata.delivery` — the
-        // ONE typed schema (C2) every reader decodes.
+        // ONE typed schema every reader decodes.
         let payload = DeliveryEnvelope {
             kind: "delivery".to_string(),
             message_id: request.message_id.to_string(),
@@ -910,7 +910,7 @@ struct DeliveryGateKeys {
 /// The message/recipient identity, or `None` when the blob is not a
 /// well-formed delivery payload.
 fn parse_delivery_gate_keys(task_json: &str) -> Option<DeliveryGateKeys> {
-    // C2: the typed envelope.
+    // The typed envelope.
     let envelope = DeliveryEnvelope::from_task_json(task_json)?;
     if envelope.kind != "delivery" {
         return None;

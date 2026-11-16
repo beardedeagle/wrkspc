@@ -1,4 +1,4 @@
-//! Store-tailing subscribe (C13): the documented streaming-results
+//! Store-tailing subscribe: the documented streaming-results
 //! transport.
 //!
 //! The SDK's default subscribe streams only in-process execution events;
@@ -29,7 +29,7 @@ const TAIL_POLL: Duration = Duration::from_millis(250);
 
 /// The wrkspc request handler: the SDK's [`DefaultRequestHandler`] for
 /// every method except `subscribe_to_task`, which tail-tails the store
-/// when no active execution exists (C13).
+/// when no active execution exists.
 #[derive(Clone)]
 pub struct WrkspcRequestHandler {
     // Debug is derived on demand by the SDK router's diagnostics; the
@@ -195,12 +195,13 @@ impl RequestHandler for WrkspcRequestHandler {
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         // An active execution streams through the SDK's own path
         // unchanged. Without one, the store is the truth: tail the
-        // task row's version (C13).
+        // task row's version.
         match self.inner.subscribe_to_task(params, req.clone()).await {
             Ok(stream) => Ok(stream),
             Err(error)
-                if error.code == -32001 /* TASK_NOT_FOUND */
-                    || error.code == -32004 /* UNSUPPORTED_OPERATION */ => {
+                if error.code == a2a::error_code::TASK_NOT_FOUND
+                    || error.code == a2a::error_code::UNSUPPORTED_OPERATION =>
+            {
                 let Some(row) = self.store.task_get(&req.id).await.map_err(internal_error)? else {
                     return Err(error);
                 };
@@ -209,12 +210,7 @@ impl RequestHandler for WrkspcRequestHandler {
                 }
                 let snapshot: Task = serde_json::from_str(&row.task_json)
                     .map_err(|e| A2AError::internal(e.to_string()))?;
-                Ok(tail_task(
-                    self.store.clone(),
-                    req.id,
-                    snapshot,
-                    row.version,
-                ))
+                Ok(tail_task(self.store.clone(), req.id, snapshot, row.version))
             }
             Err(error) => Err(error),
         }

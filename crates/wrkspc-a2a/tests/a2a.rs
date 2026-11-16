@@ -838,7 +838,7 @@ async fn executor_cancel_errors_on_malformed_stored_payload() {
     );
 }
 
-/// C13: a store-driven transition reaches a subscriber. The snapshot
+/// A store-driven transition reaches a subscriber. The snapshot
 /// arrives first, then the version change, and the terminal state
 /// ends the stream — the exact path the delivery-report leg drives
 /// for a sender watching its accepted task.

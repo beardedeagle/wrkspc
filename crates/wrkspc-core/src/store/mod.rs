@@ -123,7 +123,7 @@ impl Store {
                         // BUSY_SNAPSHOT (517), and BUSY_TIMEOUT (773)
                         // — the snapshot and recovery variants are the
                         // WAL reader's contention forms and must not
-                        // leak to callers as hard errors (C11).
+                        // leak to callers as hard errors.
                         Some("5" | "261" | "517" | "773")
                     ) && attempt < 10 =>
                 {

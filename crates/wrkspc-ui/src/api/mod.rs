@@ -39,7 +39,7 @@ pub trait CancelRequester: Send + Sync + 'static {
     ///
     /// The explicit lifetime ties the future to the borrows so
     /// implementors can capture the arguments by reference instead of
-    /// cloning (C16).
+    /// cloning.
     fn request_cancel<'a>(
         &'a self,
         message_id: &'a str,

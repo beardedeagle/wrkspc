@@ -1150,7 +1150,7 @@ async fn replay_fanout_uses_committed_authority_not_the_retry_flag() {
     );
 }
 
-/// C13: a sender may subscribe to ITS OWN accepted task through the
+/// A sender may subscribe to ITS OWN accepted task through the
 /// hub gate — the envelope's origin linkage proves the sender's host
 /// even though the accepted task's context is a conversation, not a
 /// delivery queue. Any other host is still refused.

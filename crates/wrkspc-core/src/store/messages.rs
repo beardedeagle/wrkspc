@@ -620,7 +620,7 @@ impl Store {
             routing.requests.to_vec()
         };
 
-        // The ONE filter both acceptance paths share (C3).
+        // The ONE filter both acceptance paths share.
         self.filter_recipients(
             tx,
             conversation_id,
@@ -631,7 +631,7 @@ impl Store {
         .await
     }
 
-    /// The ONE recipient filter both acceptance paths share (C3).
+    /// The ONE recipient filter both acceptance paths share.
     ///
     /// Membership is asserted FIRST, then the self skip, the duplicate
     /// skip, the human-class skip, and the ejected refusal for explicit

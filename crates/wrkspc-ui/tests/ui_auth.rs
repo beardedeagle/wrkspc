@@ -89,7 +89,7 @@ async fn serves_the_static_ui() {
     let _ = ui.shutdown.send(());
 }
 
-/// C17: a cookie-authenticated unsafe request without the SPA guard
+/// A cookie-authenticated unsafe request without the SPA guard
 /// header is refused (a cross-site page cannot forge the header without
 /// a preflight, and no CORS layer exists to approve one); the same
 /// request with the header succeeds, and bearer clients are untouched.

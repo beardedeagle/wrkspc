@@ -51,7 +51,7 @@ pub(crate) async fn cancel_enveloped_work(store: &Store, task_id: &str) -> Resul
         // The row-level cancel below reports the not-found verdict.
         return Ok(());
     };
-    // C2: the typed envelope — a blob without one carries nothing to
+    // The typed envelope — a blob without one carries nothing to
     // cancel.
     let Some(envelope) = wrkspc_core::DeliveryEnvelope::from_task_json(&row.task_json) else {
         return Ok(());

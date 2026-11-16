@@ -225,7 +225,7 @@ impl Store {
     ) -> Result<Vec<MessageView>> {
         // One pass into a per-message index, then O(1) lookups: the
         // transcript assembly is O(M + R), not O(M × R) — with large
-        // rooms the quadratic filter made the view 15× slower (C12).
+        // rooms the quadratic filter made the view 15× slower.
         let mut deliveries_by_message: std::collections::HashMap<String, Vec<DeliveryView>> =
             std::collections::HashMap::new();
         for row in deliveries {

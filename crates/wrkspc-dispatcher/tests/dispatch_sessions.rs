@@ -359,7 +359,7 @@ async fn two_peers_dispatch_in_parallel_without_wedging() {
 
 /// Guidance is claimed atomically: two concurrent turns in the SAME
 /// conversation partition the pending guidance, so the guidance rides
-/// exactly ONE prompt — never both (C3).
+/// exactly ONE prompt — never both.
 #[tokio::test]
 async fn concurrent_turns_in_one_conversation_do_not_duplicate_guidance() {
     let store = Store::open_in_memory("dispatcher-guidance-race")
@@ -523,7 +523,7 @@ async fn trailing_chunk_after_the_terminal_response_is_not_dropped() {
     .await;
 }
 
-/// C10: every security gate precedes the prompt — the dispatched
+/// Every security gate precedes the prompt — the dispatched
 /// write, the cancel checks, the delivery gate, registration, the
 /// guidance claim, and the post-claim cancel check all commit before
 /// `dispatch.started` is recorded, and `dispatch.started` precedes

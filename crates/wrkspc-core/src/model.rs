@@ -113,7 +113,7 @@ impl AttemptState {
 
 /// Operator decision resolving an unknown attempt.
 ///
-/// Carried typed end-to-end (C4): the API boundary parses the
+/// Carried typed end-to-end: the API boundary parses the
 /// operator's decision into this enum exactly once, the queue and the
 /// poll wire carry the enum, and the DB stores only its canonical
 /// literal — garbage never reaches the reconciliation queue.

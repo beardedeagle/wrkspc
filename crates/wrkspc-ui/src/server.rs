@@ -240,7 +240,7 @@ impl UiServer {
                             }
                         };
                     }
-                    // C17: a cookie-authenticated UNSAFE request must
+                    // A cookie-authenticated UNSAFE request must
                     // carry the SPA guard header — a cross-site page
                     // cannot add it without a preflight, and no CORS
                     // layer exists to approve one. The Sec-Fetch-Site

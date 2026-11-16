@@ -53,7 +53,7 @@ impl Delivery {
     /// The delivery, or `None` when the row is not a well-formed
     /// delivery payload.
     pub fn from_task_row(task: &TaskRow) -> Option<Self> {
-        // C2: the typed envelope — a corrupt blob is visible to the
+        // The typed envelope — a corrupt blob is visible to the
         // operator, never silently skipped like a non-delivery row: a
         // delivery this node should have mirrored is otherwise lost
         // without a trace. A blob without the envelope or the delivery

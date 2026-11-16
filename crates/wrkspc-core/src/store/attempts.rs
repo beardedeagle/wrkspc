@@ -403,7 +403,7 @@ impl Store {
             });
         }
         // An attempt that went unknown never delivered its guidance:
-        // release any claim (C3) so the next usable turn re-rides it.
+        // release any claim so the next usable turn re-rides it.
         sqlx::query("UPDATE guidance SET claimed_attempt = NULL WHERE claimed_attempt = ?")
             .bind(attempt_id)
             .execute(&mut *tx)

@@ -462,7 +462,7 @@ async fn outcome_report_validation() {
     assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
 }
 
-/// C13: a terminal report mirrors the outcome onto the sender's
+/// A terminal report mirrors the outcome onto the sender's
 /// accepted task — the envelope's origin IS that task's id — so a
 /// subscribing sender sees the transition the delivery-report leg
 /// produced.

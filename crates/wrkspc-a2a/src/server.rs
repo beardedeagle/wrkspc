@@ -59,7 +59,7 @@ fn supported_interfaces(base_url: &str) -> Vec<AgentInterface> {
 }
 
 /// The surface contract — the ONE list feeding the card, the handler's
-/// content-type gate and the hub's acceptance parse (C11). A text part
+/// content-type gate and the hub's acceptance parse. A text part
 /// declaring a media type off this list, or any non-text part, is
 /// refused loudly instead of silently dropped.
 pub fn surface_contract() -> Vec<String> {
@@ -447,11 +447,11 @@ impl A2aSurface {
             WrkspcExecutor::new(self.store.clone()),
             WrkspcTaskStore::new(self.store.clone()),
         )
-        // C11: the handler enforces the same surface contract the
+        // The handler enforces the same surface contract the
         // cards advertise — a declared media type off the list is
         // refused on the A2A leg, matching the hub's own parse.
         .with_default_input_modes(surface_contract());
-        // C13: subscribe tail-tails the store when no execution is
+        // Subscribe tail-tails the store when no execution is
         // active — the documented streaming-results transport.
         let handler = Arc::new(crate::WrkspcRequestHandler::new(inner, self.store.clone()));
         let card_producer = Arc::new(StaticAgentCard::new(build_agent_card(base_url, self.mtls)));

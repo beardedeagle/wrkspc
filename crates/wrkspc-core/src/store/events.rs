@@ -63,7 +63,7 @@ impl Store {
     /// Appends an event, asserting the writer's conversation
     /// membership INSIDE the same transaction as the insert — a peer
     /// kicked between a separate check and the write can never commit
-    /// a feed event it is no longer allowed to write (C15).
+    /// a feed event it is no longer allowed to write.
     ///
     /// Identical row semantics to [`append_event`](Store::append_event).
     ///
@@ -106,7 +106,7 @@ impl Store {
     /// Reads events after a cursor, asserting the reader's
     /// conversation membership INSIDE the same transaction as the
     /// read — a peer kicked between a separate check and the read can
-    /// never observe one page of events (C15).
+    /// never observe one page of events.
     ///
     /// Identical row shape, ordering and clamp to
     /// [`events_since`](Store::events_since).

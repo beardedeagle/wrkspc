@@ -137,7 +137,7 @@ pub(crate) async fn accept_translation(
             let Some(task_id) = task_id else {
                 return (StatusCode::BAD_REQUEST, "task method is missing its id").into_response();
             };
-            // A sender may subscribe to its OWN accepted task (C13):
+            // A sender may subscribe to its OWN accepted task:
             // the envelope's origin linkage proves the sender's host.
             // GetTask and CancelTask stay delivery-queue-scoped.
             let origin_host = if method.as_deref() == Some("SubscribeToTask") {

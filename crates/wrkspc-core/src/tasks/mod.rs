@@ -73,7 +73,7 @@ pub struct DeliveryTaskRequest<'a> {
 }
 
 /// The wrkspc delivery envelope riding in `metadata.delivery` of the
-/// A2A task shell core writes (C2): ONE schema for the builder and
+/// A2A task shell core writes: ONE schema for the builder and
 /// every reader — a typo is a compile error instead of a silent `None`
 /// from string indexing.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

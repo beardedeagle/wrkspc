@@ -329,7 +329,7 @@ pub async fn run_poll_loop(
                     }
                 };
                 for decision in decisions {
-                    // C4: the decision is typed on the wire — the parse
+                    // The decision is typed on the wire — the parse
                     // happened once at the API boundary; an undecided
                     // mirror simply has no decision yet.
                     let Some(reconciliation) = decision.decision else {

@@ -1,4 +1,4 @@
-//! C2-C contract: the task shell core writes IS a canonical A2A Task —
+//! Contract: the task shell core writes IS a canonical A2A Task —
 //! this pins the seam so an SDK upgrade that changes the wire shape
 //! fails here before a stored blob breaks a reader.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

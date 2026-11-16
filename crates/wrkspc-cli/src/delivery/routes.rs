@@ -140,7 +140,7 @@ pub(crate) async fn delivery_ack(
         Ok(task) => task,
         Err((code, message)) => return (code, message).into_response(),
     };
-    // C2: the typed envelope — a payload without one is not a delivery
+    // The typed envelope — a payload without one is not a delivery
     // task.
     let Some(envelope) = wrkspc_core::DeliveryEnvelope::from_task_json(&task.task_json) else {
         return (StatusCode::CONFLICT, "not a delivery task").into_response();
@@ -339,7 +339,7 @@ pub(crate) async fn delivery_report(
             return (StatusCode::CONFLICT, "task payload is not valid JSON").into_response();
         }
     };
-    // C2: the typed envelope — a payload without one is not a delivery
+    // The typed envelope — a payload without one is not a delivery
     // task.
     let Some(envelope) = wrkspc_core::DeliveryEnvelope::from_task_json(&task.task_json) else {
         return (StatusCode::CONFLICT, "not a delivery task").into_response();
@@ -439,7 +439,7 @@ pub(crate) async fn delivery_report(
             return (StatusCode::INTERNAL_SERVER_ERROR, "delivery report failed").into_response();
         }
     }
-    // C13: the sender's accepted task — when the message came from a
+    // The sender's accepted task — when the message came from a
     // remote node, the envelope's origin IS that task's id on this
     // hub — must see this terminal outcome: that is the documented
     // streaming-results path, and the subscribe transport tails it.

@@ -93,7 +93,7 @@ pub struct ReportWorkParams {
 /// Peer-scoped store handle (C1-B): the compile-time surface one MCP
 /// server may touch for ITS authenticated peer. The docs promise an
 /// agent can do "exactly the tool surface wrkspc registers" — this
-/// type IS that promise, and it hosts the member-checked reads (C15)
+/// type IS that promise, and it hosts the member-checked reads
 /// so membership and data access share one transaction.
 #[derive(Debug, Clone)]
 pub struct PeerStore {
@@ -151,7 +151,7 @@ impl PeerStore {
         self.store.message_recipients(message_id).await
     }
 
-    /// Membership-checked event read (C15): the check and the read
+    /// Membership-checked event read: the check and the read
     /// share one transaction.
     pub async fn events_since(
         &self,
@@ -164,7 +164,7 @@ impl PeerStore {
             .await
     }
 
-    /// Membership-checked event append (C15): the check and the write
+    /// Membership-checked event append: the check and the write
     /// share one transaction.
     pub async fn append_event(
         &self,
@@ -400,7 +400,7 @@ impl McpServer {
                 params.after_seq
             ));
         }
-        // Membership and the read share one transaction (C15).
+        // Membership and the read share one transaction.
         let events = self
             .store
             .events_since(&params.conversation_id, params.after_seq, params.limit)
@@ -438,7 +438,7 @@ impl McpServer {
             "peer_id": self.store.peer_id(),
             "summary": params.summary,
         });
-        // Membership and the write share one transaction (C15).
+        // Membership and the write share one transaction.
         let seq = self
             .store
             .append_event(&params.conversation_id, "work.report", &payload)
