@@ -788,6 +788,36 @@ async fn fanout_and_repair_skip_canceled_intents() {
 /// silently dropped.
 #[tokio::test]
 async fn hub_pending_outcomes_joins_the_mirrored_hub_task_mapping() {
+    /// A node's processed marker: the completed local task row under
+    /// the hub task id, carrying the full typed delivery envelope.
+    fn processed_marker(
+        task_id: &str,
+        message_id: &str,
+        origin: Option<&str>,
+        conversation: &str,
+        recipient: &str,
+    ) -> String {
+        let mut task = wrkspc_core::DeliveryEnvelope {
+            kind: "delivery".to_string(),
+            message_id: message_id.to_string(),
+            origin_message_id: origin.map(str::to_string),
+            conversation_id: conversation.to_string(),
+            sender_peer: "operator".to_string(),
+            sender_name: "operator".to_string(),
+            sender_class: "human".to_string(),
+            sender_host: "hub".to_string(),
+            recipient_peer: recipient.to_string(),
+            recipient_name: recipient.to_string(),
+            recipient_class: "harness".to_string(),
+            content: String::new(),
+            execution_requested: true,
+            guidance: Vec::new(),
+        }
+        .to_task_json(task_id, "node-work-mac");
+        task["status"]["state"] = "TASK_STATE_COMPLETED".into();
+        task.to_string()
+    }
+
     let store = Store::open_in_memory("outcome-outbox-test").await.unwrap();
     store
         .ensure_peer("operator", "operator", "human")
@@ -843,19 +873,7 @@ async fn hub_pending_outcomes_joins_the_mirrored_hub_task_mapping() {
             "node-work-mac",
             "completed",
             true,
-            &serde_json::json!({
-                "id": hub_task_id,
-                "contextId": "node-work-mac",
-                "status": {"state": "TASK_STATE_COMPLETED"},
-                "metadata": {"delivery": {
-                    "kind": "delivery",
-                    "message_id": "hub-msg-1",
-                    "origin_message_id": null,
-                    "conversation_id": conversation,
-                    "recipient_peer": "codex",
-                }},
-            })
-            .to_string(),
+            &processed_marker(&hub_task_id, "hub-msg-1", None, &conversation, "codex"),
         )
         .await
         .unwrap();
@@ -898,19 +916,13 @@ async fn hub_pending_outcomes_joins_the_mirrored_hub_task_mapping() {
             "node-work-mac",
             "completed",
             true,
-            &serde_json::json!({
-                "id": echo_hub_task,
-                "contextId": "node-work-mac",
-                "status": {"state": "TASK_STATE_COMPLETED"},
-                "metadata": {"delivery": {
-                    "kind": "delivery",
-                    "message_id": "hub-msg-2",
-                    "origin_message_id": echoed_id,
-                    "conversation_id": conversation,
-                    "recipient_peer": "agy",
-                }},
-            })
-            .to_string(),
+            &processed_marker(
+                &echo_hub_task,
+                "hub-msg-2",
+                Some(&echoed_id),
+                &conversation,
+                "agy",
+            ),
         )
         .await
         .unwrap();
@@ -1034,19 +1046,7 @@ async fn hub_pending_outcomes_joins_the_mirrored_hub_task_mapping() {
             "node-work-mac",
             "completed",
             true,
-            &serde_json::json!({
-                "id": second_task,
-                "contextId": "node-work-mac",
-                "status": {"state": "TASK_STATE_COMPLETED"},
-                "metadata": {"delivery": {
-                    "kind": "delivery",
-                    "message_id": "hub-msg-3",
-                    "origin_message_id": null,
-                    "conversation_id": conversation,
-                    "recipient_peer": "codex",
-                }},
-            })
-            .to_string(),
+            &processed_marker(&second_task, "hub-msg-3", None, &conversation, "codex"),
         )
         .await
         .unwrap();
