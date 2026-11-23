@@ -12,6 +12,12 @@ ignore = [
     # not a vulnerability. Accepted until a maintained loader replaces
     # it (candidate: hand-rolled parsing via rustls-pki-types).
     "RUSTSEC-2025-0134",
+    # RUSTSEC-2026-0543 (chrono 0.4.45, unmaintained, no safe upgrade):
+    # used directly by four workspace crates and the sqlx `chrono`
+    # feature, and transitively by rmcp, schemars and the a2a crates, so
+    # dropping our own uses would not remove it. Accepted until upstreams
+    # move to jiff/time; migrate our own uses alongside them.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]

@@ -6,6 +6,13 @@
       "reason": "rustls-pemfile 2.2.0 is unmaintained. wrkspc calls it directly in the hub/node TLS setup for PEM loading; it is stable, tiny, and widely used. Accepted until a maintained loader replaces it; re-check on every lockfile change.",
       "accepted_by": "Randy Thompson",
       "expires_on": "2026-12-02"
+    },
+    {
+      "id": "RUSTSEC-2026-0543",
+      "package": "chrono",
+      "reason": "chrono 0.4.45 is unmaintained with no safe upgrade. wrkspc uses it directly in four crates and through the sqlx chrono feature, and rmcp, schemars and the a2a crates pull it transitively, so removing our own uses would not clear it. Accepted until upstreams move to jiff or time; re-check on every lockfile change.",
+      "accepted_by": "Randy Thompson",
+      "expires_on": "2027-02-23"
     }
   ]
 }
