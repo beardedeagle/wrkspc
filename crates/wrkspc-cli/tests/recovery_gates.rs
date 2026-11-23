@@ -167,9 +167,23 @@ fn simultaneous_requests_serialize_to_one_active_prompt() {
     wait_delivery(&client, port, &conversation, &second, "delivered");
     wait_delivery(&client, port, &conversation, &third, "delivered");
 
+    // `delivered` is recorded before the busy gate releases the queued
+    // prompt, so wait for the harness to finish all three turns.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let raw = loop {
+        let raw = std::fs::read_to_string(&log).unwrap_or_default();
+        if raw.lines().filter(|line| line.starts_with("end\t")).count() == 3 {
+            break raw;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "three turns never finished: {raw}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
     // Three receipts, strictly sequential: each prompt starts after the
     // previous turn's 1.5 s hold completed.
-    let raw = std::fs::read_to_string(&log).expect("prompt log");
     let timestamps: Vec<u128> = raw
         .lines()
         .filter(|line| line.starts_with("start\t"))
