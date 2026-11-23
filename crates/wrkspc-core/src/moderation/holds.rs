@@ -56,19 +56,22 @@ impl Store {
     ///
     /// Idempotent: holding an already-held delivery is a no-op.
     ///
-    /// # Arguments
-    ///
     /// * `message_id` — the message whose delivery to hold.
     /// * `peer_id` — the recipient.
     /// * `set_by` — the operator/peer requesting the hold.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
-    /// recipient row does not exist or is `delivered`/`expired`,
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::NotFound`] when the
+    /// recipient row does not exist,
+    /// [`StoreError::TerminalState`] when the delivery is already
+    /// in a state that cannot be held (`delivered`/`expired`/
+    /// `blocked`), and [`StoreError::Db`] on failure.
     pub async fn hold_delivery(&self, message_id: &str, peer_id: &str, set_by: &str) -> Result<()> {
-        let mut tx = self.pool().begin().await?;
+        // IMMEDIATE: the hold is a read-modify-write — the state check
+        // and the UPDATE must not race another writer's commit
+        // (deferred snapshots surface as SQLITE_BUSY_SNAPSHOT).
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT delivery_state FROM message_recipients
              WHERE message_id = ? AND peer_id = ?",
@@ -126,8 +129,6 @@ impl Store {
     /// (moderation can land after the claim); the delivery claim path
     /// runs the same checks at the hub's claim boundary.
     ///
-    /// # Arguments
-    ///
     /// * `message_id` — the message being delivered.
     /// * `peer_id` — the recipient.
     ///
@@ -137,9 +138,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::BlockedByFence`](StoreError::BlockedByFence)
+    /// Returns [`StoreError::BlockedByFence`]
     /// naming the effective gate, and
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// [`StoreError::Db`] on failure.
     pub async fn delivery_gate(&self, message_id: &str, peer_id: &str) -> Result<()> {
         let mut tx = self.pool().begin().await?;
         let gate = delivery_gate_in_tx(&mut tx, message_id, peer_id).await?;
@@ -156,24 +157,23 @@ impl Store {
 
     /// Releases a held delivery back into the eligible queue.
     ///
-    /// # Arguments
-    ///
     /// * `message_id` — the message whose delivery to release.
     /// * `peer_id` — the recipient.
     /// * `set_by` — the operator/peer requesting the release.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// recipient row does not exist or is not `held`,
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// [`StoreError::Db`] on failure.
     pub async fn release_delivery(
         &self,
         message_id: &str,
         peer_id: &str,
         set_by: &str,
     ) -> Result<()> {
-        let mut tx = self.pool().begin().await?;
+        // IMMEDIATE: read-modify-write (see hold_delivery).
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT delivery_state FROM message_recipients
              WHERE message_id = ? AND peer_id = ?",
@@ -226,8 +226,6 @@ impl Store {
 /// kinds))` describing the first blocking gate, or `None` when the
 /// delivery may proceed.
 ///
-/// # Arguments
-///
 /// * `tx` — the open transaction the checks run in.
 /// * `message_id` — the message being delivered.
 /// * `peer_id` — the recipient.
@@ -238,30 +236,31 @@ impl Store {
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Db`](StoreError::Db) on failure.
+/// Returns [`StoreError::Db`] on failure.
 pub(crate) async fn delivery_gate_in_tx(
     tx: &mut sqlx::SqliteConnection,
     message_id: &str,
     peer_id: &str,
 ) -> Result<Option<(String, String)>> {
-    if let Some(row) = sqlx::query(
-        "SELECT m.conversation_id AS conversation_id, GROUP_CONCAT(f.kind) AS kinds
-         FROM messages m
-         JOIN fences f ON f.conversation_id = m.conversation_id
-           AND f.peer_id = ? AND f.active = 1
-           AND f.kind IN ('pause', 'hold', 'block')
-         WHERE m.id = ?
-         GROUP BY m.conversation_id",
+    // One conversation lookup serves every branch below — the fence,
+    // delivery-state, and peer gates all report the message's room.
+    let conversation_id: String =
+        sqlx::query_scalar("SELECT conversation_id FROM messages WHERE id = ?")
+            .bind(message_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let kinds: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT GROUP_CONCAT(kind) FROM fences
+         WHERE conversation_id = ? AND peer_id = ? AND active = 1
+           AND kind IN ('pause', 'hold', 'block')",
     )
+    .bind(&conversation_id)
     .bind(peer_id)
-    .bind(message_id)
     .fetch_optional(&mut *tx)
     .await?
-    {
-        return Ok(Some((
-            row.get("conversation_id"),
-            format!("fence:{}", row.get::<String, _>("kinds")),
-        )));
+    .flatten();
+    if let Some(kinds) = kinds {
+        return Ok(Some((conversation_id.clone(), format!("fence:{kinds}"))));
     }
     let delivery_state: Option<String> = sqlx::query(
         "SELECT delivery_state FROM message_recipients WHERE message_id = ? AND peer_id = ?",
@@ -274,12 +273,7 @@ pub(crate) async fn delivery_gate_in_tx(
     if let Some(state) = delivery_state.as_deref()
         && matches!(state, "held" | "blocked" | "expired")
     {
-        let conversation_id: String =
-            sqlx::query_scalar("SELECT conversation_id FROM messages WHERE id = ?")
-                .bind(message_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        return Ok(Some((conversation_id, format!("delivery:{state}"))));
+        return Ok(Some((conversation_id.clone(), format!("delivery:{state}"))));
     }
     if let Some(status) = sqlx::query_scalar::<_, String>("SELECT status FROM peers WHERE id = ?")
         .bind(peer_id)
@@ -287,11 +281,6 @@ pub(crate) async fn delivery_gate_in_tx(
         .await?
         && status != "enrolled"
     {
-        let conversation_id: String =
-            sqlx::query_scalar("SELECT conversation_id FROM messages WHERE id = ?")
-                .bind(message_id)
-                .fetch_one(&mut *tx)
-                .await?;
         return Ok(Some((conversation_id, format!("peer:{status}"))));
     }
     Ok(None)

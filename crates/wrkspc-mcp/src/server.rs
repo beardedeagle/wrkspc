@@ -7,7 +7,7 @@
 //!
 //! # rmcp adapter contract
 //!
-//! The pinned SDK is rmcp 3.9. `tool_router(server_handler)` generates the
+//! The pinned SDK is `rmcp` 3.9. `tool_router(server_handler)` generates the
 //! tools-only handler. Tool methods return `Result<T, String>`: `Err(String)`
 //! becomes a successful JSON-RPC response with `is_error: true`, preserving
 //! operational failures as failed tool calls. `ErrorData` instead produces a
@@ -17,12 +17,14 @@
 //! host allowlist accepts loopback only, in addition to this listener's
 //! bearer-token gate.
 
+use axum::response::IntoResponse;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use wrkspc_core::{AcceptOutcome, Store, StoreError};
 
 /// Parameters for the `post-message` tool.
@@ -51,9 +53,11 @@ pub struct ReadConversationParams {
     /// Conversation to read.
     pub conversation_id: String,
     /// Cursor: return events after this sequence number (exclusive).
+    /// Must be non-negative; a negative cursor is rejected loudly.
     #[serde(default)]
     pub after_seq: i64,
-    /// Maximum events to return. Defaults to 100.
+    /// Maximum events to return. Defaults to 100; the tool ceiling is
+    /// [`MAX_EVENTS_PER_READ`].
     #[serde(default = "default_limit")]
     pub limit: i64,
 }
@@ -62,6 +66,14 @@ pub struct ReadConversationParams {
 const fn default_limit() -> i64 {
     100
 }
+
+/// Hard ceiling for a single `read-conversation` page.
+///
+/// One constant owns the tool contract. The store's own clamp (1000)
+/// stays as wrkspc-core's defense-in-depth; this crate rejects values
+/// above its ceiling loudly so a harness learns the contract instead
+/// of silently receiving a clamped page.
+const MAX_EVENTS_PER_READ: i64 = 500;
 
 /// Parameters for the `report-work` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -78,10 +90,112 @@ pub struct ReportWorkParams {
 /// stdio connections are bound by process ownership, HTTP connections by
 /// the listener's token allowlist. The store's own membership checks still
 /// enforce conversation boundaries.
+/// Peer-scoped store handle (C1-B): the compile-time surface one MCP
+/// server may touch for ITS authenticated peer. The docs promise an
+/// agent can do "exactly the tool surface wrkspc registers" — this
+/// type IS that promise, and it hosts the member-checked reads
+/// so membership and data access share one transaction.
 #[derive(Debug, Clone)]
-pub struct McpServer {
+pub struct PeerStore {
     store: Store,
     peer_id: String,
+}
+
+impl PeerStore {
+    /// Builds the peer-scoped handle.
+    pub fn new(store: Store, peer_id: impl Into<String>) -> Self {
+        Self {
+            store,
+            peer_id: peer_id.into(),
+        }
+    }
+
+    /// Posts a message under the bound peer's identity, through the
+    /// store's readiness fence (mirror-only in hub mode).
+    pub async fn accept_post(
+        &self,
+        conversation_id: &str,
+        idempotency_key: &str,
+        content: &str,
+        execution_requested: bool,
+        recipients: &[wrkspc_core::RecipientRequest],
+        hub_connected: bool,
+    ) -> wrkspc_core::Result<wrkspc_core::AcceptOutcome> {
+        if hub_connected {
+            self.store
+                .accept_message_mirror_only(
+                    conversation_id,
+                    &self.peer_id,
+                    idempotency_key,
+                    content,
+                    execution_requested,
+                    recipients,
+                )
+                .await
+        } else {
+            self.store
+                .accept_message(
+                    conversation_id,
+                    &self.peer_id,
+                    idempotency_key,
+                    content,
+                    execution_requested,
+                    recipients,
+                )
+                .await
+        }
+    }
+
+    /// The committed recipient list for one message.
+    pub async fn message_recipients(&self, message_id: &str) -> wrkspc_core::Result<Vec<String>> {
+        self.store.message_recipients(message_id).await
+    }
+
+    /// Membership-checked event read: the check and the read
+    /// share one transaction.
+    pub async fn events_since(
+        &self,
+        conversation_id: &str,
+        after_seq: i64,
+        limit: i64,
+    ) -> wrkspc_core::Result<Vec<wrkspc_core::Event>> {
+        self.store
+            .events_since_for_member(conversation_id, &self.peer_id, after_seq, limit)
+            .await
+    }
+
+    /// Membership-checked event append: the check and the write
+    /// share one transaction.
+    pub async fn append_event(
+        &self,
+        conversation_id: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> wrkspc_core::Result<i64> {
+        self.store
+            .append_event_as_member(conversation_id, &self.peer_id, kind, payload)
+            .await
+    }
+
+    /// The mirrored cohort roster (no membership gate).
+    pub async fn roster(&self) -> wrkspc_core::Result<Vec<wrkspc_core::RosterEntry>> {
+        self.store.roster().await
+    }
+
+    /// One peer's class for the routing summary.
+    pub async fn peer_class_of(&self, peer: &str) -> wrkspc_core::Result<Option<String>> {
+        self.store.peer_class_of(peer).await
+    }
+
+    /// The bound peer's id (payload attribution).
+    pub fn peer_id(&self) -> &str {
+        &self.peer_id
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServer {
+    store: PeerStore,
     /// A node running with `--hub` must not execute local work before
     /// hub acceptance: posts mirror locally (no execution intents) and
     /// execution happens only when the hub echoes a delivery this node
@@ -92,16 +206,11 @@ pub struct McpServer {
 impl McpServer {
     /// Builds a server for `peer_id` backed by `store`.
     ///
-    /// # Arguments
-    ///
-    /// * `store` — the transactional store (shared with the dispatcher).
-    /// * `peer_id` — the enrolled peer this surface speaks for.
-    /// * `hub_connected` — whether this node runs against a hub; gates
-    ///   local execution behind hub acceptance and delivery claims.
+    /// The store is shared with the dispatcher; `hub_connected` gates
+    /// local execution behind hub acceptance and delivery claims.
     pub fn new(store: Store, peer_id: impl Into<String>, hub_connected: bool) -> Self {
         Self {
-            store,
-            peer_id: peer_id.into(),
+            store: PeerStore::new(store, peer_id),
             hub_connected,
         }
     }
@@ -120,23 +229,9 @@ impl McpServer {
         Ok(())
     }
 
-    /// Asserts this peer is a conversation member before read/report access.
-    ///
-    /// # Errors
-    ///
-    /// Returns the rejection message when the peer is not a member.
-    async fn require_member(&self, conversation_id: &str) -> Result<(), String> {
-        let members = self
-            .store
-            .conversation_members(conversation_id)
-            .await
-            .map_err(store_error)?;
-        if !members.iter().any(|m| m == &self.peer_id) {
-            return Err(format!(
-                "peer is not a member of conversation {conversation_id}"
-            ));
-        }
-        Ok(())
+    /// The bound peer's id.
+    pub fn peer_id(&self) -> &str {
+        &self.store.peer_id
     }
 }
 
@@ -149,10 +244,6 @@ impl McpServer {
 /// (`-32600`), which misclassifies an ordinary business denial as an
 /// invalid MCP request. Store errors are operational failures, so they
 /// ride the `is_error` envelope, never the protocol channel.
-///
-/// # Arguments
-///
-/// * `error` — the store error.
 fn store_error(error: StoreError) -> String {
     error.to_string()
 }
@@ -165,15 +256,12 @@ fn store_error(error: StoreError) -> String {
 /// and separates the peers that will take a harness turn from those that never
 /// will.
 ///
-/// # Arguments
-///
-/// * `store` — the node's store, read for peer classes.
-/// * `verb` — `accepted` or `replay`.
-/// * `message_id` — the committed message.
-/// * `delivered` — the peers the message was delivered to.
-/// * `execution_requested` — whether the caller asked for execution.
+/// `store` is read for peer classes, `verb` is `accepted` or `replay`,
+/// `message_id` is the committed message, `delivered` names the peers the
+/// message reached, and `execution_requested` says whether the caller asked
+/// for execution.
 async fn routing_summary(
-    store: &wrkspc_core::Store,
+    store: &PeerStore,
     verb: &str,
     message_id: &str,
     delivered: &[String],
@@ -190,10 +278,23 @@ async fn routing_summary(
         let mut harness: Vec<String> = Vec::new();
         let mut other: Vec<String> = Vec::new();
         for peer in delivered {
-            match store.peer_class_of(peer).await.ok().flatten().as_deref() {
-                Some("harness") => harness.push(peer.clone()),
-                Some(class) => other.push(format!("{peer} ({class})")),
-                None => other.push(peer.clone()),
+            // A store failure on the class lookup must not turn a
+            // committed delivery into a mystery silently: log it, then
+            // keep the unclassified fallback so the reply still
+            // describes who the message reached.
+            match store.peer_class_of(peer).await {
+                Ok(Some(class)) if class == "harness" => harness.push(peer.clone()),
+                Ok(Some(class)) => other.push(format!("{peer} ({class})")),
+                Ok(None) => other.push(peer.clone()),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        peer = %peer,
+                        message_id,
+                        "peer class lookup failed; treating the peer as unclassified",
+                    );
+                    other.push(peer.clone());
+                }
             }
         }
         if !harness.is_empty() {
@@ -235,35 +336,23 @@ impl McpServer {
                 execution_requested: params.execution_requested,
             })
             .collect::<Vec<_>>();
-        let outcome = if self.hub_connected {
-            // Hub mode: no local execution intents. The message mirrors
-            // locally and syncs to the hub; execution happens only when
-            // the hub accepts it (fences) and this node claims the
-            // echoed delivery.
-            self.store
-                .accept_message_mirror_only(
-                    &params.conversation_id,
-                    &self.peer_id,
-                    &params.idempotency_key,
-                    &params.content,
-                    params.execution_requested,
-                    &recipient_requests,
-                )
-                .await
-                .map_err(store_error)?
-        } else {
-            self.store
-                .accept_message(
-                    &params.conversation_id,
-                    &self.peer_id,
-                    &params.idempotency_key,
-                    &params.content,
-                    params.execution_requested,
-                    &recipient_requests,
-                )
-                .await
-                .map_err(store_error)?
-        };
+        // The peer-scoped handle posts under the bound identity and
+        // picks mirror-only in hub mode, where no local execution
+        // intents are created — execution happens only when the hub
+        // accepts the message (fences) and this node claims the echoed
+        // delivery.
+        let outcome = self
+            .store
+            .accept_post(
+                &params.conversation_id,
+                &params.idempotency_key,
+                &params.content,
+                params.execution_requested,
+                &recipient_requests,
+                self.hub_connected,
+            )
+            .await
+            .map_err(store_error)?;
         let (verb, message_id) = match outcome {
             AcceptOutcome::Accepted { message_id } => ("accepted", message_id),
             AcceptOutcome::Replay { message_id } => ("replay", message_id),
@@ -296,13 +385,22 @@ impl McpServer {
         // Bounded reads (P07): the store clamps defensively, but the
         // tool rejects out-of-range values loudly so a harness learns
         // the contract instead of silently getting a clamped page.
-        if !(1..=500).contains(&params.limit) {
+        if !(1..=MAX_EVENTS_PER_READ).contains(&params.limit) {
             return Err(format!(
-                "limit must be between 1 and 500 (got {})",
+                "limit must be between 1 and {MAX_EVENTS_PER_READ} (got {})",
                 params.limit
             ));
         }
-        self.require_member(&params.conversation_id).await?;
+        // A negative cursor must not silently mean "from the start":
+        // reject it with the same loud style so a harness computing a
+        // bad cursor learns the contract instead of getting a replay.
+        if params.after_seq < 0 {
+            return Err(format!(
+                "after_seq must be a non-negative sequence number (got {})",
+                params.after_seq
+            ));
+        }
+        // Membership and the read share one transaction.
         let events = self
             .store
             .events_since(&params.conversation_id, params.after_seq, params.limit)
@@ -314,6 +412,12 @@ impl McpServer {
     /// Lists the connected cohort (HLD rev0.9): the hub's roster
     /// mirrored onto this node — peer id, name, class, host, and last
     /// reported live state. Global and lean; no membership gate.
+    ///
+    /// Contract: this returns the full roster in a single content
+    /// block — one block, no cap, no pagination. Capping or paginating
+    /// would change the tool contract, so the bound is the cohort
+    /// itself (node peers, not unbounded history); a harness must
+    /// expect the whole roster in one reply.
     #[tool(
         name = "list-peers",
         description = "List the connected wrkspc cohort: peer id, display name, class, host, and last reported live state. Global roster, no membership required."
@@ -330,11 +434,11 @@ impl McpServer {
     )]
     async fn report_work(&self, params: Parameters<ReportWorkParams>) -> Result<String, String> {
         let Parameters(params) = params;
-        self.require_member(&params.conversation_id).await?;
         let payload = serde_json::json!({
-            "peer_id": self.peer_id,
+            "peer_id": self.store.peer_id(),
             "summary": params.summary,
         });
+        // Membership and the write share one transaction.
         let seq = self
             .store
             .append_event(&params.conversation_id, "work.report", &payload)
@@ -345,13 +449,24 @@ impl McpServer {
 }
 
 /// Configuration for the HTTP listener.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpListenerConfig {
     /// Bind address. Defaults to loopback — the origin check is the
     /// listener itself: only local connections may present tokens.
     pub bind: SocketAddr,
     /// Accepted bearer tokens. A connection must present one of these.
     pub tokens: HashSet<String>,
+}
+
+impl std::fmt::Debug for HttpListenerConfig {
+    /// Redacts the bearer allowlist: a Debug or log replay must never
+    /// print the tokens themselves — only the count is shown.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpListenerConfig")
+            .field("bind", &self.bind)
+            .field("tokens", &self.tokens.len())
+            .finish()
+    }
 }
 
 impl Default for HttpListenerConfig {
@@ -378,21 +493,14 @@ pub struct HttpListener {
 }
 
 impl HttpListener {
-    /// Builds a listener for `server` with `config`.
-    ///
-    /// # Arguments
-    ///
-    /// * `server` — the peer's MCP server.
-    /// * `config` — bind address and token allowlist.
+    /// Builds a listener for `server` with `config` (bind address and
+    /// token allowlist).
     pub fn new(server: McpServer, config: HttpListenerConfig) -> Self {
         Self { config, server }
     }
 
-    /// Binds the configured address and serves until `shutdown` resolves.
-    ///
-    /// # Arguments
-    ///
-    /// * `shutdown` — a future that ends serving when it resolves.
+    /// Binds the configured address and serves until the `shutdown` future
+    /// resolves.
     ///
     /// # Errors
     ///
@@ -405,13 +513,11 @@ impl HttpListener {
         self.serve_on(listener, shutdown).await
     }
 
-    /// Serves on an already-bound `listener` until `shutdown` resolves.
+    /// Serves on an already-bound `listener` until the `shutdown` future
+    /// resolves.
     ///
-    /// # Arguments
-    ///
-    /// * `listener` — a bound TCP listener (tests bind port 0 themselves to
-    ///   discover the address).
-    /// * `shutdown` — a future that ends serving when it resolves.
+    /// Tests bind port 0 themselves to discover the address before calling
+    /// this.
     ///
     /// # Errors
     ///
@@ -425,7 +531,7 @@ impl HttpListener {
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let addr = listener.local_addr()?;
-        tracing::info!(%addr, peer = %self.server.peer_id, "wrkspc MCP http listener bound");
+        tracing::info!(%addr, peer = %self.server.peer_id(), "wrkspc MCP http listener bound");
 
         // Streamable HTTP: a tower service mounted at /mcp. Older clients
         // keep managed sessions; newer protocol versions are stateless. Each
@@ -443,7 +549,9 @@ impl HttpListener {
             http_config,
         );
         let router = axum::Router::new().nest_service("/mcp", service);
-        let tokens = self.config.tokens.clone();
+        // Wrap the token set once: the per-request middleware clones
+        // only the Arc, never the whole set.
+        let tokens: Arc<HashSet<String>> = Arc::new(self.config.tokens.clone());
         let router = router.layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
                 let tokens = tokens.clone();
@@ -452,21 +560,23 @@ impl HttpListener {
                         .headers()
                         .get(axum::http::header::AUTHORIZATION)
                         .and_then(|value| value.to_str().ok())
-                        .and_then(|value| value.strip_prefix("Bearer "))
+                        .and_then(|value| {
+                            // RFC 9110 §11.1: the auth-scheme is
+                            // case-insensitive and separated from the
+                            // credentials by the first whitespace run.
+                            let (scheme, token) = value.split_once(char::is_whitespace)?;
+                            scheme
+                                .eq_ignore_ascii_case("bearer")
+                                .then_some(token.trim())
+                        })
                         .map(|token| tokens.contains(token))
                         .unwrap_or(false);
                     if !authorized {
-                        let response = axum::response::Response::builder()
-                            .status(axum::http::StatusCode::UNAUTHORIZED)
-                            .body(axum::body::Body::from("unauthorized"));
-                        return match response {
-                            Ok(response) => response,
-                            // A static status and static body cannot fail;
-                            // this arm guards against builder misuse.
-                            Err(error) => {
-                                unreachable!("static unauthorized response failed: {error}")
-                            }
-                        };
+                        // A static status with a static body is an
+                        // infallible response: the tuple impl cannot
+                        // fail, so there is no panic path here.
+                        return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized")
+                            .into_response();
                     }
                     next.run(request).await
                 }

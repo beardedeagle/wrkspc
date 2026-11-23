@@ -35,11 +35,8 @@ pub trait PresenceSource: Send + Sync {
 /// A failed fetch keeps the last-known mirror — stale-but-visible, per
 /// the freshness decision (the UI shows last-seen age).
 ///
-/// # Arguments
-///
-/// * `client` — the stamped reqwest client (mTLS identity).
-/// * `hub_url` — the hub base URL.
-/// * `store` — the node's local store.
+/// `client` is the stamped reqwest client (mTLS identity); `hub_url` is
+/// the hub base URL; `store` is the node's local store.
 ///
 /// # Returns
 ///
@@ -77,11 +74,8 @@ pub(crate) async fn sync_roster(client: &reqwest::Client, hub_url: &str, store: 
 /// Failed uploads are retried next tick — presence is a heartbeat, not
 /// a queue, so nothing is buffered here.
 ///
-/// # Arguments
-///
-/// * `client` — the stamped reqwest client (mTLS identity).
-/// * `hub_url` — the hub base URL.
-/// * `decls` — the declarations to report.
+/// `client` is the stamped reqwest client (mTLS identity); `hub_url` is
+/// the hub base URL; `decls` is the declarations to report.
 ///
 /// # Returns
 ///
@@ -127,11 +121,8 @@ pub(crate) async fn upload_presence(
 /// hub for its rooms each tick and mirrors them, so both machines show the same
 /// list. Failures keep the last-known mirror rather than emptying it.
 ///
-/// # Arguments
-///
-/// * `client` — the node's stamped mTLS client.
-/// * `hub_url` — the hub's base URL.
-/// * `store` — the node's local store.
+/// `client` is the node's stamped mTLS client; `hub_url` is the hub's
+/// base URL; `store` is the node's local store.
 ///
 /// # Returns
 ///

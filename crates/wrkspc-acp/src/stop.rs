@@ -13,8 +13,6 @@ use wrkspc_core::AttemptState;
 
 /// Maps an ACP stop reason to the wrkspc attempt state it implies.
 ///
-/// # Arguments
-///
 /// * `reason` — the stop reason from the `session/prompt` response.
 ///
 /// # Returns
@@ -38,8 +36,6 @@ pub fn stop_reason_to_attempt_state(reason: &StopReason) -> AttemptState {
 
 /// Returns the DB literal for a stop reason (the attempt `stop_reason`
 /// column), so outcome provenance is preserved on every terminal state.
-///
-/// # Arguments
 ///
 /// * `reason` — the stop reason from the `session/prompt` response.
 pub fn stop_reason_str(reason: &StopReason) -> &'static str {

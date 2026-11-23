@@ -113,15 +113,7 @@ pub enum UninstallOutcome {
     NothingToRemove,
 }
 
-/// Resolves a `--harness` value.
-///
-/// # Arguments
-///
-/// * `id` — the harness id (case-insensitive).
-///
-/// # Returns
-///
-/// The registry entry, or `None` for an unknown id.
+/// Skill installation, status, and uninstall against one harness.
 pub mod apply;
 pub mod detect;
 pub mod registry;
@@ -171,9 +163,7 @@ pub(crate) fn validated_home_from(
 
 /// Runs the `wrkspc skill` subcommand.
 ///
-/// # Arguments
-///
-/// * `args` — the skill command and its options.
+/// Takes `args`, the skill command and its options.
 ///
 /// # Errors
 ///

@@ -1,6 +1,6 @@
 //! wrkspc — coordination hub for humans and AI agents.
 //!
-//! `wrkspc node run` is the pilot (sessions + dispatcher + UI); `wrkspc
+//! `wrkspc node run` runs the node (sessions + dispatcher + UI); `wrkspc
 //! hub run` is the coordinator role (A2A surface + shared store + UI, no
 //! harness control); `mcp-bridge` is spawned by harness ACP adapters via
 //! the injected session config.
@@ -36,7 +36,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Runs the pilot node (store + sessions + dispatcher + UI).
+    /// Runs the node (store + sessions + dispatcher + UI).
     Node {
         #[command(subcommand)]
         node: NodeCommand,

@@ -24,7 +24,7 @@ pub struct Event {
     pub created_at: String,
 }
 
-/// Outcome of [`Store::accept_message`](Store::accept_message).
+/// Outcome of [`Store::accept_message`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptOutcome {
     /// A fresh message committed with its recipients and intents.
@@ -50,7 +50,7 @@ pub struct RecipientRequest {
 /// it per database, regardless of role labels, and a crashed process
 /// releases it automatically). Dropping the LAST clone closes the lock
 /// file and releases the lock; use
-/// [`Store::release_lock`](Store::release_lock) when handing the
+/// [`Store::release_lock`] when handing the
 /// database to another process without dropping the store.
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -85,6 +85,7 @@ pub mod conversations;
 pub mod events;
 pub mod fences;
 pub mod messages;
+pub use messages::MAX_DIRECTED_RECIPIENTS;
 pub mod peers;
 pub mod reconcile;
 
@@ -103,8 +104,6 @@ impl Store {
     /// turns. A genuine long-held lock still fails (and surfaces visibly)
     /// after the retry budget.
     ///
-    /// # Arguments
-    ///
     /// * `op` — the operation to run; must be safe to re-run (all store
     ///   writes here are idempotent or single-attempt).
     /// * `label` — the operation name, for retry logs.
@@ -119,15 +118,17 @@ impl Store {
                 Err(StoreError::Db(sqlx::Error::Database(db)))
                     if matches!(
                         db.code().as_deref(),
-                        // SQLITE_BUSY (5) and SQLITE_BUSY_SNAPSHOT
-                        // (517): the snapshot variant is the WAL
-                        // reader's contention form and must retry the
-                        // same way (C11).
-                        Some("5") | Some("517")
+                        // Every SQLITE_BUSY primary-5 form retries the
+                        // same way: BUSY (5), BUSY_RECOVERY (261),
+                        // BUSY_SNAPSHOT (517), and BUSY_TIMEOUT (773)
+                        // — the snapshot and recovery variants are the
+                        // WAL reader's contention forms and must not
+                        // leak to callers as hard errors.
+                        Some("5" | "261" | "517" | "773")
                     ) && attempt < 10 =>
                 {
                     attempt += 1;
-                    let delay = std::time::Duration::from_millis(100 * attempt as u64);
+                    let delay = std::time::Duration::from_millis(100 * u64::from(attempt));
                     tracing::warn!(
                         %label,
                         attempt,

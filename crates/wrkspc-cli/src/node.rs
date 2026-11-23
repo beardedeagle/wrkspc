@@ -22,7 +22,7 @@ pub struct NodeRunArgs {
     /// Database file (created if absent).
     #[arg(long)]
     pub db: PathBuf,
-    /// Bindings TOML (one [[binding]] per harness peer).
+    /// Bindings TOML (one \[\[binding\]\] per harness peer).
     #[arg(long)]
     pub bindings: PathBuf,
     /// UI bind address (default 127.0.0.1:8081).
@@ -47,9 +47,18 @@ pub struct NodeRunArgs {
     /// Client private key PEM (required with `--hub`).
     #[arg(long, requires = "hub")]
     pub tls_key: Option<PathBuf>,
-    /// Seconds between hub polls.
-    #[arg(long, default_value_t = 5)]
+    /// Seconds between hub polls. Zero is rejected at parse time: a
+    /// silently clamped zero would hammer the hub with no warning.
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
     pub poll_interval_secs: u64,
+    /// Seconds one session lookup may take (spawn, initialize, model
+    /// pin) before the dispatcher records an unknown attempt. Harness
+    /// cold start differs by harness and machine, so the default is a
+    /// generous guess; lower it on fast local drills. Too low a value
+    /// produces unknown attempts that block the recipient until
+    /// reconciliation. Zero is rejected at parse time.
+    #[arg(long, default_value_t = 45, value_parser = clap::value_parser!(u64).range(1..))]
+    pub lookup_timeout_secs: u64,
     /// This node's operator-identity name: the Keychain account key for
     /// its UI token (`wrkspc.<name>`). Defaults to the bare host name,
     /// or `default`. Distinct nodes on one machine need distinct names
@@ -65,12 +74,11 @@ pub struct NodeRunArgs {
 }
 
 /// The node's keychain identity: `--node-name` when given, otherwise the
-/// host id (shortened to the bare hostname), otherwise `default`.
+/// host id (its certificate SAN, with the `.mtls.devlocal.home.arpa`
+/// suffix trimmed), otherwise `default`.
 ///
-/// # Arguments
-///
-/// * `node_name` — the explicit `--node-name` value.
-/// * `host_id` — the node's `--host-id` value.
+/// `node_name` is the explicit `--node-name` value; `host_id` is the
+/// node's `--host-id` value.
 fn node_identity(node_name: Option<&str>, host_id: Option<&str>) -> String {
     if let Some(name) = node_name.filter(|name| !name.is_empty()) {
         return name.to_string();
@@ -83,11 +91,9 @@ fn node_identity(node_name: Option<&str>, host_id: Option<&str>) -> String {
     }
 }
 
-/// Runs the pilot node until ctrl-c.
+/// Runs the node until ctrl-c.
 ///
-/// # Arguments
-///
-/// * `args` — the parsed run arguments.
+/// Takes `args`, the parsed run arguments.
 ///
 /// # Errors
 ///
@@ -100,7 +106,7 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
     let db = canonical_db_path(&args.db)?;
     let store = Store::open(&db, "wrkspc-node").await?;
 
-    // Enrolled peers + the pilot conversation (fresh databases only).
+    // Enrolled peers + the starter conversation (fresh databases only).
     store.ensure_peer("operator", "operator", "human").await?;
     let mut peer_ids = vec!["operator".to_string()];
     for binding in &bindings.binding {
@@ -112,7 +118,7 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
     if store.list_conversations().await?.is_empty() {
         let refs: Vec<&str> = peer_ids.iter().map(String::as_str).collect();
         let conversation_id = store.create_conversation(&refs).await?;
-        tracing::info!(%conversation_id, "created pilot conversation");
+        tracing::info!(%conversation_id, "created starter conversation");
     }
 
     // Components share one shutdown signal; ctrl-c flips it and the
@@ -126,9 +132,9 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
         }
     };
 
-    // Team mode: the node's BINDING peers cut over from the pilot host
+    // Team mode: the node's BINDING peers cut over from the local host
     // marker to the node's real host id (append-only host assignment;
-    // idempotent — the pilot assignment stays as history). The operator
+    // idempotent — the local assignment stays as history). The operator
     // is NOT a local peer: its host stays the hub's, or the node would
     // treat every hub-originated operator message as locally owned and
     // re-send it back to the hub forever. Runs before any mirroring so
@@ -136,7 +142,7 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
     if let Some(host_id) = args.host_id.as_deref() {
         for binding in &bindings.binding {
             let peer_id = &binding.peer_id;
-            if store.peer_host(peer_id).await?.as_deref() == Some(wrkspc_core::PILOT_HOST_ID) {
+            if store.peer_host(peer_id).await?.as_deref() == Some(wrkspc_core::LOCAL_HOST_ID) {
                 let assigned = store.assign_peer_host(peer_id, host_id).await?;
                 tracing::info!(%peer_id, %host_id, %assigned, "team-mode host cutover");
             }
@@ -168,8 +174,14 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
         // for hub acceptance and the echoed delivery claim.
         args.hub.is_some(),
     ));
-    let (dispatcher, dispatcher_handle) =
-        Dispatcher::new(store.clone(), provider.clone(), DispatcherConfig::default());
+    let (dispatcher, dispatcher_handle) = Dispatcher::new(
+        store.clone(),
+        provider.clone(),
+        DispatcherConfig {
+            lookup_timeout: std::time::Duration::from_secs(args.lookup_timeout_secs),
+            ..DispatcherConfig::default()
+        },
+    );
 
     // Operator token: an explicit `--ui-token-file` wins (the deploy
     // wrapper's tmpfs handoff), then WRKSPC_UI_TOKEN, then the
@@ -262,7 +274,7 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
 
     // Team mode: dial the hub over mTLS and pull this host's delivery
     // queue into the local store. Mirrors + records + acks; the local
-    // dispatcher then drives execution exactly as in the pilot.
+    // dispatcher then drives execution exactly as in single-machine mode.
     let poll_task = match &args.hub {
         Some(hub_url) => {
             let host_id = args
@@ -290,7 +302,7 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
             let hub_url = hub_url.trim_end_matches('/').to_string();
             let poll_store = store.clone();
             let shutdown = shutdown_rx.clone();
-            let interval = std::time::Duration::from_secs(args.poll_interval_secs.max(1));
+            let interval = std::time::Duration::from_secs(args.poll_interval_secs);
             let host = host_id.clone();
             let presence: Option<std::sync::Arc<dyn crate::poll::PresenceSource>> =
                 Some(provider.clone());
@@ -316,8 +328,24 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
     // Readiness marker: integration tests (and operators) wait for this
     // file instead of parsing logs or polling the UI port. It carries no
     // secret — the token lives in the platform store, never in a file on
-    // macOS.
-    tokio::fs::write(format!("{}.ready", db.display()), b"ready")
+    // macOS. A pre-planted symlink at the marker path must not redirect
+    // the truncating write at an arbitrary file: it is refused, exactly
+    // like the token-file policy (CU-02).
+    let ready_marker = format!("{}.ready", db.display());
+    match std::fs::symlink_metadata(&ready_marker) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "readiness marker {ready_marker} is a symlink — refusing to write through it"
+            )
+            .into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!("cannot stat readiness marker {ready_marker}: {error}").into());
+        }
+    }
+    tokio::fs::write(&ready_marker, b"ready")
         .await
         .map_err(|e| format!("cannot write readiness marker: {e}"))?;
 
@@ -343,7 +371,7 @@ pub async fn run_node(args: NodeRunArgs) -> Result<(), Box<dyn std::error::Error
     if let Some(task) = a2a_task {
         let _ = task.await;
     }
-    if let Err(error) = tokio::fs::remove_file(format!("{}.ready", db.display())).await
+    if let Err(error) = tokio::fs::remove_file(&ready_marker).await
         && error.kind() != std::io::ErrorKind::NotFound
     {
         tracing::warn!(%error, "readiness marker removal failed");

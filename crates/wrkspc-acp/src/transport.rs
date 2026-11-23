@@ -1,4 +1,5 @@
-//! The transport seam: `SessionHandle` depends only on [`AcpTransport`].
+//! The transport seam: [`crate::session::SessionHandle`] depends only on
+//! [`AcpTransport`].
 //!
 //! [`StdioTransport`] owns the adapter child process and its pipes (the only
 //! implementation today, per D-3's verified transport reality). A future
@@ -46,8 +47,6 @@ pub trait AcpTransport: Send + 'static {
     /// Opens a connection, wires session updates and permission requests,
     /// runs `task` against it, and cleans up afterwards.
     ///
-    /// # Arguments
-    ///
     /// * `updates` — broadcast of `session/update` notifications (multiple
     ///   subscribers: the dispatcher drive task and future UI pumps).
     /// * `task` — the session-control loop; runs with a live connection.
@@ -59,39 +58,78 @@ pub trait AcpTransport: Send + 'static {
         self,
         updates: tokio::sync::broadcast::Sender<SessionEvent>,
         task: ConnectionTask,
-    ) -> Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send>>;
+    ) -> impl Future<Output = crate::error::Result<()>> + Send;
 }
 
 /// Stdio transport: launches the adapter command and speaks ACP over its
-/// stdio pipes. The command is a single shell-style string, e.g.
-/// `"npx -y @agentclientprotocol/codex-acp@2.1.1"`.
+/// stdio pipes. The command is either a single shell-style string, e.g.
+/// `"npx -y @agentclientprotocol/codex-acp@2.1.1"` ([`StdioTransport::new`]),
+/// or a structured argv that needs no shell quoting
+/// ([`StdioTransport::new_with_args`]).
 #[derive(Debug, Clone)]
 pub struct StdioTransport {
-    command: String,
+    command: StdioCommand,
+}
+
+/// The two ways a stdio adapter launch can be specified.
+#[derive(Debug, Clone)]
+enum StdioCommand {
+    /// One shell-style string, parsed by the ACP SDK's shell splitter.
+    Shell(String),
+    /// A structured program plus argv, passed through unsplit.
+    Args { program: String, args: Vec<String> },
 }
 
 impl StdioTransport {
     /// Builds a transport for the given adapter command.
     ///
-    /// # Arguments
-    ///
     /// * `command` — the adapter launch command (parsed by the ACP SDK).
     pub fn new(command: impl Into<String>) -> Self {
         Self {
-            command: command.into(),
+            command: StdioCommand::Shell(command.into()),
+        }
+    }
+
+    /// Builds a transport for a structured adapter argv.
+    ///
+    /// Arguments are passed through as-is — no shell splitting — so
+    /// paths and values containing spaces need no manual quoting.
+    ///
+    /// * `program` — the adapter executable.
+    /// * `args` — the adapter's arguments, in order.
+    pub fn new_with_args(
+        program: impl Into<String>,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            command: StdioCommand::Args {
+                program: program.into(),
+                args: args.into_iter().map(Into::into).collect(),
+            },
         }
     }
 }
 
 impl AcpTransport for StdioTransport {
+    // `impl Future + Send`, not `async fn` sugar: RPITIT futures do not
+    // leak auto traits, so the explicit Send bound is what lets
+    // SessionHandle::spawn run this future on a tokio worker.
+    #[allow(clippy::manual_async_fn)]
     fn with_connection(
         self,
         updates: tokio::sync::broadcast::Sender<SessionEvent>,
         task: ConnectionTask,
-    ) -> Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send>> {
-        Box::pin(async move {
-            let agent =
-                AcpAgent::from_str(&self.command).map_err(|e| AcpError::Spawn(e.to_string()))?;
+    ) -> impl Future<Output = crate::error::Result<()>> + Send {
+        async move {
+            let agent = match self.command {
+                StdioCommand::Shell(command) => {
+                    AcpAgent::from_str(&command).map_err(|e| AcpError::Spawn(e.to_string()))?
+                }
+                StdioCommand::Args { program, args } => {
+                    let argv = std::iter::once(program).chain(args);
+                    AcpAgent::from_args(argv).map_err(|e| AcpError::Spawn(e.to_string()))?
+                }
+            };
             Client
                 .v1()
                 .on_receive_notification(
@@ -132,6 +170,6 @@ impl AcpTransport for StdioTransport {
                 .connect_with(agent, async move |connection| task(connection).await)
                 .await
                 .map_err(|e| AcpError::Protocol(e.to_string()))
-        })
+        }
     }
 }

@@ -5,9 +5,9 @@
 //! Keep both in sync deliberately.
 
 /// The host identity stamped on every record. Constant for the single-host
-/// pilot (D-6's day-1 requirement); team mode stamps real host identities
+/// local host (D-6's day-1 requirement); team mode stamps real host identities
 /// with zero schema migration.
-pub const PILOT_HOST_ID: &str = "wrkspc-pilot-host";
+pub const LOCAL_HOST_ID: &str = "wrkspc-local-host";
 
 /// The presence live-state vocabulary (HLD rev0.9 first cut; idle/busy
 /// arrive with dispatcher in-flight wiring).
@@ -16,35 +16,6 @@ pub const PRESENCE_STATES: [&str; 3] = ["connected", "disconnected", "unknown"];
 /// Returns `true` when `state` is a known presence live state.
 pub fn is_presence_state(state: &str) -> bool {
     PRESENCE_STATES.contains(&state)
-}
-
-/// Generated identifiers are UUID v4 strings.
-pub type Id = String;
-
-/// Timestamps are RFC 3339 UTC strings.
-pub type Timestamp = String;
-
-/// Participant class, matching the HLD's two-class model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerClass {
-    /// Speaks A2A directly; the hub coordinates on its behalf.
-    A2aNative,
-    /// Resides in a harness; wrkspc exposes MCP tools to it and speaks A2A
-    /// on its behalf.
-    Harness,
-    /// Human operator.
-    Human,
-}
-
-impl PeerClass {
-    /// Returns the wire/DB literal for this class.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PeerClass::A2aNative => "a2a_native",
-            PeerClass::Harness => "harness",
-            PeerClass::Human => "human",
-        }
-    }
 }
 
 /// Delivery gate state per message recipient.
@@ -101,17 +72,12 @@ impl IntentState {
             IntentState::Canceled => "canceled",
         }
     }
-
-    /// Whether this intent state blocks new dispatch work.
-    pub fn blocks_new_work(self) -> bool {
-        matches!(self, IntentState::Claimed)
-    }
 }
 
 /// Attempt lifecycle. Terminal states are immutable: re-applying the same
 /// terminal state is allowed (idempotent re-emission), a different state is
 /// rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AttemptState {
     Claimed,
     Dispatched,
@@ -146,13 +112,46 @@ impl AttemptState {
 }
 
 /// Operator decision resolving an unknown attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Carried typed end-to-end: the API boundary parses the
+/// operator's decision into this enum exactly once, the queue and the
+/// poll wire carry the enum, and the DB stores only its canonical
+/// literal — garbage never reaches the reconciliation queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Reconciliation {
     /// The attempt is closed as failed and the intent returns to `queued`,
     /// allowing a fresh attempt under explicit operator authorization.
     Retry,
     /// The attempt is closed with the given terminal state.
     Close { state: AttemptState },
+}
+
+impl Reconciliation {
+    /// Returns the canonical DB literal for this decision.
+    pub fn as_str(self) -> String {
+        match self {
+            Reconciliation::Retry => "retry".to_string(),
+            Reconciliation::Close { state } => format!("close:{}", state.as_str()),
+        }
+    }
+
+    /// Parses a stored DB literal, refusing anything off the canonical
+    /// list instead of guessing.
+    pub fn from_literal(literal: &str) -> Option<Self> {
+        match literal {
+            "retry" => Some(Reconciliation::Retry),
+            "close:failed" => Some(Reconciliation::Close {
+                state: AttemptState::Failed,
+            }),
+            "close:completed" => Some(Reconciliation::Close {
+                state: AttemptState::Completed,
+            }),
+            "close:canceled" => Some(Reconciliation::Close {
+                state: AttemptState::Canceled,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Moderation fence kinds.
@@ -177,8 +176,6 @@ impl FenceKind {
     }
 
     /// Parses a DB literal back into a fence kind.
-    ///
-    /// # Arguments
     ///
     /// * `literal` — the kind literal (`pause`/`hold`/`block`).
     ///

@@ -1,4 +1,5 @@
-//! Unknown-attempt reconciliation and the stuck-claim release op.
+//! Unknown-attempt reconciliation: the merged local-plus-hub unknown
+//! view and the operator's retry/close decision.
 
 use super::{AppState, store_error};
 use crate::redact::redact;
@@ -94,13 +95,10 @@ pub(crate) async fn reconcile_attempt(
         .into_iter()
         .any(|view| view.attempt_id == attempt_id);
     if mirrored {
-        let decision_string = match decision {
-            Reconciliation::Retry => "retry".to_string(),
-            Reconciliation::Close { state } => format!("close:{}", state.as_str()),
-        };
+        // The typed decision is stored, not a re-encoded string.
         let updated = state
             .store
-            .set_hub_unknown_decision(&attempt_id, &decision_string)
+            .set_hub_unknown_decision(&attempt_id, decision)
             .await
             .map_err(store_error)?;
         if !updated {
@@ -122,6 +120,7 @@ pub(crate) async fn reconcile_attempt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UiConfig;
     use crate::api::AppState;
     use std::future::Future;
     use std::pin::Pin;
@@ -131,12 +130,12 @@ mod tests {
     struct NoCancel;
 
     impl crate::api::CancelRequester for NoCancel {
-        fn request_cancel(
-            &self,
-            _message_id: &str,
-            _recipient_id: &str,
-            _set_by: &str,
-        ) -> Pin<Box<dyn Future<Output = Result<CancelOutcome, String>> + Send + '_>> {
+        fn request_cancel<'a>(
+            &'a self,
+            _message_id: &'a str,
+            _recipient_id: &'a str,
+            _set_by: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<CancelOutcome, String>> + Send + 'a>> {
             Box::pin(async { Ok(CancelOutcome::IntentCanceled) })
         }
     }
@@ -186,7 +185,11 @@ mod tests {
             .await
             .unwrap();
 
-        let state = AppState::new(store, Arc::new(NoCancel), false, true, false, None);
+        let config = UiConfig {
+            hub_role: true,
+            ..Default::default()
+        };
+        let state = AppState::new(store, Arc::new(NoCancel), &config, None);
         let Json(views) = unknown_attempts(State(state)).await.unwrap();
         let views = views.as_array().expect("array response");
         assert_eq!(views.len(), 1);

@@ -1,8 +1,10 @@
-//! The task-persistence half of the [`Store`](crate::store::Store):
+//! The task-persistence half of the [`Store`]:
 //! task CRUD with keyset pagination, delivery-task queueing, and the
 //! delivery claim lifecycle.
 
-use super::{DeliveryClaimOutcome, DeliveryTaskRequest, TaskRow, task_row_from_sql};
+use super::{
+    DeliveryClaimOutcome, DeliveryEnvelope, DeliveryTaskRequest, TaskRow, task_row_from_sql,
+};
 use crate::error::{Result, StoreError};
 use crate::store::Store;
 use chrono::Utc;
@@ -10,8 +12,6 @@ use sqlx::Row;
 
 impl Store {
     /// Creates a task row. The initial version is 1.
-    ///
-    /// # Arguments
     ///
     /// * `task_id` — unique task identifier.
     /// * `context_id` — logical grouping identifier.
@@ -21,8 +21,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::AlreadyExists`](StoreError::AlreadyExists) when
-    /// the task id exists, [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::AlreadyExists`] when
+    /// the task id exists, [`StoreError::Db`] on failure.
     pub async fn task_create(
         &self,
         task_id: &str,
@@ -32,7 +32,7 @@ impl Store {
         task_json: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        let result = match sqlx::query(
+        sqlx::query(
             "INSERT INTO a2a_tasks
                (task_id, context_id, state, terminal, task_json, version, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
@@ -46,26 +46,17 @@ impl Store {
         .bind(&now)
         .execute(self.pool())
         .await
-        {
-            Ok(result) => result,
-            // SQLite raises a constraint error on a duplicate primary
-            // key; rows_affected() never reports zero here. Match the
-            // violation so callers get the documented AlreadyExists
-            // instead of a generic Db error.
-            Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
-                return Err(StoreError::AlreadyExists {
-                    entity: "a2a task",
-                    id: task_id.to_string(),
-                });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if result.rows_affected() == 0 {
-            return Err(StoreError::AlreadyExists {
+        // SQLite raises a constraint error on a duplicate primary
+        // key; rows_affected() never reports zero here. Match the
+        // violation so callers get the documented AlreadyExists
+        // instead of a generic Db error.
+        .map_err(|error| match error {
+            sqlx::Error::Database(db) if db.is_unique_violation() => StoreError::AlreadyExists {
                 entity: "a2a task",
                 id: task_id.to_string(),
-            });
-        }
+            },
+            other => other.into(),
+        })?;
         Ok(())
     }
 
@@ -74,8 +65,6 @@ impl Store {
     /// Re-applying the SAME terminal state refreshes the blob/timestamp and
     /// keeps the version (idempotent re-emission); a different state over a
     /// terminal row is rejected.
-    ///
-    /// # Arguments
     ///
     /// * `task_id` — the task to update.
     /// * `state` — the new state literal.
@@ -88,9 +77,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the task
-    /// does not exist, [`StoreError::TaskTerminal`](StoreError::TaskTerminal)
-    /// on an illegal transition, [`StoreError::Db`](StoreError::Db) on
+    /// Returns [`StoreError::NotFound`] when the task
+    /// does not exist, [`StoreError::TaskTerminal`]
+    /// on an illegal transition, [`StoreError::Db`] on
     /// failure.
     pub async fn task_update(
         &self,
@@ -150,26 +139,52 @@ impl Store {
         Ok(new_version)
     }
 
-    /// Fetches a task row.
+    /// The sender host of the message whose origin a task id is:
+    /// a delivery envelope whose `origin_message_id` matches `task_id`
+    /// carries the sender's host id, and the sender's accepted task is
+    /// exactly that origin. `None` when no delivery task links the id —
+    /// a hub-local acceptance has no node-side origin, and the events
+    /// feed is its channel.
     ///
-    /// # Arguments
+    /// * `task_id` — the accepted task id (the sender's wire message
+    ///   id).
+    ///
+    /// # Returns
+    ///
+    /// The sender's host id, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`] on failure.
+    pub async fn task_origin_host(&self, task_id: &str) -> Result<Option<String>> {
+        let host: Option<String> = sqlx::query_scalar(
+            "SELECT json_extract(task_json, '$.metadata.delivery.sender_host')
+             FROM a2a_tasks
+             WHERE json_extract(task_json, '$.metadata.delivery.origin_message_id') = ?
+             LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(host)
+    }
+
+    /// Fetches a task row.
     ///
     /// * `task_id` — the task to fetch.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn task_get(&self, task_id: &str) -> Result<Option<TaskRow>> {
         let row = sqlx::query("SELECT * FROM a2a_tasks WHERE task_id = ?")
             .bind(task_id)
             .fetch_optional(self.pool())
             .await?;
-        Ok(row.map(task_row_from_sql))
+        Ok(row.as_ref().map(task_row_from_sql))
     }
 
     /// Lists task rows, newest first, with keyset pagination.
-    ///
-    /// # Arguments
     ///
     /// * `context_id` — optional context filter.
     /// * `state` — optional state-literal filter.
@@ -184,7 +199,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn task_list(
         &self,
         context_id: Option<&str>,
@@ -193,6 +208,12 @@ impl Store {
         page: Option<(&str, &str)>,
         limit: i64,
     ) -> Result<(Vec<TaskRow>, i64)> {
+        // A negative limit is clamped to an empty page: SQLite reads
+        // `LIMIT -1` as unbounded and this function then refreshes
+        // guidance per returned row, so one bad caller value would
+        // become a full-table scan plus writes. No upper clamp — the
+        // page size is the A2A caller's contract.
+        let limit = limit.max(0);
         // Logical filters (context/state/status window) scope BOTH the
         // count and the page; the keyset cursor scopes ONLY the page
         // (P11 — counting under the cursor made `total_size` shrink to
@@ -251,7 +272,186 @@ impl Store {
             rows_query = rows_query.bind(bind);
         }
         let rows = rows_query.bind(limit).fetch_all(self.pool()).await?;
-        Ok((rows.into_iter().map(task_row_from_sql).collect(), total))
+        let mut tasks: Vec<TaskRow> = rows.iter().map(task_row_from_sql).collect();
+        // The queue read is the delivery handoff boundary: before an
+        // unclaimed delivery envelope rides to a node, its guidance
+        // snapshot is brought up to date with the conversation's
+        // current pending guidance (guidance added after
+        // the task was queued must still reach the next prompt). The
+        // refresh batches ONE claims probe and ONE guidance fetch per
+        // poll, never two queries per row.
+        self.refresh_unclaimed_delivery_guidance(&mut tasks).await?;
+        Ok((tasks, total))
+    }
+
+    /// Refreshes the guidance snapshots of every unclaimed, non-terminal
+    /// delivery envelope in one poll.
+    ///
+    /// `task_create_delivery` snapshots pending guidance only at
+    /// creation time; operator guidance added while a delivery waits
+    /// unclaimed (node offline, fence active) would otherwise never
+    /// ride it — the deterministic INSERT OR IGNORE keeps the stale
+    /// blob. This lazy refresh runs at the read boundary (the queue
+    /// poll) and only for UNCLAIMED rows: once the claim is taken the
+    /// envelope is frozen at the handoff, and terminal rows are
+    /// immutable. The row's version is untouched (no state
+    /// transition); only the envelope and `updated_at` change.
+    ///
+    /// The claims probe and the guidance fetch each run ONCE per poll
+    /// as `IN`-batched queries, so the poll's query count is O(1) in
+    /// the page size, not O(rows).
+    ///
+    /// * `tasks` — the polled rows; refreshed in place on change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`] on failure.
+    async fn refresh_unclaimed_delivery_guidance(&self, tasks: &mut [TaskRow]) -> Result<()> {
+        /// One refresh candidate: the row index and the envelope's
+        /// conversation, captured in a single preparse pass.
+        struct Candidate {
+            index: usize,
+            task_id: String,
+            conversation_id: String,
+        }
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for (index, row) in tasks.iter().enumerate() {
+            if row.terminal {
+                continue;
+            }
+            // The typed envelope — a malformed or foreign blob is
+            // simply not a claimable delivery.
+            let Some(envelope) = DeliveryEnvelope::from_task_json(&row.task_json) else {
+                continue;
+            };
+            if envelope.kind != "delivery" {
+                continue;
+            }
+            candidates.push(Candidate {
+                index,
+                task_id: row.task_id.clone(),
+                conversation_id: envelope.conversation_id,
+            });
+        }
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        // ONE claims probe across every candidate task (chunked under
+        // SQLite's variable-number limit).
+        let mut claimed = std::collections::HashSet::new();
+        for chunk in candidates.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql =
+                format!("SELECT task_id FROM delivery_claims WHERE task_id IN ({placeholders})");
+            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
+            for candidate in chunk {
+                query = query.bind(&candidate.task_id);
+            }
+            for task_id in query.fetch_all(self.pool()).await? {
+                claimed.insert(task_id);
+            }
+        }
+
+        // ONE guidance fetch for every candidate conversation (same
+        // semantics and ordering as [`Store::undelivered_guidance`]).
+        let mut pending_by_conversation: std::collections::HashMap<
+            String,
+            Vec<crate::moderation::Guidance>,
+        > = std::collections::HashMap::new();
+        for chunk in candidates.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT id, conversation_id, author_id, text, created_at \
+                 FROM guidance WHERE conversation_id IN ({placeholders}) \
+                 AND delivered = 0 ORDER BY created_at ASC"
+            );
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for candidate in chunk {
+                query = query.bind(&candidate.conversation_id);
+            }
+            let rows = query.fetch_all(self.pool()).await?;
+            for row in rows {
+                let conversation_id: String = row.get("conversation_id");
+                pending_by_conversation
+                    .entry(conversation_id)
+                    .or_default()
+                    .push(crate::moderation::Guidance {
+                        id: row.get("id"),
+                        conversation_id: row.get("conversation_id"),
+                        author_id: row.get("author_id"),
+                        text: row.get("text"),
+                        created_at: row.get("created_at"),
+                    });
+            }
+        }
+
+        for candidate in &candidates {
+            let row = &mut tasks[candidate.index];
+            if claimed.contains(&candidate.task_id) {
+                // Frozen at the claim: the handoff already happened
+                // under the previously served envelope.
+                continue;
+            }
+            let Some(pending) = pending_by_conversation.get(&candidate.conversation_id) else {
+                continue;
+            };
+            let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&row.task_json) else {
+                continue;
+            };
+            let Some(delivery) = payload
+                .get_mut("metadata")
+                .and_then(|metadata| metadata.get_mut("delivery"))
+                .and_then(|delivery| delivery.as_object_mut())
+            else {
+                continue;
+            };
+            let current_ids: Vec<&str> = delivery
+                .get("guidance")
+                .and_then(|guidance| guidance.as_array())
+                .map_or_default(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
+                        .collect()
+                });
+            let pending_ids: Vec<&str> = pending
+                .iter()
+                .map(|guidance| guidance.id.as_str())
+                .collect();
+            if current_ids == pending_ids {
+                continue;
+            }
+            let guidance: Vec<serde_json::Value> = pending
+                .iter()
+                .map(|g| {
+                    serde_json::json!({
+                        "id": g.id,
+                        "author_id": g.author_id,
+                        "text": g.text,
+                    })
+                })
+                .collect();
+            delivery.insert("guidance".to_string(), serde_json::Value::Array(guidance));
+            let blob = serde_json::to_string(&payload)
+                .map_err(|error| StoreError::Db(sqlx::Error::Decode(Box::new(error))))?;
+            let now = Utc::now().to_rfc3339();
+            let updated = sqlx::query(
+                "UPDATE a2a_tasks
+                 SET task_json = ?, updated_at = ?
+                 WHERE task_id = ? AND terminal = 0",
+            )
+            .bind(&blob)
+            .bind(&now)
+            .bind(&candidate.task_id)
+            .execute(self.pool())
+            .await?;
+            if updated.rows_affected() == 1 {
+                row.task_json = blob;
+                row.updated_at = now;
+            }
+        }
+        Ok(())
     }
 
     /// Creates a delivery task: a hub-owned A2A task row that a remote
@@ -266,8 +466,6 @@ impl Store {
     /// re-queueing is idempotent and a partially completed fan-out is
     /// repairable without duplicates.
     ///
-    /// # Arguments
-    ///
     /// * `request` — the delivery to queue.
     ///
     /// # Returns
@@ -276,7 +474,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn task_create_delivery(&self, request: DeliveryTaskRequest<'_>) -> Result<String> {
         let task_id = crate::tasks::delivery_task_id(request.message_id, request.recipient_peer);
         let now = Utc::now().to_rfc3339();
@@ -300,40 +498,48 @@ impl Store {
             .collect();
         // The stored blob is a canonical A2A Task serialization (the
         // surface serves `task_json` as the wire Task), with the
-        // wrkspc delivery envelope riding in `metadata.delivery`.
-        let payload = serde_json::json!({
-            "id": task_id,
-            "contextId": request.recipient_host,
-            "status": {"state": "TASK_STATE_SUBMITTED"},
-            "metadata": {
-                "delivery": {
-                    "kind": "delivery",
-                    "message_id": request.message_id,
-                    "origin_message_id": request.origin_message_id,
-                    "conversation_id": request.conversation_id,
-                    "sender_peer": request.sender_peer,
-                    "sender_name": request.sender_name,
-                    "sender_class": request.sender_class,
-                    "sender_host": request.sender_host,
-                    "recipient_peer": request.recipient_peer,
-                    "recipient_name": request.recipient_name,
-                    "recipient_class": request.recipient_class,
-                    "content": request.content,
-                    "execution_requested": request.execution_requested,
-                    "guidance": guidance,
-                },
-            },
-        });
+        // wrkspc delivery envelope riding in `metadata.delivery` — the
+        // ONE typed schema every reader decodes.
+        let payload = DeliveryEnvelope {
+            kind: "delivery".to_string(),
+            message_id: request.message_id.to_string(),
+            origin_message_id: request.origin_message_id.map(str::to_string),
+            conversation_id: request.conversation_id.to_string(),
+            sender_peer: request.sender_peer.to_string(),
+            sender_name: request.sender_name.to_string(),
+            sender_class: request.sender_class.to_string(),
+            sender_host: request.sender_host.to_string(),
+            recipient_peer: request.recipient_peer.to_string(),
+            recipient_name: request.recipient_name.to_string(),
+            recipient_class: request.recipient_class.to_string(),
+            content: request.content.to_string(),
+            execution_requested: request.execution_requested,
+            guidance,
+        }
+        .to_task_json(&task_id, request.recipient_host);
+        // The insertion carries the cancellation fence IN THE SAME
+        // statement: the WHERE clause reads the committed intent state
+        // atomically with the insert, so an operator cancel that
+        // commits between the caller's preflight check and this insert
+        // still suppresses the row. A mail-only message
+        // (no intent row) is not canceled and always inserts; an
+        // existing row keeps its original blob (INSERT OR IGNORE).
         sqlx::query(
             "INSERT OR IGNORE INTO a2a_tasks
                (task_id, context_id, state, terminal, task_json, version, created_at, updated_at)
-             VALUES (?, ?, 'submitted', 0, ?, 1, ?, ?)",
+             SELECT ?, ?, 'submitted', 0, ?, 1, ?, ?
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM execution_intents
+                 WHERE message_id = ? AND recipient_id = ? AND state = 'canceled'
+             )",
         )
         .bind(&task_id)
         .bind(request.recipient_host)
         .bind(payload.to_string())
         .bind(&now)
         .bind(&now)
+        .bind(request.message_id)
+        .bind(request.recipient_peer)
         .execute(self.pool())
         .await?;
         Ok(task_id)
@@ -346,8 +552,6 @@ impl Store {
     /// instance; a second instance presenting the same cert gets the
     /// foreign-claim outcome. Terminal tasks cannot be claimed.
     ///
-    /// # Arguments
-    ///
     /// * `task_id` — the delivery task to claim.
     /// * `host_id` — the claiming host (its certificate SAN).
     /// * `instance_id` — the node's stable local identity (distinguishes
@@ -359,10 +563,11 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) for an
-    /// unknown task, [`StoreError::TaskTerminal`](StoreError::TaskTerminal)
-    /// for a terminal task, and
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::NotFound`] for an
+    /// unknown task, [`StoreError::TaskTerminal`] for a terminal task,
+    /// [`StoreError::BlockedByFence`] when a moderation gate or a
+    /// malformed delivery payload blocks the claim, and
+    /// [`StoreError::Db`] on failure.
     pub async fn claim_delivery(
         &self,
         task_id: &str,
@@ -370,7 +575,11 @@ impl Store {
         instance_id: &str,
     ) -> Result<DeliveryClaimOutcome> {
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool().begin().await?;
+        // IMMEDIATE: the claim is the moderation linearization point —
+        // the gate checks and the claim insert must be serialized
+        // against concurrent cancel/accept writes so a cancel that
+        // commits mid-claim cannot slip past the checks below.
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query("SELECT terminal, task_json FROM a2a_tasks WHERE task_id = ?")
             .bind(task_id)
             .fetch_optional(&mut *tx)
@@ -393,10 +602,9 @@ impl Store {
                 .fetch_optional(&mut *tx)
                 .await?
                 .map(|r| r.get("instance_id"));
-        if let Some(claimant) = existing {
-            if claimant == instance_id {
-                return Ok(DeliveryClaimOutcome::AlreadyClaimed);
-            }
+        if let Some(claimant) = existing.as_deref()
+            && claimant != instance_id
+        {
             let claimed_at: String =
                 sqlx::query("SELECT claimed_at FROM delivery_claims WHERE task_id = ?")
                     .bind(task_id)
@@ -404,17 +612,19 @@ impl Store {
                     .await?
                     .get("claimed_at");
             return Ok(DeliveryClaimOutcome::ForeignClaimed {
-                instance_id: claimant,
+                instance_id: claimant.to_string(),
                 claimed_at,
             });
         }
         // The moderation boundary: the claim is the linearization point
-        // for hub gates. A fresh claim re-evaluates the recipient's
+        // for hub gates. Every claim — including a same-instance
+        // re-claim after a restart — re-evaluates the recipient's
         // fences, delivery state, and peer status in the SAME
-        // transaction — a fence or hold that became effective before the
-        // claim must keep the node from ever mirroring an executable
-        // intent ("before anything mirrors"). The delivery identity
-        // (message/conversation/recipient) rides the task payload.
+        // transaction: a fence or hold that became effective after the
+        // first claim must keep the node from ever mirroring an
+        // executable intent ("before anything mirrors"). The delivery
+        // identity (message/conversation/recipient) rides the task
+        // payload.
         let task_json: String = row.get("task_json");
         let Some(keys) = parse_delivery_gate_keys(&task_json) else {
             return Err(StoreError::BlockedByFence {
@@ -423,6 +633,52 @@ impl Store {
                 kinds: "malformed delivery payload".to_string(),
             });
         };
+        // Orphan boundary: a delivery whose committed
+        // message or recipient no longer exists must never be claimed
+        // — the room's deletion committed and the surviving task row is
+        // a fan-out race artifact. The gate below treats a missing
+        // parent as "no gate"; this check is the defensive refusal.
+        let parent_exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1
+             FROM messages m
+             JOIN message_recipients r
+               ON r.message_id = m.id AND r.peer_id = ?
+             WHERE m.id = ?",
+        )
+        .bind(&keys.recipient_peer)
+        .bind(&keys.message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if parent_exists.is_none() {
+            return Err(StoreError::BlockedByFence {
+                conversation_id: String::new(),
+                peer_id: keys.recipient_peer,
+                kinds: "orphan:delivery parent message/recipient removed".to_string(),
+            });
+        }
+        // Canceled-intent boundary: a delivery whose
+        // execution intent the operator canceled after the task was
+        // created must not become executable — the intent tombstone is
+        // the authoritative cancellation fence at the claim gate.
+        let intent_state: Option<String> = sqlx::query_scalar(
+            "SELECT state FROM execution_intents WHERE message_id = ? AND recipient_id = ?",
+        )
+        .bind(&keys.message_id)
+        .bind(&keys.recipient_peer)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if intent_state.as_deref() == Some("canceled") {
+            let conversation_id: String =
+                sqlx::query_scalar("SELECT conversation_id FROM messages WHERE id = ?")
+                    .bind(&keys.message_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            return Err(StoreError::BlockedByFence {
+                conversation_id,
+                peer_id: keys.recipient_peer,
+                kinds: "intent:canceled".to_string(),
+            });
+        }
         if let Some((conversation_id, kinds)) = crate::moderation::holds::delivery_gate_in_tx(
             &mut tx,
             &keys.message_id,
@@ -435,6 +691,13 @@ impl Store {
                 peer_id: keys.recipient_peer,
                 kinds,
             });
+        }
+        if existing.is_some() {
+            // The same instance already holds the claim — idempotent
+            // re-claim (restart mid-delivery). The current gate was
+            // evaluated above: ownership idempotency must never let a
+            // now-effective hold/fence/ejection through.
+            return Ok(DeliveryClaimOutcome::AlreadyClaimed);
         }
         sqlx::query(
             "INSERT INTO delivery_claims (task_id, host_id, instance_id, claimed_at)
@@ -455,8 +718,6 @@ impl Store {
     /// no TTL by design). Idempotent: releasing an unclaimed task is a
     /// no-op.
     ///
-    /// # Arguments
-    ///
     /// * `task_id` — the delivery task to release.
     ///
     /// # Returns
@@ -465,7 +726,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn release_delivery_claim(&self, task_id: &str) -> Result<bool> {
         let result = sqlx::query("DELETE FROM delivery_claims WHERE task_id = ?")
             .bind(task_id)
@@ -476,8 +737,6 @@ impl Store {
 
     /// Reads a delivery claim, if one exists.
     ///
-    /// # Arguments
-    ///
     /// * `task_id` — the delivery task to query.
     ///
     /// # Returns
@@ -487,7 +746,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn delivery_claim(&self, task_id: &str) -> Result<Option<(String, String, String)>> {
         let row = sqlx::query(
             "SELECT host_id, instance_id, claimed_at FROM delivery_claims WHERE task_id = ?",
@@ -503,8 +762,6 @@ impl Store {
     ///
     /// The check and the transition run in one transaction.
     ///
-    /// # Arguments
-    ///
     /// * `task_id` — the task to cancel.
     /// * `canceled_state` — the caller's canceled-state literal.
     /// * `canceled_json` — the caller's serialized canceled-task blob.
@@ -515,9 +772,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the task
-    /// does not exist, [`StoreError::TaskTerminal`](StoreError::TaskTerminal)
-    /// when it is already terminal, [`StoreError::Db`](StoreError::Db) on
+    /// Returns [`StoreError::NotFound`] when the task
+    /// does not exist, [`StoreError::TaskTerminal`]
+    /// when it is already terminal, [`StoreError::Db`] on
     /// failure.
     pub async fn task_begin_cancel(
         &self,
@@ -526,7 +783,10 @@ impl Store {
         canceled_json: &str,
     ) -> Result<TaskRow> {
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool().begin().await?;
+        // IMMEDIATE: the terminal check and the terminal UPDATE are a
+        // read-modify-write pair; a deferred snapshot could promote
+        // under a concurrent writer and surface SQLITE_BUSY_SNAPSHOT.
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query("SELECT * FROM a2a_tasks WHERE task_id = ?")
             .bind(task_id)
             .fetch_optional(&mut *tx)
@@ -535,7 +795,7 @@ impl Store {
                 entity: "a2a task",
                 id: task_id.to_string(),
             })?;
-        let current = task_row_from_sql(row);
+        let current = task_row_from_sql(&row);
         if current.terminal {
             return Err(StoreError::TaskTerminal {
                 task_id: task_id.to_string(),
@@ -577,8 +837,6 @@ impl Store {
     /// to the terminal canceled state with its record preserved (the
     /// delivery envelope survives — H-13).
     ///
-    /// # Arguments
-    ///
     /// * `task_id` — the delivery task to cancel.
     ///
     /// # Returns
@@ -588,7 +846,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn task_mark_canceled(&self, task_id: &str) -> Result<Option<TaskRow>> {
         let Some(current) = self.task_get(task_id).await? else {
             return Ok(None);
@@ -616,9 +874,20 @@ impl Store {
         }
         let canceled_json = serde_json::to_string(&blob)
             .map_err(|error| StoreError::Db(sqlx::Error::Encode(Box::new(error))))?;
-        let canceled = self
+        // A concurrent cancel that committed between the read above and
+        // this transition satisfies the idempotent contract — the task
+        // is terminal either way — so the documented `Ok(None)` holds
+        // instead of surfacing a race as TaskTerminal/NotFound.
+        let canceled = match self
             .task_begin_cancel(task_id, "canceled", &canceled_json)
-            .await?;
+            .await
+        {
+            Ok(row) => row,
+            Err(StoreError::TaskTerminal { .. }) | Err(StoreError::NotFound { .. }) => {
+                return Ok(None);
+            }
+            Err(other) => return Err(other),
+        };
         Ok(Some(canceled))
     }
 }
@@ -626,15 +895,13 @@ impl Store {
 /// The delivery identity needed to evaluate a hub-side moderation gate:
 /// the committed message id and the recipient peer, parsed from the
 /// task payload's `metadata.delivery` envelope (written by
-/// [`Store::task_create_delivery`](Store::task_create_delivery)).
+/// [`Store::task_create_delivery`]).
 struct DeliveryGateKeys {
     message_id: String,
     recipient_peer: String,
 }
 
 /// Parses the gate-relevant keys out of a delivery task's payload blob.
-///
-/// # Arguments
 ///
 /// * `task_json` — the stored `a2a_tasks.task_json` blob.
 ///
@@ -643,13 +910,13 @@ struct DeliveryGateKeys {
 /// The message/recipient identity, or `None` when the blob is not a
 /// well-formed delivery payload.
 fn parse_delivery_gate_keys(task_json: &str) -> Option<DeliveryGateKeys> {
-    let payload: serde_json::Value = serde_json::from_str(task_json).ok()?;
-    let delivery = payload.get("metadata")?.get("delivery")?;
-    if delivery.get("kind")?.as_str()? != "delivery" {
+    // The typed envelope.
+    let envelope = DeliveryEnvelope::from_task_json(task_json)?;
+    if envelope.kind != "delivery" {
         return None;
     }
     Some(DeliveryGateKeys {
-        message_id: delivery.get("message_id")?.as_str()?.to_string(),
-        recipient_peer: delivery.get("recipient_peer")?.as_str()?.to_string(),
+        message_id: envelope.message_id,
+        recipient_peer: envelope.recipient_peer,
     })
 }

@@ -12,9 +12,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use wrkspc_acp::{SessionEvent, SessionHandle};
 
-/// The three verbs dispatch needs from a session: prompt (turn with stop
-/// reason), cancel (interrupt the in-flight turn), and events (the turn's
-/// streamed output, attributed while in flight).
+/// The three verbs dispatch needs from a session: `prompt` (turn with stop
+/// reason), `cancel` (interrupt the in-flight turn), and `events` (the
+/// turn's streamed output, attributed while in flight).
 pub trait SessionDriver: Send + Sync + 'static {
     /// Prompts the session and resolves with the turn's stop reason.
     fn prompt(

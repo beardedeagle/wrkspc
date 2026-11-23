@@ -3,6 +3,7 @@
 
 use super::{PresenceOutcome, RosterEntry, roster_entry, status_is_ejected};
 use crate::Result;
+use crate::error::StoreError;
 use crate::store::Store;
 
 impl Store {
@@ -14,6 +15,16 @@ impl Store {
         host_id: &str,
         state: &str,
     ) -> Result<PresenceOutcome> {
+        // The core boundary validates the presence vocabulary: every
+        // caller writes through here, so an unknown state string can
+        // never be persisted into presence/roster (the vocabulary check
+        // must not live only in the one call site that happens to have
+        // it today).
+        if !crate::model::is_presence_state(state) {
+            return Err(StoreError::InvalidPresenceState {
+                state: state.to_string(),
+            });
+        }
         let now = chrono::Utc::now().to_rfc3339();
         // IMMEDIATE: presence upsert is a read-modify-write that races
         // operator moderation writes (ban/boot) on the same tables.
@@ -48,6 +59,44 @@ impl Store {
             {
                 if status_is_ejected(&status) {
                     return Ok(PresenceOutcome::Ejected { status });
+                }
+                // The node re-reports its binding every presence
+                // tick, and the docs make `harness` the display name —
+                // a changed binding shows up, with an audit row. The
+                // class is authority-pinned: a node only ever reports
+                // `harness`, so a different class is an anomaly —
+                // record the drift and change nothing.
+                let (stored_name, stored_class): (String, String) =
+                    sqlx::query_as("SELECT name, class FROM peers WHERE id = ?")
+                        .bind(peer_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                if stored_name != name {
+                    sqlx::query("UPDATE peers SET name = ? WHERE id = ?")
+                        .bind(name)
+                        .bind(peer_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    Self::log_moderation(
+                        &mut tx,
+                        peer_id,
+                        "system",
+                        "rename",
+                        Some(&stored_name),
+                        Some(name),
+                    )
+                    .await?;
+                }
+                if stored_class != class {
+                    Self::log_moderation(
+                        &mut tx,
+                        peer_id,
+                        "system",
+                        "class drift",
+                        Some(&stored_class),
+                        Some(class),
+                    )
+                    .await?;
                 }
                 // A deleted cohort entry stays deleted. The node re-reports
                 // its bindings every few seconds, so re-materialising on
@@ -142,7 +191,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn roster(&self) -> Result<Vec<RosterEntry>> {
         let rows = sqlx::query(
             "SELECT r.peer_id, r.name, r.alias, r.class, r.host_id, r.status, r.state,
@@ -152,12 +201,10 @@ impl Store {
         )
         .fetch_all(self.pool())
         .await?;
-        Ok(rows.into_iter().map(roster_entry).collect())
+        Ok(rows.iter().map(roster_entry).collect())
     }
 
     /// Reads one roster row.
-    ///
-    /// # Arguments
     ///
     /// * `peer_id` — the peer to look up.
     ///
@@ -167,7 +214,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn roster_entry(&self, peer_id: &str) -> Result<Option<RosterEntry>> {
         let row = sqlx::query(
             "SELECT r.peer_id, r.name, r.alias, r.class, r.host_id, r.status, r.state,
@@ -178,7 +225,7 @@ impl Store {
         .bind(peer_id)
         .fetch_optional(self.pool())
         .await?;
-        Ok(row.map(roster_entry))
+        Ok(row.as_ref().map(roster_entry))
     }
 
     /// Replaces the local roster mirror with the hub's rows.
@@ -188,13 +235,11 @@ impl Store {
     /// hub round-trips. All-or-nothing; a failed fetch keeps the last
     /// known mirror (stale-but-visible, per the freshness decision).
     ///
-    /// # Arguments
-    ///
     /// * `entries` — the hub's current roster.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`crate::error::StoreError::Db`] on failure.
     pub async fn replace_roster(&self, entries: &[RosterEntry]) -> Result<()> {
         // IMMEDIATE: a delete-and-rebuild must not interleave with other
         // writers mid-stream.

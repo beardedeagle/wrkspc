@@ -153,7 +153,7 @@ fn simultaneous_requests_serialize_to_one_active_prompt() {
     let conversation = seed_store(&db);
     let log = dir.join("prompts.log");
     let fake = fake_agent_path();
-    let command = format!("{} --log-prompts {}", fake.display(), log.display());
+    let command = format!("{} --log-turn {}", fake.display(), log.display());
 
     let (node, port, token) = boot(&dir, &db, &command);
     let client = api_client(&token);
@@ -167,12 +167,33 @@ fn simultaneous_requests_serialize_to_one_active_prompt() {
     wait_delivery(&client, port, &conversation, &second, "delivered");
     wait_delivery(&client, port, &conversation, &third, "delivered");
 
+    // `delivered` is recorded before the busy gate releases the queued
+    // prompt, so wait for the harness to finish all three turns.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let raw = loop {
+        let raw = std::fs::read_to_string(&log).unwrap_or_default();
+        if raw.lines().filter(|line| line.starts_with("end\t")).count() == 3 {
+            break raw;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "three turns never finished: {raw}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
     // Three receipts, strictly sequential: each prompt starts after the
     // previous turn's 1.5 s hold completed.
-    let raw = std::fs::read_to_string(&log).expect("prompt log");
     let timestamps: Vec<u128> = raw
         .lines()
-        .map(|line| line.split('\t').next().unwrap().parse().unwrap())
+        .filter(|line| line.starts_with("start\t"))
+        .map(|line| {
+            line.split('\t')
+                .nth(2)
+                .expect("turn log carries a millisecond stamp")
+                .parse()
+                .unwrap()
+        })
         .collect();
     assert_eq!(timestamps.len(), 3, "three prompts: {raw}");
     for window in timestamps.windows(2) {
@@ -249,13 +270,32 @@ fn held_delivery_survives_restart_and_releases_cleanly() {
     let (node, port, token) = boot(&dir, &db, fake.to_str().unwrap());
     let client = api_client(&token);
 
-    // Hold lands before the next dispatcher tick (250 ms), so the
-    // intent never dispatches.
+    // The hold must land while the delivery is still queued — but the
+    // dispatcher ticks every 250 ms and the fake agent answers
+    // instantly, so racing post → hold → assert-held against the tick
+    // flakes under load (a dispatched delivery refuses the hold with
+    // 409). A pause fence placed BEFORE the post removes the race
+    // deterministically: the fence blocks both the claim and the
+    // dispatch-boundary gate, so the delivery cannot dispatch before
+    // the hold lands.
+    let fence_id = fence(&client, port, &conversation, "codex", "pause");
     let held = post(&client, port, &conversation, "held-work");
     hold(&client, port, &held, "codex");
     assert_eq!(
         delivery_state(&client, port, &conversation, &held, "codex").as_deref(),
         Some("held")
+    );
+    clear_fence(&client, port, &fence_id);
+    // With the fence gone, the HOLD alone must keep the delivery from
+    // dispatching.
+    wait_state_holds(
+        &client,
+        port,
+        &conversation,
+        &held,
+        "codex",
+        "delivered",
+        Duration::from_secs(3),
     );
 
     // The hold is durable moderation: after a node kill + restart the

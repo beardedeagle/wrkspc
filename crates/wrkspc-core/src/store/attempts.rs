@@ -12,16 +12,16 @@ impl Store {
     /// Claims an execution intent for dispatch, creating an attempt row
     /// BEFORE any harness write.
     ///
-    /// Idempotent: claiming an intent that already has an open (claimed,
-    /// dispatched, or unknown) attempt returns that attempt instead of
-    /// creating a second one.
+    /// Idempotent: claiming an intent that already has an open claimed
+    /// or dispatched attempt returns that attempt instead of creating
+    /// a second one; an unknown attempt blocks until reconciliation.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::BlockedByUnknown`](StoreError::BlockedByUnknown)
+    /// Returns [`StoreError::BlockedByUnknown`]
     /// when a prior attempt on this intent is unknown (operator
     /// reconciliation required first), and
-    /// [`StoreError::IntentTerminal`](StoreError::IntentTerminal) when the
+    /// [`StoreError::IntentTerminal`] when the
     /// intent already reached a terminal state.
     pub async fn claim_intent(&self, message_id: &str, recipient_id: &str) -> Result<String> {
         Store::retry_on_busy(
@@ -31,7 +31,50 @@ impl Store {
         .await
     }
 
+    /// Claims an intent ONLY when no open attempt exists for it: a
+    /// fresh claim returns `Ok(Some(attempt_id))`, while an intent
+    /// another drive has already claimed returns `Ok(None)`.
+    ///
+    /// This is the dispatcher's ownership probe for supervised
+    /// lookups: an idempotent [`claim_intent`](Store::claim_intent)
+    /// returns the existing attempt, so a stale timeout task could
+    /// quarantine an attempt another drive is actively executing.
+    /// With `fresh_only`, the timeout task only ever marks its OWN
+    /// fresh claim unknown.
+    ///
+    /// # Errors
+    ///
+    /// The same error set as [`claim_intent`](Store::claim_intent).
+    pub async fn claim_intent_if_unclaimed(
+        &self,
+        message_id: &str,
+        recipient_id: &str,
+    ) -> Result<Option<String>> {
+        Store::retry_on_busy(
+            || self.claim_intent_inner_with(message_id, recipient_id, true),
+            "claim_intent_if_unclaimed",
+        )
+        .await
+    }
+
     async fn claim_intent_inner(&self, message_id: &str, recipient_id: &str) -> Result<String> {
+        // fresh_only=false: every non-error outcome is a fresh claim or
+        // an existing open attempt, so Some always resolves.
+        self.claim_intent_inner_with(message_id, recipient_id, false)
+            .await?
+            .ok_or_else(|| {
+                StoreError::Db(sqlx::Error::Protocol(
+                    "claim_intent resolved without an attempt".to_string(),
+                ))
+            })
+    }
+
+    async fn claim_intent_inner_with(
+        &self,
+        message_id: &str,
+        recipient_id: &str,
+        fresh_only: bool,
+    ) -> Result<Option<String>> {
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin().await?;
 
@@ -65,17 +108,17 @@ impl Store {
             let open_id: String = row.get("id");
             let open_state: String = row.get("state");
             match open_state.as_str() {
-                "claimed" | "dispatched" => return Ok(open_id),
-                "unknown" => {
-                    return Err(StoreError::BlockedByUnknown {
-                        intent: intent_id,
-                        state: "unknown".to_string(),
-                    });
+                "claimed" | "dispatched" => {
+                    return Ok(if fresh_only { None } else { Some(open_id) });
                 }
-                other => {
+                // The query's IN filter admits only the three states
+                // above and below; the shared arm keeps this a
+                // defensive no-panic path should a future writer add
+                // one.
+                state => {
                     return Err(StoreError::BlockedByUnknown {
                         intent: intent_id,
-                        state: other.to_string(),
+                        state: state.to_string(),
                     });
                 }
             }
@@ -105,11 +148,11 @@ impl Store {
         }
 
         match intent_state.as_str() {
-            "queued" => {}
-            "claimed" => {
-                // Intent is claimed but no open attempt row exists — recover
-                // by re-attaching: treat as queued (crash between claim and
-                // commit can't happen; this closes the window defensively).
+            "queued" | "claimed" => {
+                // Claimed with no open attempt row means the claim's
+                // commit was interrupted: recover by re-attaching, as
+                // if queued (the crash window between claim and commit
+                // cannot happen; this closes it defensively).
             }
             "completed" | "failed" | "canceled" => {
                 return Err(StoreError::IntentTerminal {
@@ -184,7 +227,7 @@ impl Store {
         .await?;
 
         tx.commit().await?;
-        Ok(attempt_id)
+        Ok(Some(attempt_id))
     }
 
     /// Records a delivery fence-ack: the recipient's node durably
@@ -192,16 +235,16 @@ impl Store {
     /// the delivery task to terminal). Idempotent: a delivery already
     /// marked `delivered` acks again without error.
     ///
-    /// # Arguments
-    ///
     /// * `message_id` — the hub-committed message.
     /// * `peer_id` — the recipient whose delivery is acked.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
-    /// recipient row does not exist, and
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::NotFound`] when the
+    /// recipient row does not exist,
+    /// [`StoreError::TerminalState`] when the delivery is already
+    /// in a state that cannot be marked delivered, and
+    /// [`StoreError::Db`] on failure.
     pub async fn mark_delivered(&self, message_id: &str, peer_id: &str) -> Result<()> {
         Store::retry_on_busy(
             || self.mark_delivered_inner(message_id, peer_id),
@@ -211,10 +254,13 @@ impl Store {
     }
 
     async fn mark_delivered_inner(&self, message_id: &str, peer_id: &str) -> Result<()> {
+        // `dispatched` is an attempt/intent state, never a delivery
+        // state — the recipient CHECK admits only stored/held/eligible/
+        // delivered/blocked/expired — so naming it here was a dead arm.
         let result = sqlx::query(
             "UPDATE message_recipients SET delivery_state = 'delivered'
              WHERE message_id = ? AND peer_id = ?
-               AND delivery_state IN ('stored', 'eligible', 'dispatched')",
+               AND delivery_state IN ('stored', 'eligible')",
         )
         .bind(message_id)
         .bind(peer_id)
@@ -256,9 +302,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// attempt does not exist, and
-    /// [`StoreError::TerminalState`](StoreError::TerminalState) when it is
+    /// [`StoreError::TerminalState`] when it is
     /// already terminal.
     pub async fn mark_dispatched(&self, attempt_id: &str) -> Result<()> {
         Store::retry_on_busy(|| self.mark_dispatched_inner(attempt_id), "mark_dispatched").await
@@ -326,9 +372,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// attempt does not exist, and
-    /// [`StoreError::TerminalState`](StoreError::TerminalState) when it is
+    /// [`StoreError::TerminalState`] when it is
     /// already terminal (unknown can't supersede a terminal state).
     pub async fn mark_unknown(&self, attempt_id: &str, reason: &str) -> Result<()> {
         Store::retry_on_busy(
@@ -357,7 +403,7 @@ impl Store {
             });
         }
         // An attempt that went unknown never delivered its guidance:
-        // release any claim (C3) so the next usable turn re-rides it.
+        // release any claim so the next usable turn re-rides it.
         sqlx::query("UPDATE guidance SET claimed_attempt = NULL WHERE claimed_attempt = ?")
             .bind(attempt_id)
             .execute(&mut *tx)
@@ -378,9 +424,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// attempt does not exist, and
-    /// [`StoreError::TerminalState`](StoreError::TerminalState) on a state
+    /// [`StoreError::TerminalState`] on a state
     /// conflict.
     pub async fn mark_terminal(
         &self,
@@ -403,9 +449,29 @@ impl Store {
         stop_reason: Option<&str>,
         result_ref: Option<&str>,
     ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        Self::terminal_transition_in_tx(&mut tx, attempt_id, state, stop_reason, result_ref)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Transitions the attempt (and its intent) to a terminal state
+    /// inside an already-open transaction. Idempotent re-emission of
+    /// the SAME terminal state succeeds; a conflicting terminal state
+    /// errors. Shared by [`mark_terminal`](Store::mark_terminal) and
+    /// [`complete_attempt`](Store::complete_attempt) so terminal
+    /// persistence and guidance consumption can commit atomically.
+    async fn terminal_transition_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        attempt_id: &str,
+        state: AttemptState,
+        stop_reason: Option<&str>,
+        result_ref: Option<&str>,
+    ) -> Result<()> {
         debug_assert!(
             state.is_terminal(),
-            "mark_terminal requires a terminal state"
+            "terminal_transition_in_tx requires a terminal state"
         );
         if !state.is_terminal() {
             return Err(StoreError::TerminalState {
@@ -415,11 +481,10 @@ impl Store {
             });
         }
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
 
         let row = sqlx::query("SELECT intent_id, state FROM attempts WHERE id = ?")
             .bind(attempt_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
             .ok_or_else(|| StoreError::NotFound {
                 entity: "attempt",
@@ -450,7 +515,7 @@ impl Store {
         .bind(result_ref)
         .bind(&now)
         .bind(attempt_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         let intent_state = match state {
             AttemptState::Completed => IntentState::Completed,
@@ -461,8 +526,55 @@ impl Store {
         sqlx::query("UPDATE execution_intents SET state = ? WHERE id = ?")
             .bind(intent_state.as_str())
             .bind(&intent_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
+        Ok(())
+    }
+
+    /// Commits a terminal attempt state and its guidance consumption in
+    /// ONE transaction: a crash or transient failure can no longer
+    /// leave guidance permanently claimed by an already-terminal
+    /// attempt (restart reconciliation only enumerates open attempts,
+    /// so a stranded claim would never be delivered or released).
+    ///
+    /// * `guidance_ids` — the guidance rows this turn consumed; empty
+    ///   is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// The same error set as [`mark_terminal`](Store::mark_terminal),
+    /// plus [`StoreError::Db`] when a guidance write fails (the
+    /// transaction rolls back, leaving the attempt open and the claim
+    /// intact for the drive's release path).
+    pub async fn complete_attempt(
+        &self,
+        attempt_id: &str,
+        state: AttemptState,
+        stop_reason: Option<&str>,
+        guidance_ids: &[&str],
+    ) -> Result<()> {
+        Store::retry_on_busy(
+            || self.complete_attempt_inner(attempt_id, state, stop_reason, guidance_ids),
+            "complete_attempt",
+        )
+        .await
+    }
+
+    async fn complete_attempt_inner(
+        &self,
+        attempt_id: &str,
+        state: AttemptState,
+        stop_reason: Option<&str>,
+        guidance_ids: &[&str],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        Self::terminal_transition_in_tx(&mut tx, attempt_id, state, stop_reason, None).await?;
+        for id in guidance_ids {
+            sqlx::query("UPDATE guidance SET delivered = 1, claimed_attempt = NULL WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -472,22 +584,20 @@ impl Store {
     /// ran), and its intent returns to the queue so the delivery stays
     /// deliverable once the gate clears.
     ///
-    /// Unlike [`Store::mark_terminal`](Store::mark_terminal) with
+    /// Unlike [`Store::mark_terminal`] with
     /// `Canceled`, the intent is NOT terminal — a gate is not an
     /// operator cancellation, and the delivery must not be lost.
-    ///
-    /// # Arguments
     ///
     /// * `attempt_id` — the gated attempt.
     /// * `reason` — the recorded gate description.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// attempt does not exist,
-    /// [`StoreError::TerminalState`](StoreError::TerminalState) when it
+    /// [`StoreError::TerminalState`] when it
     /// already left the pre-dispatch states, and
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// [`StoreError::Db`] on failure.
     pub async fn gate_attempt(&self, attempt_id: &str, reason: &str) -> Result<()> {
         Store::retry_on_busy(
             || self.gate_attempt_inner(attempt_id, reason),

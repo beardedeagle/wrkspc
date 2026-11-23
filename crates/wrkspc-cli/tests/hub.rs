@@ -6,6 +6,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
+
+mod common;
+use common::scratch_dir;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -25,20 +28,6 @@ impl Drop for Hub {
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
-}
-
-/// Unique scratch dir for one test run.
-fn scratch_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "wrkspc-hub-test-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 /// Spawns the hub and waits for the `--a2a-addr-file` to appear (a

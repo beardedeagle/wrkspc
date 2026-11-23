@@ -7,8 +7,9 @@ instead of loopback.
 
 ## 1. Get the binary
 
-The pre-release binary ships as a signed release tarball — download
-one for your platform and verify its checksum and signature (see
+The pre-release binary ships as a release tarball with a keyless
+Sigstore attestation — download one for your platform and verify its
+checksum and attestation (see
 [Installation](./installation.md)), or build from a checkout:
 
 ```console

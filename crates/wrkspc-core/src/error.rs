@@ -11,6 +11,12 @@ pub enum StoreError {
     #[error("idempotency conflict: key `{key}` was already used with different content")]
     IdempotencyConflict { key: String },
 
+    /// A recipient list exceeded the directed-post ceiling: the fence
+    /// holds for every acceptance path (operator UI and MCP), so one
+    /// post can never fan out into unbounded per-recipient work.
+    #[error("too many recipients: {count} (max {limit})")]
+    TooManyRecipients { limit: usize, count: usize },
+
     /// The referenced record does not exist.
     #[error("{entity} `{id}` not found")]
     NotFound { entity: &'static str, id: String },
@@ -86,13 +92,15 @@ pub enum StoreError {
     )]
     ExecutionAuthorityConflict { message_id: String },
 
+    /// A presence report carried a state outside the presence
+    /// vocabulary; the write is refused at the core boundary so no
+    /// caller can persist a state the readers do not understand.
+    #[error("invalid presence state `{state}`")]
+    InvalidPresenceState { state: String },
+
     /// Schema migration failure.
     #[error("migration error: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
-
-    /// A task failed to join.
-    #[error("task failed: {0}")]
-    Join(#[from] tokio::task::JoinError),
 }
 
 /// Result alias for store operations.

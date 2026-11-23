@@ -12,9 +12,13 @@ Serves the shared-state role. Listens, never dials.
 $ wrkspc hub run \
     --db PATH            # SQLite: shared conversations, deliveries, feed
     --a2a ADDR           # A2A coordination port nodes dial
+    --ui ADDR            # optional plaintext operator-UI listener (loopback use)
+    --card-url URL       # externally resolvable URL nodes/browsers verify against
     --tls-cert PATH      # hub certificate chain
     --tls-key PATH       # hub private key
     --tls-ca PATH        # CA used to verify nodes
+    --revoke-list PATH   # serial deny-list file (one hex serial per line; TLS only)
+    --ui-token-file PATH # explicit operator-token file (fail-closed if missing)
 ```
 
 ## node run

@@ -7,6 +7,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use wrkspc_core::store::MAX_DIRECTED_RECIPIENTS;
 use wrkspc_core::{CancelOutcome, FenceKind};
 
 /// Removes one member from a conversation (kick from the room). The peer
@@ -40,6 +41,15 @@ pub(crate) async fn post_message(
     Path(id): Path<String>,
     Json(body): Json<PostMessageBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // The UI composer refuses empty sends, and so does the API: a blank
+    // post would commit an empty message and mint execution intents for
+    // an empty prompt.
+    if body.content.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "message content must not be blank" })),
+        ));
+    }
     // The operator posts as a participant; every other member receives the
     // delivery with execution requested (the dispatcher drives it).
     // Ejected (booted/banned) members are skipped: the operator's post
@@ -54,6 +64,15 @@ pub(crate) async fn post_message(
     // that is not a member rather than silently dropping it.
     let directed: Option<Vec<String>> = match body.recipients {
         Some(requested) => {
+            if requested.len() > MAX_DIRECTED_RECIPIENTS {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!(
+                        "too many recipients: {} (max {MAX_DIRECTED_RECIPIENTS})",
+                        requested.len()
+                    ) })),
+                ));
+            }
             let mut resolved = Vec::with_capacity(requested.len());
             for target in requested {
                 let peer_id = state
@@ -89,30 +108,48 @@ pub(crate) async fn post_message(
         None => None,
     };
     let mut recipients: Vec<wrkspc_core::RecipientRequest> = Vec::new();
-    for member in members
-        .iter()
-        .filter(|member| member.as_str() != "operator")
-    {
-        if directed
-            .as_ref()
-            .is_some_and(|targets| !targets.iter().any(|target| target == member))
-        {
-            continue;
-        }
-        let ejected = state
+    if directed.as_ref().is_some_and(Vec::is_empty) {
+        // An explicitly empty recipient list is authoritative: the
+        // operator addressed nobody directly, and @mentions in the
+        // body are resolved HERE, into the explicit list — the store
+        // never infers recipients on this path. No mentions, nobody.
+        for peer_id in state
             .store
-            .peer_status(member)
+            .resolve_mentions(&id, &body.content)
             .await
             .map_err(store_error)?
-            .is_some_and(|status| wrkspc_core::status_is_ejected(&status));
-        if ejected {
-            tracing::info!(peer = %member, conversation = %id, "ejected member skipped by operator post");
-            continue;
+        {
+            recipients.push(wrkspc_core::RecipientRequest {
+                peer_id,
+                execution_requested: true,
+            });
         }
-        recipients.push(wrkspc_core::RecipientRequest {
-            peer_id: member.clone(),
-            execution_requested: true,
-        });
+    } else {
+        for member in members
+            .iter()
+            .filter(|member| member.as_str() != "operator")
+        {
+            if directed
+                .as_ref()
+                .is_some_and(|targets| !targets.iter().any(|target| target == member))
+            {
+                continue;
+            }
+            let ejected = state
+                .store
+                .peer_status(member)
+                .await
+                .map_err(store_error)?
+                .is_some_and(|status| wrkspc_core::status_is_ejected(&status));
+            if ejected {
+                tracing::info!(peer = %member, conversation = %id, "ejected member skipped by operator post");
+                continue;
+            }
+            recipients.push(wrkspc_core::RecipientRequest {
+                peer_id: member.clone(),
+                execution_requested: true,
+            });
+        }
     }
     let outcome = if state.hub_connected && !state.hub_role {
         // Team mode: the operator post mirrors locally WITHOUT local
@@ -134,10 +171,13 @@ pub(crate) async fn post_message(
     } else {
         // Standalone node, or the hub itself: direct acceptance with
         // local execution intents (the hub never executes — its
-        // fan-out below queues remote deliveries instead).
+        // fan-out below queues remote deliveries instead). The
+        // recipient list is always explicit here — mentions resolved
+        // above, members or targets otherwise — so committed routing
+        // applies and the store never re-infers from the body.
         state
             .store
-            .accept_message(
+            .accept_message_committed_routing(
                 &id,
                 "operator",
                 &uuid::Uuid::new_v4().to_string(),
@@ -153,14 +193,36 @@ pub(crate) async fn post_message(
             // Hub mode: fan the operator's post out to recipients on
             // remote hosts as pollable delivery tasks.
             if state.queue_remote_deliveries {
-                let recipient_peers: Vec<String> = recipients
-                    .iter()
-                    .map(|recipient| recipient.peer_id.clone())
-                    .collect();
+                // Fan out from the COMMITTED routing: mention
+                // resolution happened in the gate above, and the
+                // committed recipient set is the authoritative one.
+                let recipient_peers = match state.store.message_recipients(&message_id).await {
+                    Ok(recipient_peers) => recipient_peers,
+                    Err(error) => {
+                        // The message is ALREADY committed: a routing
+                        // read failure must not 500 and invite a
+                        // duplicate post. Fail visible through the same
+                        // post-commit event; startup repair re-queues
+                        // the fan-out from the committed routing.
+                        tracing::error!(%error, %message_id, "committed routing read failed");
+                        let _ = state
+                            .store
+                            .append_event(
+                                &id,
+                                "delivery.queueing_failed",
+                                &json!({
+                                    "message_id": message_id,
+                                    "error": error.to_string(),
+                                }),
+                            )
+                            .await;
+                        Vec::new()
+                    }
+                };
                 if let Err(error) = state
                     .store
                     .queue_remote_deliveries(wrkspc_core::RemoteFanoutRequest {
-                        local_host: wrkspc_core::PILOT_HOST_ID,
+                        local_host: wrkspc_core::LOCAL_HOST_ID,
                         conversation_id: &id,
                         message_id: &message_id,
                         // Operator posts have no node-side origin.
@@ -172,11 +234,23 @@ pub(crate) async fn post_message(
                     })
                     .await
                 {
-                    tracing::error!(%error, "remote delivery queueing failed");
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": "delivery queueing failed" })),
-                    ));
+                    // The message is ALREADY committed: a 500 here would
+                    // invite the operator to retry, and each retry mints
+                    // a fresh idempotency key and a duplicate post. Fail
+                    // visible instead — a feed event names the failure,
+                    // and startup repair re-queues the fan-out.
+                    tracing::error!(%error, %message_id, "remote delivery queueing failed");
+                    let _ = state
+                        .store
+                        .append_event(
+                            &id,
+                            "delivery.queueing_failed",
+                            &json!({
+                                "message_id": message_id,
+                                "error": error.to_string(),
+                            }),
+                        )
+                        .await;
                 }
             }
             message_id
@@ -280,6 +354,12 @@ pub(crate) async fn add_guidance(
     Path(id): Path<String>,
     Json(body): Json<GuidanceBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if body.text.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "guidance text must not be blank" })),
+        ));
+    }
     let guidance_id = state
         .store
         .add_guidance(&id, "operator", &body.text)
@@ -291,6 +371,7 @@ pub(crate) async fn add_guidance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UiConfig;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -299,12 +380,12 @@ mod tests {
     struct NoCancel;
 
     impl crate::api::CancelRequester for NoCancel {
-        fn request_cancel(
-            &self,
-            _message_id: &str,
-            _recipient_id: &str,
-            _set_by: &str,
-        ) -> Pin<Box<dyn Future<Output = Result<wrkspc_core::CancelOutcome, String>> + Send + '_>>
+        fn request_cancel<'a>(
+            &'a self,
+            _message_id: &'a str,
+            _recipient_id: &'a str,
+            _set_by: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<wrkspc_core::CancelOutcome, String>> + Send + 'a>>
         {
             Box::pin(async { Ok(wrkspc_core::CancelOutcome::IntentCanceled) })
         }
@@ -333,7 +414,11 @@ mod tests {
     #[tokio::test]
     async fn hub_connected_operator_post_defers_execution() {
         let (store, conversation) = seeded().await;
-        let state = AppState::new(store.clone(), Arc::new(NoCancel), false, false, true, None);
+        let config = UiConfig {
+            hub_connected: true,
+            ..Default::default()
+        };
+        let state = AppState::new(store.clone(), Arc::new(NoCancel), &config, None);
         let Json(response) = post_message(
             State(state),
             Path(conversation.clone()),
@@ -361,7 +446,12 @@ mod tests {
     #[tokio::test]
     async fn standalone_operator_post_still_executes_directly() {
         let (store, conversation) = seeded().await;
-        let state = AppState::new(store.clone(), Arc::new(NoCancel), false, false, false, None);
+        let state = AppState::new(
+            store.clone(),
+            Arc::new(NoCancel),
+            &UiConfig::default(),
+            None,
+        );
         let Json(response) = post_message(
             State(state),
             Path(conversation.clone()),
@@ -377,5 +467,46 @@ mod tests {
             store.claim_intent(&message_id, "codex").await.is_ok(),
             "standalone posts keep their local intent"
         );
+    }
+
+    /// Blank posts and blank guidance are refused with 400 before any
+    /// store mutation: an empty prompt must never mint execution
+    /// intents or commit guidance.
+    #[tokio::test]
+    async fn empty_posts_and_blank_guidance_are_refused() {
+        let (store, conversation) = seeded().await;
+        let state = AppState::new(
+            store.clone(),
+            Arc::new(NoCancel),
+            &UiConfig::default(),
+            None,
+        );
+
+        let error = post_message(
+            State(state.clone()),
+            Path(conversation.clone()),
+            Json(PostMessageBody {
+                content: "   ".to_string(),
+                recipients: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(
+            store.due_intents().await.unwrap().is_empty(),
+            "a blank post mints no execution intents"
+        );
+
+        let error = add_guidance(
+            State(state),
+            Path(conversation),
+            Json(GuidanceBody {
+                text: " ".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 }

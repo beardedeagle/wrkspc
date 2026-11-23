@@ -1,12 +1,13 @@
 //! The event feed cursor, the fence set/ack/clear lifecycle, and
-//! the seeded pilot host row.
+//! the seeded local host row.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 
 use common::{key, pool_for, seeded, temp_db_path};
 use sqlx::Row;
-use wrkspc_core::{FenceKind, PILOT_HOST_ID, Store};
+use uuid::Uuid;
+use wrkspc_core::{FenceKind, LOCAL_HOST_ID, Store};
 
 /// The event feed resumes from a cursor with monotonic sequence numbers.
 #[tokio::test]
@@ -96,19 +97,80 @@ async fn fence_set_ack_clear_lifecycle() {
     );
 }
 
-/// A fresh database seeds the pilot host row.
+/// A fresh database seeds the local host row.
 #[tokio::test]
-async fn pilot_host_is_seeded() {
+async fn local_host_is_seeded() {
     let path = temp_db_path();
     let store = Store::open(&path, "proc-a").await.unwrap();
     let pool = pool_for(&path).await;
     let row = sqlx::query("SELECT host_id FROM hosts WHERE host_id = ?")
-        .bind(PILOT_HOST_ID)
+        .bind(LOCAL_HOST_ID)
         .fetch_one(&pool)
         .await
         .unwrap();
     let host_id: String = row.get("host_id");
-    assert_eq!(host_id, PILOT_HOST_ID);
+    assert_eq!(host_id, LOCAL_HOST_ID);
+    store.release_lock().await.unwrap();
+    std::fs::remove_file(&path).ok();
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
+/// The member-checked event read and append refuse a non-member
+/// in the SAME transaction as the data access, so a kicked peer can
+/// never observe or write one page of feed events.
+#[tokio::test]
+async fn member_checked_events_refuse_non_members() {
+    let path = temp_db_path();
+    let store = Store::open(&path, "proc-a").await.unwrap();
+    let (operator, agent, conversation) = seeded(&store).await;
+    let outsider = format!("human-{}", Uuid::new_v4());
+    store
+        .ensure_peer(&outsider, "outsider", "human")
+        .await
+        .unwrap();
+
+    // A member appends and reads through the checked surfaces.
+    let seq = store
+        .append_event_as_member(
+            &conversation,
+            &agent,
+            "work.report",
+            &serde_json::json!({ "summary": "done" }),
+        )
+        .await
+        .unwrap();
+    let events = store
+        .events_since_for_member(&conversation, &agent, seq - 1, 10)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| event.kind == "work.report"));
+
+    // The non-member is refused by both, transactionally.
+    let read = store
+        .events_since_for_member(&conversation, &outsider, 0, 10)
+        .await;
+    assert!(matches!(
+        read,
+        Err(wrkspc_core::StoreError::NotFound { .. })
+    ));
+    let write = store
+        .append_event_as_member(
+            &conversation,
+            &outsider,
+            "work.report",
+            &serde_json::json!({ "summary": "intruder" }),
+        )
+        .await;
+    assert!(matches!(
+        write,
+        Err(wrkspc_core::StoreError::NotFound { .. })
+    ));
+    // Nothing leaked: the member's view is unchanged.
+    let after = store.events_since(&conversation, seq, 100).await.unwrap();
+    assert!(after.is_empty());
+
+    let _ = operator;
     store.release_lock().await.unwrap();
     std::fs::remove_file(&path).ok();
     let _ = std::fs::remove_file(path.with_extension("db-wal"));

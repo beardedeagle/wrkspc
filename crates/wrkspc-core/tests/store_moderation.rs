@@ -4,7 +4,7 @@
 
 mod common;
 
-use wrkspc_core::{PILOT_HOST_ID, Store};
+use wrkspc_core::{LOCAL_HOST_ID, Store};
 
 /// Peer alias sets, clears, and mirrors into the roster row.
 #[tokio::test]
@@ -15,7 +15,7 @@ async fn peer_alias_sets_clears_and_mirrors_roster() {
         .await
         .unwrap();
     store
-        .upsert_roster_presence("codex", "codex", "harness", PILOT_HOST_ID, "connected")
+        .upsert_roster_presence("codex", "codex", "harness", LOCAL_HOST_ID, "connected")
         .await
         .unwrap();
     store
@@ -41,11 +41,11 @@ async fn peer_status_transitions_and_ban_records_revocation() {
         .await
         .unwrap();
     store
-        .upsert_roster_presence("codex", "codex", "harness", PILOT_HOST_ID, "connected")
+        .upsert_roster_presence("codex", "codex", "harness", LOCAL_HOST_ID, "connected")
         .await
         .unwrap();
     store
-        .record_host_cert_serial(PILOT_HOST_ID, "aa11")
+        .record_host_cert_serial(LOCAL_HOST_ID, "aa11")
         .await
         .unwrap();
     // Boot.
@@ -61,7 +61,7 @@ async fn peer_status_transitions_and_ban_records_revocation() {
     );
     // A booted peer's presence is refused.
     let outcome = store
-        .upsert_roster_presence("codex", "codex", "harness", PILOT_HOST_ID, "connected")
+        .upsert_roster_presence("codex", "codex", "harness", LOCAL_HOST_ID, "connected")
         .await
         .unwrap();
     assert!(matches!(
@@ -92,7 +92,7 @@ async fn peer_status_transitions_and_ban_records_revocation() {
     );
     assert!(store.cert_revocations().await.unwrap().is_empty());
     let outcome = store
-        .upsert_roster_presence("codex", "codex", "harness", PILOT_HOST_ID, "connected")
+        .upsert_roster_presence("codex", "codex", "harness", LOCAL_HOST_ID, "connected")
         .await
         .unwrap();
     assert!(matches!(outcome, wrkspc_core::PresenceOutcome::Updated));
@@ -111,7 +111,7 @@ async fn moderation_audit_logs_every_transition() {
     let store = Store::open_in_memory("test").await.unwrap();
     // First presence performs the enrolment itself — a system audit row.
     store
-        .upsert_roster_presence("codex", "codex", "harness", PILOT_HOST_ID, "connected")
+        .upsert_roster_presence("codex", "codex", "harness", LOCAL_HOST_ID, "connected")
         .await
         .unwrap();
     store
@@ -138,7 +138,7 @@ async fn moderation_audit_logs_every_transition() {
 
     let enrol = log.iter().find(|e| e.action == "enroll").unwrap();
     assert_eq!(enrol.actor, "system");
-    assert_eq!(enrol.after.as_deref(), Some(PILOT_HOST_ID));
+    assert_eq!(enrol.after.as_deref(), Some(LOCAL_HOST_ID));
 
     let boot = log.iter().find(|e| e.action == "boot").unwrap();
     assert_eq!(boot.actor, "operator");
@@ -159,11 +159,11 @@ async fn forget_is_soft_hidden_and_preserves_revocations() {
         .await
         .unwrap();
     store
-        .upsert_roster_presence("codex", "codex", "harness", PILOT_HOST_ID, "connected")
+        .upsert_roster_presence("codex", "codex", "harness", LOCAL_HOST_ID, "connected")
         .await
         .unwrap();
     store
-        .record_host_cert_serial(PILOT_HOST_ID, "aa11")
+        .record_host_cert_serial(LOCAL_HOST_ID, "aa11")
         .await
         .unwrap();
     // Deleting works whatever the peer's status: the operator's problem was
@@ -176,7 +176,7 @@ async fn forget_is_soft_hidden_and_preserves_revocations() {
     // It re-enrols on its next presence, then the ban path is exercised from
     // a live entry.
     store
-        .upsert_roster_presence("codex", "codex", "harness", PILOT_HOST_ID, "connected")
+        .upsert_roster_presence("codex", "codex", "harness", LOCAL_HOST_ID, "connected")
         .await
         .unwrap();
     // Ban, then forget: the revocation must survive.
@@ -199,7 +199,7 @@ async fn forget_is_soft_hidden_and_preserves_revocations() {
     );
     // Presence is refused, so the node cannot silently resurrect it.
     let outcome = store
-        .upsert_roster_presence("codex", "codex", "harness", PILOT_HOST_ID, "connected")
+        .upsert_roster_presence("codex", "codex", "harness", LOCAL_HOST_ID, "connected")
         .await
         .unwrap();
     assert!(matches!(
@@ -231,11 +231,11 @@ async fn latest_presented_serial_wins() {
         .await
         .unwrap();
     store
-        .record_host_cert_serial(PILOT_HOST_ID, "aa11")
+        .record_host_cert_serial(LOCAL_HOST_ID, "aa11")
         .await
         .unwrap();
     store
-        .record_host_cert_serial(PILOT_HOST_ID, "bb22")
+        .record_host_cert_serial(LOCAL_HOST_ID, "bb22")
         .await
         .unwrap();
     assert_eq!(
@@ -246,7 +246,7 @@ async fn latest_presented_serial_wins() {
     // certificate is per host, and any of its peers' bans must revoke it.
     store.ensure_peer("agy", "agy", "harness").await.unwrap();
     store
-        .record_host_cert_serial(PILOT_HOST_ID, "cc33")
+        .record_host_cert_serial(LOCAL_HOST_ID, "cc33")
         .await
         .unwrap();
     assert_eq!(

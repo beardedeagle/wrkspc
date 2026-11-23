@@ -1,6 +1,6 @@
 //! The hub role: coordinator without harness control (D-13).
 //!
-//! Runs the A2A surface over a hub-owned store — plain TCP for pilot
+//! Runs the A2A surface over a hub-owned store — plain TCP for single-machine
 //! parity or mutual TLS (rustls `WebPkiClientVerifier`, optional serial
 //! deny-list) for team mode — plus an optional operator UI. No ACP, no
 //! dispatcher, no harness spawning: remote coordination, never remote
@@ -63,16 +63,14 @@ pub struct HubRunArgs {
 
 /// Runs the hub until ctrl-c.
 ///
-/// # Arguments
-///
-/// * `args` — the parsed hub arguments.
+/// Takes `args`, the parsed hub arguments.
 ///
 /// # Errors
 ///
 /// Returns a boxed error on store, bind, or TLS-material failures.
 // The default bind address is a compile-time constant (same
 // reviewed allowance as the UiConfig Default impl).
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let db = canonical_db_path(&args.db)?;
     let store = Store::open(&db, "wrkspc-hub").await?;
@@ -84,7 +82,7 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
             "operator",
             "operator",
             "human",
-            wrkspc_core::PILOT_HOST_ID,
+            wrkspc_core::LOCAL_HOST_ID,
             "connected",
         )
         .await?;
@@ -95,7 +93,7 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
     // (H-5 — a crash between acceptance and fan-out must not lose the
     // delivery).
     let repaired = store
-        .repair_remote_fanout(wrkspc_core::PILOT_HOST_ID)
+        .repair_remote_fanout(wrkspc_core::LOCAL_HOST_ID)
         .await?;
     if repaired > 0 {
         tracing::warn!(repaired, "repaired incomplete remote fan-out at startup");
@@ -175,7 +173,9 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
             .await
             .map_err(|e| format!("cannot write bound address to {}: {e}", path.display()))?;
     }
-    let surface = A2aSurface::new(store.clone()).with_mtls(tls.is_some());
+    // The mTLS declaration is decided by the transport: serve_tls
+    // always publishes it, the plaintext path never does.
+    let surface = A2aSurface::new(store.clone());
     let a2a_task = match tls {
         Some((cert, key, ca)) => {
             let acceptor = build_acceptor(cert, key, ca)?;
@@ -198,7 +198,7 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                 .unwrap_or_else(|| format!("https://{addr}"));
             let acceptance = crate::acceptance::AcceptanceState::new(
                 store.clone(),
-                wrkspc_core::PILOT_HOST_ID.to_string(),
+                wrkspc_core::LOCAL_HOST_ID.to_string(),
             );
             let delivery = crate::delivery::DeliveryState::new(store.clone());
             let presence =
@@ -274,7 +274,7 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                             let denied = certs
                                 .first()
                                 .and_then(cert_serial_hex)
-                                .is_some_and(|serial| read_deny(&denied).contains(&serial));
+                                .is_some_and(|serial| serial_denied(&denied, &serial));
                             if denied {
                                 wrkspc_a2a::PeerDecision::Deny
                             } else {
@@ -344,7 +344,7 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
                                                     .headers()
                                                     .get("x-wrkspc-serial")
                                                     .and_then(|value| value.to_str().ok())
-                                                    && read_deny(&revoked).contains(serial)
+                                                    && serial_denied(&revoked, serial)
                                                 {
                                                     return match axum::response::Response::builder()
                                                         .status(axum::http::StatusCode::FORBIDDEN)
@@ -397,10 +397,8 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
 /// required — the browser UI joins the same listener; the A2A routes
 /// enforce the client-certificate stamp themselves.
 ///
-/// # Arguments
-///
-/// * `cert`/`key` — server material in PEM.
-/// * `ca` — trusted CA roots in PEM.
+/// `cert`/`key` are the server material in PEM; `ca` holds the trusted
+/// CA roots in PEM.
 ///
 /// # Returns
 ///
@@ -414,16 +412,19 @@ pub async fn run_hub(args: HubRunArgs) -> Result<(), Box<dyn std::error::Error>>
 ///
 /// Poison here is an unrecoverable invariant violation — a writer
 /// panicked mid-update — and reading possibly torn set state could
-/// MISS a revoked serial (allowing a denied peer), so the read panics
-/// deliberately instead of recovering. This is the hub's single
-/// reviewed invariant-panic site.
-#[allow(clippy::panic)]
-fn read_deny(
-    denied: &wrkspc_ui::RevocationSet,
-) -> std::sync::RwLockReadGuard<'_, std::collections::HashSet<String>> {
+/// Fails CLOSED on a poisoned deny lock: a torn set must never let a
+/// revoked serial through, so poison means deny-all plus a loud log,
+/// never a panic. The next re-sync clears the poison (self-healing).
+fn serial_denied(denied: &wrkspc_ui::RevocationSet, serial: &str) -> bool {
     match denied.live.read() {
-        Ok(guard) => guard,
-        Err(poisoned) => panic!("deny lock poisoned: {poisoned}"),
+        Ok(guard) => guard.contains(serial),
+        Err(poisoned) => {
+            tracing::error!(
+                %poisoned,
+                "deny lock poisoned — denying all certificate clients until the next re-sync",
+            );
+            true
+        }
     }
 }
 
@@ -442,10 +443,15 @@ fn build_acceptor(
     for root in rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(ca)?)) {
         roots.add(root?)?;
     }
-    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
-    let verifier = wrkspc_a2a::OptionalClientVerifier::new(verifier);
+    // Requests but does not require client certificates: presented
+    // chains are verified against the CA roots, and connections with
+    // none complete unauthenticated. Route-level policy (the hub's
+    // stamp gate) still decides what those may reach.
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .allow_unauthenticated()
+        .build()?;
     let config = rustls::ServerConfig::builder()
-        .with_client_cert_verifier(Arc::new(verifier))
+        .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)?;
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
@@ -454,10 +460,8 @@ fn build_acceptor(
 /// deploy wrapper's tmpfs handoff), then `WRKSPC_UI_TOKEN`, then the
 /// stable token derived from the hub database.
 ///
-/// # Arguments
-///
-/// * `db` — the hub database path.
-/// * `file` — the optional explicit token file.
+/// `db` is the hub database path; `file` is the optional explicit
+/// token file.
 ///
 /// # Returns
 ///
@@ -501,9 +505,13 @@ async fn require_peer_stamp(
 
 /// Loads the serial deny-list file (one lowercase hex serial per line).
 ///
-/// # Arguments
+/// The file must be a REGULAR file (a symlink, FIFO, or device is
+/// refused — a FIFO would block the open indefinitely), bounded in
+/// size, and every line must be hex: a malformed line is dropped with
+/// a warning, since a non-hex serial could never match a certificate
+/// serial and a silently accepted typo would leave a peer allowed.
 ///
-/// * `path` — optional file path.
+/// `path` is the optional file path.
 ///
 /// # Returns
 ///
@@ -511,16 +519,52 @@ async fn require_peer_stamp(
 ///
 /// # Errors
 ///
-/// Returns an error when the file exists but cannot be read.
+/// Returns an error when the file exists but is not a readable,
+/// bounded, regular file — the deny-list fails CLOSED, never open.
 fn load_deny_list(path: Option<&Path>) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
     let Some(path) = path else {
         return Ok(HashSet::new());
     };
+    // Checked with symlink_metadata BEFORE opening: a FIFO would block
+    // the open, a symlink or directory must not be followed into the
+    // deny set, and a multi-GB file must not be materialized before
+    // the hub starts listening.
+    const MAX_DENY_LIST_BYTES: u64 = 1 << 20; // 1 MiB
+    const MAX_DENY_LIST_LINES: usize = 10_000;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot stat revoke list {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "revoke list {} is not a regular file — refusing to load it",
+            path.display()
+        )
+        .into());
+    }
+    if metadata.len() > MAX_DENY_LIST_BYTES {
+        return Err(format!(
+            "revoke list {} exceeds {} bytes — refusing to load it",
+            path.display(),
+            MAX_DENY_LIST_BYTES
+        )
+        .into());
+    }
     let mut set = HashSet::new();
     for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
         let line = line?.trim().to_ascii_lowercase();
-        if !line.is_empty() {
-            set.insert(line);
+        if line.is_empty() {
+            continue;
+        }
+        if !line.chars().all(|c| c.is_ascii_hexdigit()) {
+            tracing::warn!(line = %line, "revoke list line is not a hex serial; dropping");
+            continue;
+        }
+        set.insert(line);
+        if set.len() > MAX_DENY_LIST_LINES {
+            return Err(format!(
+                "revoke list {} exceeds {MAX_DENY_LIST_LINES} entries — refusing to load it",
+                path.display()
+            )
+            .into());
         }
     }
     tracing::info!(count = set.len(), "serial deny-list loaded");
@@ -540,24 +584,18 @@ struct HubCancel {
 }
 
 impl wrkspc_ui::CancelRequester for HubCancel {
-    fn request_cancel(
-        &self,
-        message_id: &str,
-        recipient_id: &str,
-        set_by: &str,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<CancelOutcome, String>> + Send + '_>> {
+    fn request_cancel<'a>(
+        &'a self,
+        message_id: &'a str,
+        recipient_id: &'a str,
+        set_by: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<CancelOutcome, String>> + Send + 'a>> {
         let store = self.store.clone();
-        let message_id = message_id.to_string();
-        let recipient_id = recipient_id.to_string();
-        let set_by = set_by.to_string();
         Box::pin(async move {
             // The hub-side intent (queued → canceled, with the feed
             // event). A mail-only message has no intent and nothing to
             // cancel here.
-            let outcome = match store
-                .request_cancel(&message_id, &recipient_id, &set_by)
-                .await
-            {
+            let outcome = match store.request_cancel(message_id, recipient_id, set_by).await {
                 Ok(outcome) => outcome,
                 Err(wrkspc_core::StoreError::NotFound { .. }) => {
                     // No intent to cancel; fall through to the task.
@@ -567,7 +605,7 @@ impl wrkspc_ui::CancelRequester for HubCancel {
             };
             // The delivery task the node polls: canceling it stops an
             // unclaimed delivery from ever executing.
-            let task_id = wrkspc_core::tasks::delivery_task_id(&message_id, &recipient_id);
+            let task_id = wrkspc_core::tasks::delivery_task_id(message_id, recipient_id);
             store
                 .task_mark_canceled(&task_id)
                 .await

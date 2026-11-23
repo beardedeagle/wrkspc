@@ -17,8 +17,6 @@ impl Store {
     /// `codex`. Only when no peer carries the id does the target
     /// resolve as an alias, and an ambiguous alias fails closed.
     ///
-    /// # Arguments
-    ///
     /// * `target` — the alias or peer id as typed by the operator.
     ///
     /// # Errors
@@ -27,21 +25,31 @@ impl Store {
     /// peers sharing one display name): routing must fail closed rather
     /// than guess a recipient.
     pub async fn resolve_peer_ref(&self, target: &str) -> Result<Option<String>> {
-        let by_id: Option<(String,)> = sqlx::query_as("SELECT id FROM peers WHERE id = ?")
-            .bind(target)
-            .fetch_optional(self.pool())
-            .await?;
+        // Canonical-id precedence first (UI-04), with the same
+        // case-insensitive semantics mention resolution uses: an id
+        // match — whatever the operator's casing — always means that
+        // peer, and only when no peer carries the id does the target
+        // resolve through alias/display name, which must be unique.
+        let by_id: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM peers WHERE id = ? COLLATE NOCASE")
+                .bind(target)
+                .fetch_optional(self.pool())
+                .await?;
         if let Some((id,)) = by_id {
             return Ok(Some(id));
         }
-        let by_alias: Vec<(String,)> =
-            sqlx::query_as("SELECT id FROM peers WHERE alias = ? ORDER BY id LIMIT 2")
-                .bind(target)
-                .fetch_all(self.pool())
-                .await?;
-        match by_alias.len() {
+        let by_alias_or_name: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM peers
+             WHERE alias = ? COLLATE NOCASE OR name = ? COLLATE NOCASE
+             ORDER BY id LIMIT 2",
+        )
+        .bind(target)
+        .bind(target)
+        .fetch_all(self.pool())
+        .await?;
+        match by_alias_or_name.len() {
             0 => Ok(None),
-            1 => Ok(Some(by_alias[0].0.clone())),
+            1 => Ok(Some(by_alias_or_name[0].0.clone())),
             _ => Err(StoreError::AmbiguousPeerRef {
                 reference: target.to_string(),
             }),
@@ -65,7 +73,14 @@ impl Store {
             .await?;
         let Some((old,)) = old else {
             tx.rollback().await?;
-            return Ok(());
+            // A silent success for an unknown peer made typos
+            // indistinguishable from a committed alias change; the
+            // typed NotFound matches set_peer_status/forget_peer, which
+            // report the missing peer distinctly.
+            return Err(StoreError::NotFound {
+                entity: "peer",
+                id: peer_id.to_string(),
+            });
         };
         sqlx::query("UPDATE peers SET alias = ? WHERE id = ?")
             .bind(alias)
@@ -91,8 +106,6 @@ impl Store {
     /// clears a soft-forget, and re-materializes the roster row (the
     /// forget path deleted it) so the operator's restore is complete.
     ///
-    /// # Arguments
-    ///
     /// * `peer_id` — the peer to moderate.
     /// * `status` — the target status.
     /// * `actor` — who performed the action (audit trail).
@@ -103,7 +116,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn set_peer_status(
         &self,
         peer_id: &str,
@@ -234,8 +247,6 @@ impl Store {
     /// stays banned at the TLS layer). Forgotten peers are refused
     /// re-enrolment by the presence path.
     ///
-    /// # Arguments
-    ///
     /// * `peer_id` — the peer to forget.
     /// * `actor` — who performed the action (audit trail).
     ///
@@ -245,7 +256,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn forget_peer(&self, peer_id: &str, actor: &str) -> Result<bool> {
         // IMMEDIATE: read-modify-write (see set_peer_alias).
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
@@ -281,13 +292,11 @@ impl Store {
 
     /// Reads the moderation audit log, newest first.
     ///
-    /// # Arguments
-    ///
     /// * `limit` — the maximum number of rows to return.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn moderation_log(&self, limit: i64) -> Result<Vec<ModerationEvent>> {
         let rows = sqlx::query_as::<_, ModerationEvent>(
             "SELECT id, peer_id, actor, action, before, after, at
@@ -310,14 +319,12 @@ impl Store {
     /// the leaf, and a ban must revoke the serial the peer presents now,
     /// not the first one the hub ever saw.
     ///
-    /// # Arguments
-    ///
     /// * `host_id` — the presenting host (the certificate's first SAN).
     /// * `serial` — the lowercase hex certificate serial.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn record_host_cert_serial(&self, host_id: &str, serial: &str) -> Result<()> {
         // The host-level record stands independent of peer enrolment: a
         // connection that arrived before any peer was enrolled still
@@ -367,7 +374,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn cert_revocations(&self) -> Result<Vec<String>> {
         let rows: Vec<(String,)> =
             sqlx::query_as("SELECT DISTINCT serial FROM cert_revocations ORDER BY serial")

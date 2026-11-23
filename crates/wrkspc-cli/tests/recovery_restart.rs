@@ -34,7 +34,7 @@ fn node_restart_replays_nothing_and_resumes_delivery() {
     // reached the harness (receipt + a real turn, not one or the other).
     let prompts_log = dir.join("prompts.log");
     let command = format!(
-        "{} --log-prompts {}",
+        "{} --log-turn {}",
         fake_agent_path().display(),
         prompts_log.display()
     );
@@ -116,13 +116,14 @@ fn wait_attempt_terminal(
 }
 
 /// Asserts the fake harness received exactly `expected` prompts (its
-/// --log-prompts side channel, one line per prompt receipt).
+/// --log-turn side channel, one `start` line per prompt receipt).
 fn assert_prompt_count(path: &Path, expected: usize, why: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let lines = std::fs::read_to_string(path)
             .unwrap_or_default()
             .lines()
+            .filter(|line| line.starts_with("start\t"))
             .count();
         if lines == expected {
             return;
@@ -178,22 +179,38 @@ fn harness_death_marks_the_attempt_unknown_and_recovers() {
     // The node stayed alive. New work for the same recipient is
     // BLOCKED while the unknown is unresolved: the intent queues but
     // no new attempt runs, so its delivery never reaches dispatched
-    // state and no second unknown appears.
+    // state and no second unknown appears. Poll until the queued
+    // delivery is visible in the transcript, then hold the assertion
+    // for a full three seconds AFTER visibility — a slow dispatcher
+    // must not false-green the quarantine check.
     let next = post(&client, port, &conversation, "again");
-    std::thread::sleep(Duration::from_secs(3));
-    let queued = messages(&client, port, &conversation)
-        .into_iter()
-        .find(|message| message["id"].as_str() == Some(next.as_str()))
-        .expect("the queued delivery is visible in the transcript");
-    let delivery = queued["deliveries"]
-        .as_array()
-        .and_then(|deliveries| deliveries.first())
-        .expect("one recipient");
-    assert_ne!(
-        delivery["state"], "delivered",
-        "H-6: the recipient is quarantined, so the queued turn must not \
-         dispatch until the unknown is reconciled; delivery: {delivery:#?}"
-    );
+    let hold = Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut queued = None;
+    let mut held_since = None;
+    while Instant::now() < deadline {
+        let found = messages(&client, port, &conversation)
+            .into_iter()
+            .find(|message| message["id"].as_str() == Some(next.as_str()));
+        if let Some(found) = found {
+            let delivery = found["deliveries"]
+                .as_array()
+                .and_then(|deliveries| deliveries.first())
+                .expect("one recipient");
+            assert_ne!(
+                delivery["state"], "delivered",
+                "H-6: the recipient is quarantined, so the queued turn must not \
+                 dispatch until the unknown is reconciled; delivery: {found:#?}"
+            );
+            queued = Some(found);
+            let started = *held_since.get_or_insert_with(Instant::now);
+            if started.elapsed() >= hold {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _queued = queued.expect("the queued delivery is visible in the transcript");
     assert_eq!(
         unknown_attempts(&client, port).len(),
         1,
@@ -271,22 +288,38 @@ fn node_kill_mid_turn_reconciles_unknown_on_restart() {
 
     // Delivery of that message stays unresolved (visible, operator-owned).
     // A fresh turn for the SAME recipient is blocked while the unknown is
-    // unresolved (H-6): it queues but must not dispatch.
+    // unresolved (H-6): it queues but must not dispatch. Poll until the
+    // queued delivery is visible, then hold the assertion for three
+    // seconds AFTER visibility — a slow dispatcher must not false-green
+    // the quarantine check.
     let next = post(&client, port, &conversation, "next");
-    std::thread::sleep(Duration::from_secs(3));
-    let queued = messages(&client, port, &conversation)
-        .into_iter()
-        .find(|message| message["id"].as_str() == Some(next.as_str()))
-        .expect("the queued delivery is visible in the transcript");
-    let delivery = queued["deliveries"]
-        .as_array()
-        .and_then(|deliveries| deliveries.first())
-        .expect("one recipient");
-    assert_ne!(
-        delivery["state"], "delivered",
-        "H-6: the recipient is quarantined, so the queued turn must not \
-         dispatch until the unknown is reconciled; delivery: {delivery:#?}"
-    );
+    let hold = Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut queued = None;
+    let mut held_since = None;
+    while Instant::now() < deadline {
+        let found = messages(&client, port, &conversation)
+            .into_iter()
+            .find(|message| message["id"].as_str() == Some(next.as_str()));
+        if let Some(found) = found {
+            let delivery = found["deliveries"]
+                .as_array()
+                .and_then(|deliveries| deliveries.first())
+                .expect("one recipient");
+            assert_ne!(
+                delivery["state"], "delivered",
+                "H-6: the recipient is quarantined, so the queued turn must not \
+                 dispatch until the unknown is reconciled; delivery: {found:#?}"
+            );
+            queued = Some(found);
+            let started = *held_since.get_or_insert_with(Instant::now);
+            if started.elapsed() >= hold {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _queued = queued.expect("the queued delivery is visible in the transcript");
 
     // Operator closes the undeterminable turn; only then does the queued
     // turn dispatch.

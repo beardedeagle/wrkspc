@@ -6,7 +6,7 @@
 //! network.
 //!
 //! Execution hops (dispatcher → harness) are deliberately not driven
-//! here (`execution_requested: false`); they are covered by the pilot
+//! here (`execution_requested: false`); they are covered by the
 //! dispatcher tests. The node binary's CLI arg wiring is covered by the
 //! unit tests; driving the binary itself would additionally require an
 //! ACP-speaking child process for the bindings, which is not this
@@ -15,6 +15,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+
+mod common;
+use common::scratch_dir;
 use std::time::{Duration, Instant};
 
 use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
@@ -29,20 +32,6 @@ impl Drop for Hub {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-/// Unique scratch dir for one test run.
-fn scratch_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "wrkspc-loop-test-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 /// Writes a test PKI: CA, hub server cert/key (loopback SANs), and a
@@ -200,7 +189,7 @@ async fn seed_hub_db(db: &Path) -> (String, String) {
             sender_peer: "operator",
             sender_name: "operator",
             sender_class: "human",
-            sender_host: wrkspc_core::PILOT_HOST_ID,
+            sender_host: wrkspc_core::LOCAL_HOST_ID,
             content: "hello from the hub",
             execution_requested: false,
         })

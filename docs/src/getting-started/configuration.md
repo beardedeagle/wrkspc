@@ -59,6 +59,15 @@ The hub identifies nodes by the certificate they present. Identity,
 enrollment, and revocation all hang off that certificate — there is no
 separate username/password layer.
 
+## Node timing
+
+Two bounded numeric flags tune the node:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--poll-interval-secs` | 5 | Seconds between hub polls. Zero is rejected at parse time. |
+| `--lookup-timeout-secs` | 45 | Seconds one session lookup may take (spawn, initialize, model pin) before the dispatcher records an unknown attempt. Harness cold start differs by harness and machine; lower it on fast local drills, but too low a value produces unknown attempts that block the recipient until reconciliation. |
+
 ## Database
 
 Each role owns one SQLite database. The hub's holds conversations,

@@ -25,11 +25,18 @@ async fn seeded() -> (Store, String) {
 /// Builds the router under test: the A2A surface plus the acceptance
 /// layer, with the hub as the local host.
 async fn router_under_test(store: Store) -> axum::Router {
+    router_with_local_host(store, wrkspc_core::LOCAL_HOST_ID.to_string()).await
+}
+
+/// Builds the router with an explicit local-host id (the fan-out
+/// skip key: recipients enrolled on `local_host` never get a delivery
+/// task).
+async fn router_with_local_host(store: Store, local_host: String) -> axum::Router {
     let surface = A2aSurface::new(store.clone());
     surface
         .into_router("https://hub.test")
         .layer(axum::middleware::from_fn_with_state(
-            AcceptanceState::new(store, wrkspc_core::PILOT_HOST_ID.to_string()),
+            AcceptanceState::new(store, local_host),
             accept_translation,
         ))
 }
@@ -124,6 +131,131 @@ async fn accepted_events(store: &Store, conversation: &str) -> usize {
         .count()
 }
 
+/// A JSON-RPC send body with full control over the execution flag and
+/// an optional continuation taskId.
+fn send_body_full(
+    method: &str,
+    message_id: &str,
+    conversation_id: &str,
+    peer_id: &str,
+    recipients: &[&str],
+    execution_requested: bool,
+    task_id: Option<&str>,
+) -> String {
+    let mut message = serde_json::json!({
+        "messageId": message_id,
+        "role": "ROLE_USER",
+        "contextId": conversation_id,
+        "parts": [{"text": "hello from the node"}],
+        "metadata": {
+            "peerId": peer_id,
+            "recipients": recipients,
+            "executionRequested": execution_requested,
+        },
+    });
+    if let Some(task_id) = task_id {
+        message["taskId"] = serde_json::json!(task_id);
+    }
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": { "message": message },
+    })
+    .to_string()
+}
+
+/// A REST `message/send` body (the SDK's SendMessageRequest shape).
+fn rest_send_body(
+    message_id: &str,
+    conversation_id: &str,
+    peer_id: &str,
+    recipients: &[&str],
+    execution_requested: bool,
+) -> String {
+    serde_json::json!({
+        "message": {
+            "messageId": message_id,
+            "role": "ROLE_USER",
+            "contextId": conversation_id,
+            "parts": [{"text": "hello from the node"}],
+            "metadata": {
+                "peerId": peer_id,
+                "recipients": recipients,
+                "executionRequested": execution_requested,
+            },
+        },
+    })
+    .to_string()
+}
+
+/// A REST `message/send` continuation body naming an existing task.
+fn rest_continuation_body(
+    message_id: &str,
+    context_id: &str,
+    peer_id: &str,
+    task_id: &str,
+) -> String {
+    serde_json::json!({
+        "message": {
+            "messageId": message_id,
+            "role": "ROLE_USER",
+            "contextId": context_id,
+            "taskId": task_id,
+            "parts": [{"text": "continue please"}],
+            "metadata": {
+                "peerId": peer_id,
+                "recipients": [],
+                "executionRequested": true,
+            },
+        },
+    })
+    .to_string()
+}
+
+/// POSTs a body to a REST path with an optional stamped identity and
+/// reads the (bounded) response.
+async fn rest_post(
+    router: axum::Router,
+    identity: Option<&str>,
+    path: &str,
+    body: &str,
+) -> (axum::http::StatusCode, String) {
+    let mut builder = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(CONTENT_TYPE, "application/json");
+    if let Some(identity) = identity {
+        builder = builder.header("x-wrkspc-peer", identity);
+    }
+    let response = router
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// Sends a stamped REST request and returns the STATUS only — for
+/// routes whose bodies never end (SSE subscriptions), where reading
+/// the body would hang the test.
+async fn rest_status_only(
+    router: axum::Router,
+    method: &str,
+    uri: String,
+) -> axum::http::StatusCode {
+    let request = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-wrkspc-peer", "node-test-1")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    router.oneshot(request).await.unwrap().status()
+}
+
 #[tokio::test]
 async fn ejected_peer_send_is_refused_until_restored() {
     let (store, conversation) = seeded().await;
@@ -175,7 +307,7 @@ async fn attributed_send_commits_and_queues_remote_delivery() {
     // The operator (hub host) sends to codex on a remote host.
     let (status, body) = post(
         router,
-        Some("wrkspc-pilot-host"),
+        Some("wrkspc-local-host"),
         &send_body("m-1", &conversation, "operator", &["codex"]),
     )
     .await;
@@ -202,7 +334,7 @@ async fn attributed_send_commits_and_queues_remote_delivery() {
     let router = router_under_test(store.clone()).await;
     let (status, _) = post(
         router,
-        Some("wrkspc-pilot-host"),
+        Some("wrkspc-local-host"),
         &send_body("m-1", &conversation, "operator", &["codex"]),
     )
     .await;
@@ -268,7 +400,7 @@ async fn jsonrpc_error_envelope_is_not_translated() {
     // must honor that verdict instead of translating the send.
     let (status, body) = post_versioned(
         router,
-        Some("wrkspc-pilot-host"),
+        Some("wrkspc-local-host"),
         &send_body("m-noversion", &conversation, "operator", &["codex"]),
         None,
     )
@@ -278,6 +410,28 @@ async fn jsonrpc_error_envelope_is_not_translated() {
         body.contains("\"error\""),
         "the SDK's verdict rides inside HTTP 200, got: {body}"
     );
+    assert_eq!(accepted_events(&store, &conversation).await, 0);
+}
+
+// A JSON-RPC batch (array) body must never reach the SDK handler on
+// the stamped surface: per-element validation does not exist, so the
+// whole batch fails closed with a 400.
+#[tokio::test]
+async fn jsonrpc_batch_bodies_are_rejected_on_the_stamped_surface() {
+    let (store, conversation) = seeded().await;
+    let router = router_under_test(store.clone()).await;
+
+    let batch = serde_json::json!([
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "SendMessage",
+            "params": { "message": { "messageId": "m-batch", "role": "ROLE_USER", "contextId": conversation, "parts": [], "metadata": { "peerId": "operator", "recipients": ["codex"], "executionRequested": true } } },
+        }),
+    ])
+    .to_string();
+    let (status, _body) = post(router, Some("wrkspc-local-host"), &batch).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
     assert_eq!(accepted_events(&store, &conversation).await, 0);
 }
 
@@ -328,7 +482,7 @@ async fn send_without_sender_metadata_is_rejected() {
         },
     })
     .to_string();
-    let (status, _) = post(router, Some("wrkspc-pilot-host"), &body).await;
+    let (status, _) = post(router, Some("wrkspc-local-host"), &body).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
     assert_eq!(accepted_events(&store, &conversation).await, 0);
 }
@@ -409,7 +563,7 @@ async fn seeded_delivery(
             sender_peer: "operator",
             sender_name: "operator",
             sender_class: "human",
-            sender_host: wrkspc_core::PILOT_HOST_ID,
+            sender_host: wrkspc_core::LOCAL_HOST_ID,
             content: "private delivery content",
             execution_requested: true,
         })
@@ -568,4 +722,545 @@ async fn rest_task_routes_are_host_queue_scoped() {
         .await
         .unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::OK);
+}
+
+// ─── Every registered send entry point runs acceptance ───
+
+/// Both REST unary spellings run the SAME verified-identity acceptance
+/// as the JSON-RPC surface: the legacy slash alias (/rest/message/send)
+/// splits into two path segments and must match ["message", "send"] —
+/// never a single segment containing the unsplit path — and the
+/// canonical colon spelling (/rest/message:send) stays guarded too.
+/// Each committed send also queues the remote delivery task.
+#[tokio::test]
+async fn rest_unary_send_spellings_run_full_acceptance() {
+    let (store, conversation) = seeded().await;
+    let router = router_under_test(store.clone()).await;
+
+    for (path, message_id) in [
+        ("/rest/message:send", "m-rest-canon"),
+        ("/rest/message/send", "m-rest-alias"),
+    ] {
+        let (status, text) = rest_post(
+            router.clone(),
+            Some("wrkspc-local-host"),
+            path,
+            &rest_send_body(message_id, &conversation, "operator", &["codex"], true),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{path}: {text}");
+    }
+    assert_eq!(accepted_events(&store, &conversation).await, 2);
+    let (_, total) = store
+        .task_list(Some("node-test-1"), None, None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(total, 2, "each committed send queues its remote delivery");
+}
+
+/// The legacy alias enforces sender attribution too: a peer asserted
+/// from the wrong host is refused before any SDK acceptance or store
+/// commit.
+#[tokio::test]
+async fn rest_send_alias_refuses_spoofed_sender() {
+    let (store, conversation) = seeded().await;
+    let router = router_under_test(store.clone()).await;
+
+    let (status, text) = rest_post(
+        router,
+        Some("node-test-1"),
+        "/rest/message/send",
+        &rest_send_body("m-rest-spoof", &conversation, "operator", &["codex"], true),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "body: {text}");
+    let envelope: serde_json::Value = serde_json::from_str(&text).expect("json envelope");
+    assert_eq!(envelope["error"]["code"], -32001, "body: {text}");
+    assert_eq!(accepted_events(&store, &conversation).await, 0);
+}
+
+/// Streaming sends are a REGISTERED SDK entry point with no secure
+/// acceptance translation: both REST spellings and the JSON-RPC
+/// `SendStreamingMessage` method are refused BEFORE the SDK handler
+/// runs, and nothing commits.
+#[tokio::test]
+async fn streaming_sends_are_refused_before_the_sdk() {
+    let (store, conversation) = seeded().await;
+    let router = router_under_test(store.clone()).await;
+
+    for path in ["/rest/message:stream", "/rest/message/stream"] {
+        let (status, text) = rest_post(
+            router.clone(),
+            Some("wrkspc-local-host"),
+            path,
+            &rest_send_body("m-rest-stream", &conversation, "operator", &["codex"], true),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{path}: {text}");
+        let envelope: serde_json::Value = serde_json::from_str(&text).expect("json envelope");
+        assert!(
+            envelope.get("error").is_some(),
+            "{path} must carry an error envelope: {text}"
+        );
+    }
+
+    let (status, text) = post(
+        router,
+        Some("wrkspc-local-host"),
+        &send_body_full(
+            "SendStreamingMessage",
+            "m-jsonrpc-stream",
+            &conversation,
+            "operator",
+            &["codex"],
+            true,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "body: {text}");
+    let envelope: serde_json::Value = serde_json::from_str(&text).expect("json envelope");
+    assert!(
+        envelope.get("error").is_some(),
+        "streaming rejection must be an envelope: {text}"
+    );
+
+    assert_eq!(accepted_events(&store, &conversation).await, 0);
+    let (_, total) = store
+        .task_list(Some("node-test-1"), None, None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(total, 0, "no streaming send may commit or fan out");
+}
+
+// ─── Continuation taskId is authorized before the SDK ───
+
+/// A send naming another host's delivery task (or any unreadable task)
+/// is refused with the fail-closed host-queue rule BEFORE the SDK
+/// handler can load or mutate it — on both send transports — and the
+/// task blob stays byte-identical.
+#[tokio::test]
+async fn foreign_task_continuation_is_refused_before_the_sdk() {
+    let (store, conversation) = seeded().await;
+    let foreign = seeded_delivery(&store, &conversation, "node-other", "msg-foreign-cont").await;
+    let before = store.task_get(&foreign).await.unwrap().unwrap();
+    let router = router_under_test(store.clone()).await;
+
+    // JSON-RPC SendMessage with a foreign taskId.
+    let (status, text) = post(
+        router.clone(),
+        Some("node-test-1"),
+        &send_body_full(
+            "SendMessage",
+            "m-cont-jsonrpc",
+            "node-other",
+            "codex",
+            &[],
+            true,
+            Some(&foreign),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "body: {text}");
+    let envelope: serde_json::Value = serde_json::from_str(&text).expect("json envelope");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("delivery queue"),
+        "rejection must state the host-queue rule: {text}"
+    );
+
+    // The same continuation field on a REST send.
+    let (status, text) = rest_post(
+        router.clone(),
+        Some("node-test-1"),
+        "/rest/message/send",
+        &rest_continuation_body("m-cont-rest", "node-other", "codex", &foreign),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "body: {text}");
+
+    // A nonexistent task id fails closed too: no existence oracle.
+    let (status, _) = post(
+        router.clone(),
+        Some("node-test-1"),
+        &send_body_full(
+            "SendMessage",
+            "m-cont-ghost",
+            "node-other",
+            "codex",
+            &[],
+            true,
+            Some("ghost-task"),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+
+    // The refused continuation never mutated the foreign task blob.
+    let after = store.task_get(&foreign).await.unwrap().unwrap();
+    assert_eq!(before.task_json, after.task_json);
+    assert_eq!(accepted_events(&store, &conversation).await, 0);
+}
+
+/// A continuation naming the PRESENTING host's own queue passes the
+/// authorization gate (the SDK verdict — not a middleware 403 — is
+/// what comes back).
+#[tokio::test]
+async fn own_queue_task_continuation_is_authorized() {
+    let (store, conversation) = seeded().await;
+    let own = seeded_delivery(&store, &conversation, "node-test-1", "msg-own-cont").await;
+    let router = router_under_test(store.clone()).await;
+
+    let (status, _) = post(
+        router,
+        Some("node-test-1"),
+        &send_body_full(
+            "SendMessage",
+            "m-cont-own",
+            "node-test-1",
+            "codex",
+            &[],
+            true,
+            Some(&own),
+        ),
+    )
+    .await;
+    assert_ne!(
+        status,
+        axum::http::StatusCode::FORBIDDEN,
+        "an own-queue continuation must not be refused by the middleware"
+    );
+}
+
+// ─── Canonical task-action suffixes authorize correctly ───
+
+/// The canonical `:cancel`/`:subscribe` spellings authorize the SAME
+/// host-queue rule as the legacy slash forms: the owning host's
+/// requests reach the SDK (its own verdict, never a middleware 403),
+/// and foreign hosts are still refused fail-closed.
+#[tokio::test]
+async fn canonical_task_action_suffixes_are_host_queue_scoped() {
+    let (store, conversation) = seeded().await;
+    let foreign = seeded_delivery(&store, &conversation, "node-other", "msg-canon-foreign").await;
+    let own = seeded_delivery(&store, &conversation, "node-test-1", "msg-canon-own").await;
+    let router = router_under_test(store.clone()).await;
+
+    // Foreign canonical actions: refused before the SDK, for every
+    // canonical spelling.
+    for (method, path) in [
+        ("POST", format!("/rest/tasks/{foreign}:cancel")),
+        ("GET", format!("/rest/tasks/{foreign}:subscribe")),
+        ("POST", format!("/rest/tasks/{foreign}:subscribe")),
+    ] {
+        let status = rest_status_only(router.clone(), method, path.clone()).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "{method} {path} on a foreign task"
+        );
+    }
+
+    // The owning host's canonical actions pass authorization and reach
+    // the SDK (whose own verdicts — a cancel result, a subscription
+    // stream/error — are not middleware refusals).
+    let status =
+        rest_status_only(router.clone(), "POST", format!("/rest/tasks/{own}:cancel")).await;
+    assert_ne!(
+        status,
+        axum::http::StatusCode::FORBIDDEN,
+        "the owner's canonical :cancel must not be refused by the middleware"
+    );
+    let status = rest_status_only(
+        router.clone(),
+        "GET",
+        format!("/rest/tasks/{own}:subscribe"),
+    )
+    .await;
+    assert_ne!(
+        status,
+        axum::http::StatusCode::FORBIDDEN,
+        "the owner's canonical :subscribe must not be refused by the middleware"
+    );
+}
+
+// ───  (wire side): committed routing stays authoritative ───
+
+/// An EXPLICITLY EMPTY recipient list is a node's committed routing —
+/// the hub must not re-infer @mentions from the body. The same post
+/// with the recipients field ABSENT keeps mention inference (fresh
+/// callers).
+#[tokio::test]
+async fn explicit_empty_recipient_list_stays_authoritative_at_the_hub() {
+    let store = Store::open_in_memory("acceptance-test").await.unwrap();
+    store
+        .ensure_peer("operator", "operator", "human")
+        .await
+        .unwrap();
+    store
+        .ensure_peer_on_host("codex", "codex", "harness", "node-test-1")
+        .await
+        .unwrap();
+    store
+        .ensure_peer_on_host("agy", "agy", "harness", "node-other")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "codex", "agy"])
+        .await
+        .unwrap();
+    let router = router_under_test(store.clone()).await;
+
+    // The body @mentions agy, but the recipients field is an EXPLICIT
+    // empty array: the committed routing says nobody, and the hub must
+    // honor it.
+    let explicit_empty = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "SendMessage",
+        "params": {
+            "message": {
+                "messageId": "m-committed-empty",
+                "role": "ROLE_USER",
+                "contextId": conversation,
+                "parts": [{"text": "@agy please review"}],
+                "metadata": {
+                    "peerId": "codex",
+                    "recipients": [],
+                    "executionRequested": true,
+                },
+            },
+        },
+    })
+    .to_string();
+    let (status, text) = post(router.clone(), Some("node-test-1"), &explicit_empty).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "body: {text}");
+    assert_eq!(accepted_events(&store, &conversation).await, 1);
+    let (_, total) = store
+        .task_list(Some("node-other"), None, None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        total, 0,
+        "an explicit empty committed list must not re-infer @agy at the hub"
+    );
+
+    // The ABSENT field keeps mention inference for fresh callers: the
+    // same body without a recipients field resolves @agy.
+    let absent = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "SendMessage",
+        "params": {
+            "message": {
+                "messageId": "m-mention-inferred",
+                "role": "ROLE_USER",
+                "contextId": conversation,
+                "parts": [{"text": "@agy please review"}],
+                "metadata": {
+                    "peerId": "codex",
+                    "executionRequested": true,
+                },
+            },
+        },
+    })
+    .to_string();
+    let (status, text) = post(router, Some("node-test-1"), &absent).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "body: {text}");
+    assert_eq!(accepted_events(&store, &conversation).await, 2);
+    let (_, total) = store
+        .task_list(Some("node-other"), None, None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(total, 1, "an absent field keeps mention inference");
+}
+
+// ───  (wire side): replay fan-out uses committed authority ───
+
+/// Replay fan-out authority comes from the COMMITTED message state,
+/// never the retry payload's flag: a replay of an executable message
+/// whose delivery task is still missing (the supported partial-fan-out
+/// window) rebuilds that task as executable even when the retry itself
+/// carries executionRequested=false. (The opposite direction — a
+/// mail-only message replayed with executionRequested=true — is
+/// rejected by the store's replay authority check before fan-out.)
+#[tokio::test]
+async fn replay_fanout_uses_committed_authority_not_the_retry_flag() {
+    let (store, conversation) = seeded().await;
+
+    // Phase 1: accept an EXECUTABLE message on a hub whose local host
+    // equals codex's own host — the fan-out skip leaves the committed
+    // recipient row WITHOUT a delivery task. Committed authority:
+    // execution_requested = true.
+    let router = router_with_local_host(store.clone(), "node-test-1".to_string()).await;
+    let (status, text) = post(
+        router,
+        Some("wrkspc-local-host"),
+        &send_body_full(
+            "SendMessage",
+            "m-exec",
+            &conversation,
+            "operator",
+            &["codex"],
+            true,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "body: {text}");
+    assert_eq!(accepted_events(&store, &conversation).await, 1);
+    let (_, total) = store
+        .task_list(Some("node-test-1"), None, None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(total, 0, "the first acceptance must leave no delivery task");
+
+    // Phase 2: the real hub replays the same message with
+    // executionRequested=false and an explicit-empty recipient list.
+    // The store accepts (no escalation), and the wire-side fan-out
+    // must rebuild the missing task from the COMMITTED message state —
+    // executable — not the retry's false.
+    let router = router_under_test(store.clone()).await;
+    let (status, text) = post(
+        router,
+        Some("wrkspc-local-host"),
+        &send_body_full(
+            "SendMessage",
+            "m-exec",
+            &conversation,
+            "operator",
+            &[],
+            false,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "body: {text}");
+
+    let (tasks, total) = store
+        .task_list(Some("node-test-1"), None, None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(total, 1, "the replay must repair the missing delivery task");
+    let payload: serde_json::Value = serde_json::from_str(&tasks[0].task_json).unwrap();
+    assert_eq!(
+        payload["metadata"]["delivery"]["execution_requested"], true,
+        "replay fan-out authority must come from the committed message, not the retry payload"
+    );
+}
+
+/// A sender may subscribe to ITS OWN accepted task through the
+/// hub gate — the envelope's origin linkage proves the sender's host
+/// even though the accepted task's context is a conversation, not a
+/// delivery queue. Any other host is still refused.
+#[tokio::test]
+async fn sender_subscribes_to_its_own_accepted_task() {
+    let store = Store::open_in_memory("acceptance-subscribe").await.unwrap();
+    store
+        .ensure_peer_on_host("operator", "operator", "human", wrkspc_core::LOCAL_HOST_ID)
+        .await
+        .unwrap();
+    store
+        .ensure_peer_on_host("codex", "codex", "harness", "node-test-1")
+        .await
+        .unwrap();
+    let conversation = store
+        .create_conversation(&["operator", "codex"])
+        .await
+        .unwrap();
+
+    // The sender's accepted task (context = the conversation).
+    let accepted_task_id = "node-wire-msg-1";
+    store
+        .task_create(
+            accepted_task_id,
+            &conversation,
+            "submitted",
+            false,
+            &serde_json::json!({
+                "id": accepted_task_id,
+                "contextId": conversation,
+                "status": {"state": "TASK_STATE_SUBMITTED"},
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    // The delivery task whose envelope links the origin to the
+    // sender's host.
+    store
+        .task_create_delivery(wrkspc_core::DeliveryTaskRequest {
+            recipient_host: "node-test-1",
+            recipient_peer: "codex",
+            recipient_name: "codex",
+            recipient_class: "harness",
+            message_id: "hub-msg-1",
+            origin_message_id: Some(accepted_task_id),
+            conversation_id: &conversation,
+            sender_peer: "codex",
+            sender_name: "codex",
+            sender_class: "harness",
+            sender_host: "node-test-1",
+            content: "hello",
+            execution_requested: true,
+        })
+        .await
+        .unwrap();
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "SubscribeToTask",
+        "params": {"id": accepted_task_id},
+    })
+    .to_string();
+
+    let router = router_under_test(store.clone()).await;
+
+    // The sender's own host passes the gate (the request reaches the
+    // SDK handler, which answers anything EXCEPT the queue rejection).
+    let response = router
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/jsonrpc")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-wrkspc-peer", "node-test-1")
+                .body(axum::body::Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        !text.contains("not in this host's delivery queue"),
+        "the sender's own accepted task must pass the gate: {text}"
+    );
+
+    // Any other host is refused with the queue rejection.
+    let response = router
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/jsonrpc")
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-wrkspc-peer", "other-host")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("not in this host's delivery queue"),
+        "a foreign host must be refused: {text}"
+    );
 }

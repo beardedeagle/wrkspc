@@ -13,9 +13,7 @@ pub fn parse(id: &str) -> Option<&'static HarnessEntry> {
 
 /// The registry entries whose detection paths exist under `home`.
 ///
-/// # Arguments
-///
-/// * `home` — the home directory to inspect.
+/// `home` is the home directory to inspect.
 ///
 /// # Returns
 ///

@@ -4,11 +4,8 @@
 
 mod common;
 use common::*;
-use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
 use wrkspc_core::Store;
-use wrkspc_ui::{UiConfig, UiServer};
+use wrkspc_ui::UiConfig;
 
 /// The operator post commits with an execution intent for the other member.
 #[tokio::test]
@@ -275,6 +272,57 @@ async fn unknown_attempts_surface_and_reconcile() {
     );
     let _ = ui.shutdown.send(());
 }
+/// A directed post whose recipient list exceeds the cap is refused
+/// outright: no partial resolution, no fan-out, no committed message
+/// (CodeQL `rust/uncontrolled-allocation-size`).
+#[tokio::test]
+async fn directed_post_rejects_recipient_lists_over_the_cap() {
+    let ui = spawn_ui().await;
+    let conversation = ui.conversation_id().await;
+
+    let recipients: Vec<String> = (0..33).map(|index| format!("peer{index}")).collect();
+    let res = ui
+        .client()
+        .post(format!(
+            "{}/api/conversations/{conversation}/messages",
+            ui.base
+        ))
+        .bearer_auth(TOKEN)
+        .json(&serde_json::json!({
+            "content": "directed at everyone",
+            "recipients": recipients,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("too many recipients") && error.contains("32")),
+        "the refusal names the cap: {body}"
+    );
+
+    // Nothing was committed and nothing was queued for execution.
+    assert_eq!(ui.store.due_intents().await.unwrap().len(), 0);
+    let messages: Vec<serde_json::Value> = ui
+        .client()
+        .get(format!(
+            "{}/api/conversations/{conversation}/messages",
+            ui.base
+        ))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 0, "no message lands on a refused post");
+    let _ = ui.shutdown.send(());
+}
+
 /// Hub-mode operator posts queue a pollable delivery task for remote-host recipients.
 #[tokio::test]
 async fn hub_mode_operator_post_queues_remote_deliveries() {
@@ -291,37 +339,22 @@ async fn hub_mode_operator_post_queues_remote_deliveries() {
         .create_conversation(&["operator", "codex"])
         .await
         .unwrap();
-
-    let cancel: Arc<FakeCancel> = Arc::new(FakeCancel {
-        calls: Mutex::new(Vec::new()),
-    });
-    let ui = UiServer::new(
+    let ui = spawn_ui_on(
         store.clone(),
-        cancel,
         UiConfig {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            cookie_secure: false,
-            token: Some(TOKEN.to_string()),
             queue_remote_deliveries: true,
             hub_role: true,
-            hub_connected: false,
+            token: Some(TOKEN.to_string()),
+            ..Default::default()
         },
-        None,
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(async move {
-        ui.serve_on(listener, async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .expect("ui serves");
-    });
+    )
+    .await;
 
-    let res = reqwest::Client::new()
+    let res = ui
+        .client()
         .post(format!(
-            "http://{addr}/api/conversations/{conversation}/messages"
+            "{}/api/conversations/{conversation}/messages",
+            ui.base
         ))
         .bearer_auth(TOKEN)
         .json(&serde_json::json!({ "content": "hello team" }))
@@ -340,8 +373,7 @@ async fn hub_mode_operator_post_queues_remote_deliveries() {
     assert_eq!(payload["metadata"]["delivery"]["recipient_peer"], "codex");
     assert_eq!(payload["metadata"]["delivery"]["sender_peer"], "operator");
 
-    let _ = shutdown_tx.send(());
-    let _ = server.await;
+    let _ = ui.shutdown.send(());
 }
 
 /// Node-mode operator posts queue no delivery tasks (the hub never sees them).
@@ -360,37 +392,22 @@ async fn node_mode_operator_post_queues_nothing() {
         .create_conversation(&["operator", "codex"])
         .await
         .unwrap();
-
-    let cancel: Arc<FakeCancel> = Arc::new(FakeCancel {
-        calls: Mutex::new(Vec::new()),
-    });
-    let ui = UiServer::new(
+    let ui = spawn_ui_on(
         store.clone(),
-        cancel,
         UiConfig {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            cookie_secure: false,
-            token: Some(TOKEN.to_string()),
             queue_remote_deliveries: false,
             hub_role: false,
-            hub_connected: false,
+            token: Some(TOKEN.to_string()),
+            ..Default::default()
         },
-        None,
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(async move {
-        ui.serve_on(listener, async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .expect("ui serves");
-    });
+    )
+    .await;
 
-    let res = reqwest::Client::new()
+    let res = ui
+        .client()
         .post(format!(
-            "http://{addr}/api/conversations/{conversation}/messages"
+            "{}/api/conversations/{conversation}/messages",
+            ui.base
         ))
         .bearer_auth(TOKEN)
         .json(&serde_json::json!({ "content": "hello team" }))
@@ -407,6 +424,149 @@ async fn node_mode_operator_post_queues_nothing() {
         .unwrap();
     assert_eq!(total, 0);
 
-    let _ = shutdown_tx.send(());
-    let _ = server.await;
+    let _ = ui.shutdown.send(());
+}
+
+/// An operator post with no recipient list fans out to every eligible
+/// member: in a room with more than the directed-post ceiling of
+/// members, the shared store fence refuses the post with a 400 (not a
+/// 500) so a big room never amplifies into unbounded per-peer work.
+#[tokio::test]
+async fn oversized_fanout_room_post_is_refused_with_400() {
+    let ui = spawn_ui().await;
+    let mut members: Vec<String> = Vec::new();
+    for index in 0..33 {
+        let peer_id = format!("peer{index}");
+        ui.store
+            .ensure_peer(&peer_id, &peer_id, "harness")
+            .await
+            .unwrap();
+        members.push(peer_id);
+    }
+    members.insert(0, "operator".to_string());
+    let member_refs: Vec<&str> = members.iter().map(String::as_str).collect();
+    let conversation = ui.store.create_conversation(&member_refs).await.unwrap();
+
+    let res = ui
+        .client()
+        .post(format!(
+            "{}/api/conversations/{conversation}/messages",
+            ui.base
+        ))
+        .bearer_auth(TOKEN)
+        .json(&serde_json::json!({ "content": "everyone listens" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("too many recipients") && error.contains("33")),
+        "the refusal names the fan-out size: {body}"
+    );
+    let _ = ui.shutdown.send(());
+}
+
+/// A mention-only operator post on the hub fans out from the COMMITTED
+/// routing: the member the mention resolves to gets a pollable remote
+/// delivery even though the request named no recipients.
+#[tokio::test]
+async fn hub_mention_only_post_fans_out_from_committed_routing() {
+    let ui = spawn_ui_hub().await;
+    // A member on a REMOTE host: the local-host skip in
+    // queue_remote_deliveries would mask the fan-out for a local peer.
+    ui.store
+        .ensure_peer_on_host("remote-agent", "Remote Agent", "harness", "remote-host-7")
+        .await
+        .unwrap();
+    let conversation_id = ui
+        .store
+        .create_conversation(&["operator", "remote-agent"])
+        .await
+        .unwrap();
+
+    let res = ui
+        .client()
+        .post(format!(
+            "{}/api/conversations/{conversation_id}/messages",
+            ui.base
+        ))
+        .bearer_auth(TOKEN)
+        .json(&serde_json::json!({
+            "content": "@remote-agent please review",
+            "recipients": []
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let message_id = res.json::<serde_json::Value>().await.unwrap()["message_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The mention resolved to the remote member in the committed
+    // routing, and the hub queued exactly one delivery task for it.
+    assert_eq!(
+        ui.store.message_recipients(&message_id).await.unwrap(),
+        vec!["remote-agent".to_string()]
+    );
+    // Delivery tasks are filed under the RECIPIENT HOST's queue.
+    let (tasks, _total) = ui
+        .store
+        .task_list(Some("remote-host-7"), None, None, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        tasks.len(),
+        1,
+        "the mention-resolved member gets a pollable delivery task"
+    );
+    let _ = ui.shutdown.send(());
+}
+
+/// An explicitly empty recipient list is authoritative on the operator
+/// surface: without @mentions in the body the message commits to
+/// nobody — the store must not infer a recipient set from the content.
+#[tokio::test]
+async fn explicit_empty_recipients_without_mentions_addresses_nobody() {
+    let ui = spawn_ui_hub().await;
+    ui.store
+        .ensure_peer_on_host("remote-agent", "Remote Agent", "harness", "remote-host-7")
+        .await
+        .unwrap();
+    let conversation_id = ui
+        .store
+        .create_conversation(&["operator", "remote-agent"])
+        .await
+        .unwrap();
+
+    let res = ui
+        .client()
+        .post(format!(
+            "{}/api/conversations/{conversation_id}/messages",
+            ui.base
+        ))
+        .bearer_auth(TOKEN)
+        .json(&serde_json::json!({
+            "content": "nobody in particular",
+            "recipients": []
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let message_id = res.json::<serde_json::Value>().await.unwrap()["message_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let recipients = ui.store.message_recipients(&message_id).await.unwrap();
+    assert!(
+        recipients.is_empty(),
+        "an explicit empty list with no mentions must address nobody: {recipients:?}"
+    );
+    let _ = ui.shutdown.send(());
 }

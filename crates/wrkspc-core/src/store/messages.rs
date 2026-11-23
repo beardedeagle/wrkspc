@@ -17,6 +17,35 @@ struct AcceptText<'a> {
     content: &'a str,
 }
 
+/// The two acceptance-mode switches, paired so the shared fence
+/// implementation stays under the argument-count lint.
+#[derive(Clone, Copy)]
+struct AcceptMode {
+    /// Whether execution intents are committed (the execution authority
+    /// is still recorded on the message either way, so the wire flag
+    /// never lies).
+    create_intents: bool,
+    /// Whether an empty requested recipient list falls back to
+    /// `@mention` resolution (fresh callers) or is authoritative
+    /// (committed routing propagated from a node).
+    infer_mentions: bool,
+}
+
+/// The caller's routing input to mention/recipient resolution: the
+/// explicit requests plus whether an empty list may fall back to
+/// `@mention` inference.
+struct Routing<'a> {
+    requests: &'a [RecipientRequest],
+    infer_mentions: bool,
+}
+
+/// The ceiling on directed-post recipients per message, enforced on the
+/// shared acceptance path so EVERY caller (operator UI route and MCP
+/// post-message tool) is fenced — a near-limit recipient list could
+/// otherwise fan out to thousands of per-target store resolves and
+/// deliveries (CodeQL `rust/uncontrolled-allocation-size`).
+pub const MAX_DIRECTED_RECIPIENTS: usize = 32;
+
 impl Store {
     /// Runs the readiness fence: commits a message, its recipients, and any
     /// requested execution intents in one transaction.
@@ -25,9 +54,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::IdempotencyConflict`](StoreError::IdempotencyConflict)
+    /// Returns [`StoreError::IdempotencyConflict`]
     /// when the key is reused with different content, and
-    /// [`StoreError::NotFound`](StoreError::NotFound) for non-members.
+    /// [`StoreError::NotFound`] for non-members.
     pub async fn accept_message(
         &self,
         conversation_id: &str,
@@ -46,7 +75,10 @@ impl Store {
             },
             execution_requested,
             recipients,
-            true,
+            AcceptMode {
+                create_intents: true,
+                infer_mentions: true,
+            },
         )
         .await
     }
@@ -82,14 +114,153 @@ impl Store {
             },
             execution_requested,
             recipients,
-            false,
+            AcceptMode {
+                create_intents: false,
+                infer_mentions: true,
+            },
         )
         .await
     }
 
-    /// Shared fence implementation; `create_intents` selects whether
-    /// execution intents are committed (the execution authority is still
-    /// recorded on the message either way, so the wire flag never lies).
+    /// The committed-routing form of
+    /// [`accept_message`](Store::accept_message): identical fence and
+    /// commit semantics, but an explicitly supplied recipient list —
+    /// EMPTY included — is authoritative and the body is NEVER scanned
+    /// for `@mentions`.
+    ///
+    /// A hub-connected node commits its routing once, locally, and the
+    /// outbound sync propagates that committed set verbatim. The frozen
+    /// routing contract says an empty committed list wakes nobody at the
+    /// hub: a fresh acceptance that re-resolved the body could expand a
+    /// post that addressed nobody locally into one that wakes peers only
+    /// the hub knows. Callers that WANT mention inference (fresh
+    /// operator and A2A posts) use
+    /// [`accept_message`](Store::accept_message).
+    ///
+    /// # Errors
+    ///
+    /// The same error set as [`accept_message`](Store::accept_message).
+    pub async fn accept_message_committed_routing(
+        &self,
+        conversation_id: &str,
+        sender_id: &str,
+        idempotency_key: &str,
+        content: &str,
+        execution_requested: bool,
+        recipients: &[RecipientRequest],
+    ) -> Result<AcceptOutcome> {
+        self.accept_message_with(
+            conversation_id,
+            sender_id,
+            AcceptText {
+                key: idempotency_key,
+                content,
+            },
+            execution_requested,
+            recipients,
+            AcceptMode {
+                create_intents: true,
+                infer_mentions: false,
+            },
+        )
+        .await
+    }
+
+    /// Resolves the `@mention` tokens in `content` to the conversation
+    /// members they address.
+    ///
+    /// The operator surface calls this BEFORE acceptance and submits the
+    /// result as the explicit recipient list, so the committed routing is
+    /// always the routing the operator authored: an empty list stays
+    /// empty, and this store never infers recipients from message bodies
+    /// on that path. The resolution applies the same filters the
+    /// inference path once applied inside acceptance:
+    ///
+    /// * the operator never wakes itself,
+    /// * human-class members never receive deliveries,
+    /// * a mention never wakes a booted or banned peer,
+    /// * duplicate matches collapse to one recipient.
+    ///
+    /// # Args
+    ///
+    /// * `conversation_id` - The conversation the post belongs to.
+    /// * `content` - The message body to scan for mentions.
+    ///
+    /// # Returns
+    ///
+    /// The resolved peer ids in body order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::AmbiguousPeerRef`] when a token matches
+    /// more than one member, and [`StoreError::Db`] when the queries
+    /// fail.
+    pub async fn resolve_mentions(
+        &self,
+        conversation_id: &str,
+        content: &str,
+    ) -> Result<Vec<String>> {
+        // A deferred READ transaction, never IMMEDIATE: this is a
+        // read-only operator-surface call, and holding the WAL write
+        // lock across the per-peer loop below would stall every writer
+        // for its whole duration.
+        let mut tx = self.pool.begin().await?;
+        let matched = self
+            .mentioned_members(&mut tx, conversation_id, content)
+            .await?;
+        let mut resolved: Vec<String> = Vec::with_capacity(matched.len());
+        for peer_id in matched {
+            if peer_id == "operator"
+                || resolved.iter().any(|row| row == &peer_id)
+                || self.peer_class(&mut tx, &peer_id).await?.as_deref() == Some(HUMAN_CLASS)
+            {
+                continue;
+            }
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM peers WHERE id = ?")
+                    .bind(&peer_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if let Some(status) = status
+                && status != "enrolled"
+            {
+                // A mention never wakes a booted or banned peer.
+                continue;
+            }
+            resolved.push(peer_id);
+        }
+        tx.rollback().await?;
+        Ok(resolved)
+    }
+
+    /// Reads one message's committed execution flag by id.
+    ///
+    /// The single-column form of the transcript read: replay authority
+    /// checks need exactly this value, and loading the whole
+    /// conversation to find one row is unbounded work for one column.
+    ///
+    /// # Args
+    ///
+    /// * `message_id` - The message to look up.
+    ///
+    /// # Returns
+    ///
+    /// `Some(execution_requested)` for a committed row, `None` when the
+    /// message does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`] when the query fails.
+    pub async fn message_execution_requested(&self, message_id: &str) -> Result<Option<bool>> {
+        sqlx::query_scalar("SELECT execution_requested FROM messages WHERE id = ?")
+            .bind(message_id)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Shared fence implementation; `mode` carries the two acceptance
+    /// switches (see [`AcceptMode`]).
     async fn accept_message_with(
         &self,
         conversation_id: &str,
@@ -97,8 +268,18 @@ impl Store {
         text: AcceptText<'_>,
         execution_requested: bool,
         recipients: &[RecipientRequest],
-        create_intents: bool,
+        mode: AcceptMode,
     ) -> Result<AcceptOutcome> {
+        // The ceiling holds on the SHARED path, not per caller: both the
+        // operator UI route and the MCP post-message tool funnel through
+        // here, and a harness can name as many peers as the protocol lets
+        // it (CodeQL rust/uncontrolled-allocation-size).
+        if recipients.len() > MAX_DIRECTED_RECIPIENTS {
+            return Err(StoreError::TooManyRecipients {
+                limit: MAX_DIRECTED_RECIPIENTS,
+                count: recipients.len(),
+            });
+        }
         let AcceptText {
             key: idempotency_key,
             content,
@@ -149,61 +330,19 @@ impl Store {
                     key: idempotency_key.to_string(),
                 });
             }
-            // A replay means the message is already stored, not that this
-            // recipient's work is done. The delivery loop feeds one
-            // delivery per recipient under the same origin id, so every
-            // recipient after the first reaches this branch: enrol it
-            // and raise its intent here, or the peer silently never
-            // runs.
-            self.assert_member(&mut tx, conversation_id, sender_id)
-                .await?;
-            // Execution authority is committed at first acceptance: a
-            // mail-only message can never become executable via a retry.
-            let requests_execution = recipients.iter().any(|r| r.execution_requested);
-            if requests_execution && !existing_execution {
-                return Err(StoreError::ExecutionAuthorityConflict {
-                    message_id: existing_id,
-                });
-            }
-            for recipient in recipients {
-                self.assert_member(&mut tx, conversation_id, &recipient.peer_id)
-                    .await?;
-                sqlx::query(
-                    "INSERT OR IGNORE INTO message_recipients
-                       (message_id, peer_id, delivery_state)
-                     VALUES (?, ?, ?)",
+            return self
+                .replay_committed(
+                    tx,
+                    conversation_id,
+                    sender_id,
+                    &existing_id,
+                    existing_execution,
+                    execution_requested,
+                    recipients,
+                    &mode,
+                    &now,
                 )
-                .bind(&existing_id)
-                .bind(&recipient.peer_id)
-                .bind(DeliveryState::Stored.as_str())
-                .execute(&mut *tx)
-                .await?;
-                if create_intents && recipient.execution_requested {
-                    sqlx::query(
-                        "INSERT OR IGNORE INTO execution_intents
-                           (id, message_id, recipient_id, state, created_at)
-                         VALUES (?, ?, ?, 'queued', ?)",
-                    )
-                    .bind(Uuid::new_v4().to_string())
-                    .bind(&existing_id)
-                    .bind(&recipient.peer_id)
-                    .bind(&now)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-            }
-            // The stored flag reflects the committed intents, never a
-            // stale first-acceptance snapshot.
-            if requests_execution {
-                sqlx::query("UPDATE messages SET execution_requested = 1 WHERE id = ?")
-                    .bind(&existing_id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            tx.commit().await?;
-            return Ok(AcceptOutcome::Replay {
-                message_id: existing_id,
-            });
+                .await;
         }
 
         // Resolve who this post actually wakes before anything is written: the
@@ -217,10 +356,23 @@ impl Store {
                 sender_id,
                 content,
                 execution_requested,
-                recipients,
+                Routing {
+                    requests: recipients,
+                    infer_mentions: mode.infer_mentions,
+                },
             )
             .await?;
         let recipients = recipients.as_slice();
+        // The ceiling also fences the RESOLVED list: a mention-only post
+        // arrives with an empty requested list (the early guard above
+        // passes), and @mentions can still resolve to dozens of members —
+        // the resolved set is what actually fans out.
+        if recipients.len() > MAX_DIRECTED_RECIPIENTS {
+            return Err(StoreError::TooManyRecipients {
+                limit: MAX_DIRECTED_RECIPIENTS,
+                count: recipients.len(),
+            });
+        }
 
         self.assert_member(&mut tx, conversation_id, sender_id)
             .await?;
@@ -252,7 +404,7 @@ impl Store {
             .bind(DeliveryState::Stored.as_str())
             .execute(&mut *tx)
             .await?;
-            if create_intents && recipient.execution_requested {
+            if mode.create_intents && recipient.execution_requested {
                 let intent_id = Uuid::new_v4().to_string();
                 sqlx::query(
                     "INSERT INTO execution_intents
@@ -278,6 +430,124 @@ impl Store {
 
         tx.commit().await?;
         Ok(AcceptOutcome::Accepted { message_id })
+    }
+
+    /// The replay leg of [`accept_message_with`](Store::accept_message_with):
+    /// the message row already exists, so this enrols the newly
+    /// presented recipients and raises their intents under the SAME
+    /// origin id — a recipient after the first reaches this branch,
+    /// and it must run or the peer silently never does.
+    #[allow(clippy::too_many_arguments)]
+    async fn replay_committed(
+        &self,
+        mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+        conversation_id: &str,
+        sender_id: &str,
+        existing_id: &str,
+        existing_execution: bool,
+        execution_requested: bool,
+        recipients: &[RecipientRequest],
+        mode: &AcceptMode,
+        now: &str,
+    ) -> Result<AcceptOutcome> {
+        // A replay means the message is already stored, not that this
+        // recipient's work is done. The delivery loop feeds one
+        // delivery per recipient under the same origin id, so every
+        // recipient after the first reaches this branch: enrol it
+        // and raise its intent here, or the peer silently never
+        // runs.
+        self.assert_member(&mut tx, conversation_id, sender_id)
+            .await?;
+        // Execution authority is committed at first acceptance: a
+        // mail-only message can never become executable via a retry.
+        // The check covers BOTH channels a replay can smuggle
+        // authority through — the per-recipient flags AND the
+        // message-level flag. An empty recipient list makes the
+        // per-recipient scan vacuous, so without the global term a
+        // mail-only replay carrying execution_requested=true slips
+        // through and the caller's fan-out would queue executable
+        // work the original acceptance never granted.
+        let requests_execution =
+            execution_requested || recipients.iter().any(|r| r.execution_requested);
+        if requests_execution && !existing_execution {
+            return Err(StoreError::ExecutionAuthorityConflict {
+                message_id: existing_id.to_string(),
+            });
+        }
+        // The ceiling is CUMULATIVE across replays: each per-recipient
+        // delivery loop call lands here with its own small list, but a
+        // caller rotating lists under one idempotency key could
+        // otherwise accumulate unbounded recipients on one message.
+        // Two guards on the count: the incoming list may name the same
+        // peer twice (INSERT OR IGNORE would dedupe), and a pure
+        // re-ack that adds NOBODY must always pass (the delivery
+        // loop's own replay acks rely on it). The refusal fires only
+        // when the replay GROWS the set past the ceiling.
+        let committed_ids: Vec<String> =
+            sqlx::query_scalar("SELECT peer_id FROM message_recipients WHERE message_id = ?")
+                .bind(existing_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        // A replay must honor the SAME recipient filter as first
+        // acceptance — the shared filter_recipients, with explicit =
+        // true: a non-member is refused by the membership assert, an
+        // ejected peer is refused loudly, and self-addresses,
+        // duplicates, and member human-class peers are skipped — a
+        // retry cannot smuggle a banned target or a human execution
+        // intent past the resolution gate.
+        let filtered = self
+            .filter_recipients(&mut tx, conversation_id, sender_id, recipients, true)
+            .await?;
+        let mut new_unique_ids: Vec<&str> = Vec::new();
+        for recipient in &filtered {
+            if !committed_ids.iter().any(|id| id == &recipient.peer_id)
+                && !new_unique_ids.contains(&recipient.peer_id.as_str())
+            {
+                new_unique_ids.push(&recipient.peer_id);
+            }
+        }
+        if !new_unique_ids.is_empty()
+            && committed_ids.len() + new_unique_ids.len() > MAX_DIRECTED_RECIPIENTS
+        {
+            return Err(StoreError::TooManyRecipients {
+                limit: MAX_DIRECTED_RECIPIENTS,
+                count: committed_ids.len() + new_unique_ids.len(),
+            });
+        }
+        for recipient in &filtered {
+            sqlx::query(
+                "INSERT OR IGNORE INTO message_recipients
+                   (message_id, peer_id, delivery_state)
+                 VALUES (?, ?, ?)",
+            )
+            .bind(existing_id)
+            .bind(&recipient.peer_id)
+            .bind(DeliveryState::Stored.as_str())
+            .execute(&mut *tx)
+            .await?;
+            if mode.create_intents && recipient.execution_requested {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO execution_intents
+                       (id, message_id, recipient_id, state, created_at)
+                     VALUES (?, ?, ?, 'queued', ?)",
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(existing_id)
+                .bind(&recipient.peer_id)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        // The stored flag reflects the committed intents, never a
+        // stale first-acceptance snapshot: reaching this point with
+        // `requests_execution` means the execution-authority guard
+        // above already saw the flag committed, so there is nothing
+        // to update here.
+        tx.commit().await?;
+        Ok(AcceptOutcome::Replay {
+            message_id: existing_id.to_string(),
+        })
     }
 }
 
@@ -305,8 +575,6 @@ impl Store {
     ///
     /// Human peers never take a delivery.
     ///
-    /// # Arguments
-    ///
     /// * `tx` — the acceptance transaction.
     /// * `conversation_id` — the room the post lands in.
     /// * `sender_id` — the author, never a recipient of its own post.
@@ -314,12 +582,16 @@ impl Store {
     ///   named no recipients.
     /// * `execution_requested` — the flag carried onto every resolved
     ///   recipient.
-    /// * `requested` — the caller's explicit recipients, possibly empty.
+    /// * `routing` — the caller's explicit requests plus whether an
+    ///   empty list may fall back to `@mention` inference (fresh
+    ///   callers) or is authoritative (committed routing propagated
+    ///   from a node).
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::NotFound`] when an explicit recipient is not a
-    /// conversation member.
+    /// conversation member, and [`StoreError::AmbiguousPeerRef`] when a
+    /// mention matches more than one member.
     async fn resolve_recipients(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
@@ -327,23 +599,56 @@ impl Store {
         sender_id: &str,
         content: &str,
         execution_requested: bool,
-        requested: &[RecipientRequest],
+        routing: Routing<'_>,
     ) -> Result<Vec<RecipientRequest>> {
-        let candidates = if requested.is_empty() {
-            self.mentioned_members(tx, conversation_id, content)
-                .await?
-                .into_iter()
-                .map(|peer_id| RecipientRequest {
-                    peer_id,
-                    execution_requested,
-                })
-                .collect::<Vec<_>>()
+        let candidates = if routing.requests.is_empty() {
+            if routing.infer_mentions {
+                self.mentioned_members(tx, conversation_id, content)
+                    .await?
+                    .into_iter()
+                    .map(|peer_id| RecipientRequest {
+                        peer_id,
+                        execution_requested,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                // Committed routing: an explicitly supplied empty list is
+                // authoritative and the body is never re-resolved.
+                Vec::new()
+            }
         } else {
-            requested.to_vec()
+            routing.requests.to_vec()
         };
 
+        // The ONE filter both acceptance paths share.
+        self.filter_recipients(
+            tx,
+            conversation_id,
+            sender_id,
+            &candidates,
+            !routing.requests.is_empty(),
+        )
+        .await
+    }
+
+    /// The ONE recipient filter both acceptance paths share.
+    ///
+    /// Membership is asserted FIRST, then the self skip, the duplicate
+    /// skip, the human-class skip, and the ejected refusal for explicit
+    /// addresses — a mention never wakes a booted or banned peer, an
+    /// explicit address is refused loudly instead of silently reaching
+    /// nobody. The replay leg runs the identical filter, so a retry
+    /// cannot smuggle a banned target or a human execution intent past
+    /// the resolution gate.
+    async fn filter_recipients(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        conversation_id: &str,
+        sender_id: &str,
+        candidates: &[RecipientRequest],
+        explicit: bool,
+    ) -> Result<Vec<RecipientRequest>> {
         let mut resolved: Vec<RecipientRequest> = Vec::with_capacity(candidates.len());
-        let explicit = !requested.is_empty();
         for candidate in candidates {
             // An explicit recipient must be a member; the check stays so a
             // typo fails loudly instead of silently reaching nobody.
@@ -370,13 +675,13 @@ impl Store {
             {
                 if explicit {
                     return Err(StoreError::PeerEjected {
-                        peer_id: candidate.peer_id,
+                        peer_id: candidate.peer_id.clone(),
                         status,
                     });
                 }
                 continue;
             }
-            resolved.push(candidate);
+            resolved.push(candidate.clone());
         }
         Ok(resolved)
     }
@@ -385,11 +690,16 @@ impl Store {
     ///
     /// A token matches a member's peer id, alias, or display name,
     /// case-insensitively, so a peer renamed with an alias stays addressable
-    /// under the old name.
+    /// under the old name. Resolution follows the same contract as
+    /// [`Store::resolve_peer_ref`] (UI-04): a member's canonical peer id
+    /// always wins over any alias/display-name collision, and an
+    /// alias/display-name match must be UNIQUE — ambiguity fails closed
+    /// instead of routing by database row order.
     ///
     /// # Errors
     ///
-    /// Returns a store error when the membership query fails.
+    /// Returns [`StoreError::AmbiguousPeerRef`] when a mention matches
+    /// more than one member, and a store error when the query fails.
     async fn mentioned_members(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
@@ -419,14 +729,47 @@ impl Store {
 
         let mut matched: Vec<String> = Vec::new();
         for name in names {
-            let hit = members.iter().find(|member| {
-                member.peer_id.eq_ignore_ascii_case(&name)
-                    || member
-                        .alias
-                        .as_deref()
-                        .is_some_and(|alias| alias.eq_ignore_ascii_case(&name))
-                    || member.name.eq_ignore_ascii_case(&name)
-            });
+            // Canonical-id precedence: an exact peer-id mention always
+            // means that peer, even when another member's alias or
+            // display name collides with it.
+            let by_id: Vec<&Candidate> = members
+                .iter()
+                .filter(|member| member.peer_id.eq_ignore_ascii_case(&name))
+                .collect();
+            let hit = match by_id.len() {
+                1 => Some(by_id[0]),
+                0 => {
+                    // No id match: the alias/display-name match must be
+                    // unique, so a token matching two members (whether
+                    // through one channel or across both) is refused
+                    // rather than guessed by row order. Members come
+                    // from a PK-unique set, so the candidate list is
+                    // already duplicate-free — its length IS the match
+                    // count.
+                    let by_alias_or_name: Vec<&Candidate> = members
+                        .iter()
+                        .filter(|member| {
+                            member
+                                .alias
+                                .as_deref()
+                                .is_some_and(|alias| alias.eq_ignore_ascii_case(&name))
+                                || member.name.eq_ignore_ascii_case(&name)
+                        })
+                        .collect();
+                    match by_alias_or_name.len() {
+                        0 => None,
+                        1 => Some(by_alias_or_name[0]),
+                        _ => {
+                            return Err(StoreError::AmbiguousPeerRef { reference: name });
+                        }
+                    }
+                }
+                // Two peer ids differing only by case are equally
+                // ambiguous under case-insensitive mention semantics.
+                _ => {
+                    return Err(StoreError::AmbiguousPeerRef { reference: name });
+                }
+            };
             if let Some(member) = hit
                 && !matched.contains(&member.peer_id)
             {
@@ -499,7 +842,7 @@ fn mentioned_names(content: &str) -> Vec<String> {
             continue;
         };
         let boundary = token[..at].chars().last();
-        if boundary.is_some_and(|c| c.is_alphanumeric()) {
+        if boundary.is_some_and(char::is_alphanumeric) {
             continue;
         }
         let rest = &token[at + 1..];
@@ -510,7 +853,7 @@ fn mentioned_names(content: &str) -> Vec<String> {
         if name.is_empty() || names.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
             continue;
         }
-        names.push(name.to_string());
+        names.push(name.to_owned());
     }
     names
 }

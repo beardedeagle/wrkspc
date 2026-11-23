@@ -19,12 +19,12 @@ pub struct FakeCancel {
 }
 
 impl CancelRequester for FakeCancel {
-    fn request_cancel(
-        &self,
-        message_id: &str,
-        recipient_id: &str,
-        _set_by: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<CancelOutcome, String>> + Send + '_>> {
+    fn request_cancel<'a>(
+        &'a self,
+        message_id: &'a str,
+        recipient_id: &'a str,
+        _set_by: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CancelOutcome, String>> + Send + 'a>> {
         self.calls
             .lock()
             .unwrap()
@@ -51,18 +51,25 @@ pub async fn spawn_ui() -> TestUi {
 /// Spawns the UI with hub-mode delivery queueing and the hub-role
 /// operator surface on or off.
 pub async fn spawn_ui_with(queue_remote_deliveries: bool, hub_role: bool) -> TestUi {
-    spawn_ui_full(queue_remote_deliveries, hub_role, false).await
+    spawn_ui_full(queue_remote_deliveries, hub_role, false, false).await
+}
+
+/// Spawns the UI as the hub: hub-connected, remote-delivery queueing
+/// on, hub-role operator surface.
+pub async fn spawn_ui_hub() -> TestUi {
+    spawn_ui_full(true, true, true, false).await
 }
 
 /// Spawns the UI as a TLS-listener surface: the login cookie is
 /// marked Secure.
 pub async fn spawn_ui_secure() -> TestUi {
-    spawn_ui_full(false, false, true).await
+    spawn_ui_full(false, false, false, true).await
 }
 
 async fn spawn_ui_full(
     queue_remote_deliveries: bool,
     hub_role: bool,
+    hub_connected: bool,
     cookie_secure: bool,
 ) -> TestUi {
     let store = Store::open_in_memory("ui-test").await.unwrap();
@@ -78,23 +85,29 @@ async fn spawn_ui_full(
         .create_conversation(&["operator", "agent"])
         .await
         .unwrap();
-
-    let cancel = Arc::new(FakeCancel {
-        calls: Mutex::new(Vec::new()),
-    });
-    let ui = UiServer::new(
-        store.clone(),
-        cancel.clone(),
+    spawn_ui_on(
+        store,
         UiConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             cookie_secure,
             token: Some(TOKEN.to_string()),
             queue_remote_deliveries,
             hub_role,
-            hub_connected: false,
+            hub_connected,
         },
-        None,
-    );
+    )
+    .await
+}
+
+/// Spawns the UI on a caller-provided store and config: the shared boot
+/// wiring for tests whose fixture needs a custom store or role flags
+/// beyond the standard seed. The store is NOT seeded — the caller owns
+/// its peers and conversations.
+pub async fn spawn_ui_on(store: Store, config: UiConfig) -> TestUi {
+    let cancel = Arc::new(FakeCancel {
+        calls: Mutex::new(Vec::new()),
+    });
+    let ui = UiServer::new(store.clone(), cancel.clone(), config, None);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();

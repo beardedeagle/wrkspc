@@ -41,8 +41,6 @@ impl Store {
     /// hub-mirrored deliveries carry a remote sender host and are
     /// never re-sent.
     ///
-    /// # Arguments
-    ///
     /// * `host_id` — this node's own host id (its certificate SAN).
     ///
     /// # Returns
@@ -51,7 +49,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn hub_pending_outbound(&self, host_id: &str) -> Result<Vec<OutboundMessage>> {
         let rows = sqlx::query(
             "SELECT m.id, m.conversation_id, m.sender_id, m.content, m.execution_requested
@@ -95,13 +93,11 @@ impl Store {
     /// Records a message as delivered to the hub. Idempotent: a second
     /// call for the same message is a no-op.
     ///
-    /// # Arguments
-    ///
     /// * `message_id` — the message that was sent to the hub.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn mark_hub_sent(&self, message_id: &str) -> Result<()> {
         sqlx::query("INSERT OR IGNORE INTO hub_outbound (message_id, sent_at) VALUES (?, ?)")
             .bind(message_id)
@@ -120,8 +116,6 @@ impl Store {
     /// recipients are skipped (acceptance already asserted membership,
     /// so this is a defensive no-op).
     ///
-    /// # Arguments
-    ///
     /// * `request` — the committed message and the recipients.
     ///
     /// # Returns
@@ -130,9 +124,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`](StoreError::NotFound) when the
+    /// Returns [`StoreError::NotFound`] when the
     /// sender is not enrolled, and
-    /// [`StoreError::Db`](StoreError::Db) on failure.
+    /// [`StoreError::Db`] on failure.
     pub async fn queue_remote_deliveries(&self, request: RemoteFanoutRequest<'_>) -> Result<usize> {
         let (sender_name, sender_class, sender_host) = self
             .peer_details(request.sender_peer)
@@ -142,28 +136,86 @@ impl Store {
                 id: request.sender_peer.to_string(),
             })?;
         let mut queued = 0;
+        // Batch the per-recipient probes into chunked IN queries
+        // — one canceled-intent probe, one peer lookup, and one task
+        // probe per CHUNK instead of per recipient. The create below
+        // still runs only for genuinely new remote tasks.
+        let mut canceled: std::collections::HashSet<String> = Default::default();
+        let mut details: std::collections::HashMap<String, (String, String, String)> =
+            Default::default();
+        let mut existing_tasks: std::collections::HashSet<String> = Default::default();
+        for chunk in request.recipients.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+
+            let sql = format!(
+                "SELECT recipient_id FROM execution_intents
+                 WHERE message_id = ? AND state = 'canceled'
+                   AND recipient_id IN ({placeholders})",
+            );
+            let mut query =
+                sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(request.message_id);
+            for peer in chunk {
+                query = query.bind(peer);
+            }
+            for peer in query.fetch_all(self.pool()).await? {
+                canceled.insert(peer);
+            }
+
+            let sql =
+                format!("SELECT id, name, class, host_id FROM peers WHERE id IN ({placeholders})",);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for peer in chunk {
+                query = query.bind(peer);
+            }
+            for row in query.fetch_all(self.pool()).await? {
+                details.insert(
+                    row.get("id"),
+                    (row.get("name"), row.get("class"), row.get("host_id")),
+                );
+            }
+
+            let task_ids: Vec<String> = chunk
+                .iter()
+                .map(|peer| crate::tasks::delivery_task_id(request.message_id, peer))
+                .collect();
+            let sql = format!(
+                "SELECT task_id FROM a2a_tasks WHERE task_id IN ({})",
+                vec!["?"; task_ids.len()].join(", "),
+            );
+            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
+            for task_id in &task_ids {
+                query = query.bind(task_id);
+            }
+            for task_id in query.fetch_all(self.pool()).await? {
+                existing_tasks.insert(task_id);
+            }
+        }
         for peer_id in request.recipients {
             // An operator-canceled intent must not be fanned out (the
             // delivery task is the node's execution channel).
-            if self
-                .recipient_intent_canceled(request.message_id, peer_id)
-                .await?
-            {
+            if canceled.contains(peer_id) {
                 continue;
             }
-            let Some((recipient_name, recipient_class, peer_host)) =
-                self.peer_details(peer_id).await?
-            else {
+            let Some((recipient_name, recipient_class, peer_host)) = details.get(peer_id) else {
                 continue;
             };
             if peer_host == request.local_host {
                 continue;
             }
+            // A pre-existing deterministic row means this is a
+            // replay/repair re-queue: INSERT OR IGNORE keeps the
+            // original blob, so it is not a creation and must not
+            // count as one (the documented return is the number of
+            // delivery tasks created).
+            let task_id = crate::tasks::delivery_task_id(request.message_id, peer_id);
+            if existing_tasks.contains(&task_id) {
+                continue;
+            }
             self.task_create_delivery(DeliveryTaskRequest {
-                recipient_host: &peer_host,
+                recipient_host: peer_host,
                 recipient_peer: peer_id,
-                recipient_name: &recipient_name,
-                recipient_class: &recipient_class,
+                recipient_name,
+                recipient_class,
                 message_id: request.message_id,
                 origin_message_id: request.origin_message_id,
                 conversation_id: request.conversation_id,
@@ -190,8 +242,6 @@ impl Store {
     /// never touched, and no duplicate can form because the task id is
     /// a function of (message, recipient).
     ///
-    /// # Arguments
-    ///
     /// * `local_host` — the hub's own host id; recipients on it are
     ///   local and never get a delivery task.
     ///
@@ -201,69 +251,176 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn repair_remote_fanout(&self, local_host: &str) -> Result<usize> {
-        let rows = sqlx::query(
-            "SELECT m.id AS message_id, m.conversation_id, m.sender_id, m.content,
-                    m.execution_requested, r.peer_id,
-                    p.name AS recipient_name, p.class AS recipient_class,
-                    p.host_id AS recipient_host
-             FROM message_recipients r
-             JOIN messages m ON m.id = r.message_id
-             JOIN peers p ON p.id = r.peer_id
-             WHERE p.host_id != ?",
-        )
-        .bind(local_host)
-        .fetch_all(self.pool())
-        .await?;
+        // The scan pages over the (message_id, peer_id) keyset —
+        // the repair cost no longer grows with history in one
+        // unbounded fetch — and each page reuses the batched probes.
+        let page_size: i64 = 400;
+        let mut last_message: String = String::new();
+        let mut last_peer: String = String::new();
         let mut repaired = 0;
-        for row in rows {
-            let message_id: String = row.get("message_id");
-            let recipient_peer: String = row.get("peer_id");
-            // An operator-canceled turn must never be re-created by a
-            // repair pass (H-10): the fan-out is the execution channel,
-            // and a canceled intent means the recipient must not run it.
-            if self
-                .recipient_intent_canceled(&message_id, &recipient_peer)
-                .await?
-            {
-                continue;
-            }
-            let task_id = crate::tasks::delivery_task_id(&message_id, &recipient_peer);
-            if self.task_get(&task_id).await?.is_some() {
-                continue;
-            }
-            let sender_peer: String = row.get("sender_id");
-            let (sender_name, sender_class, sender_host) = self
-                .peer_details(&sender_peer)
-                .await?
-                .ok_or_else(|| StoreError::NotFound {
-                entity: "peer",
-                id: sender_peer.clone(),
-            })?;
-            let recipient_host: String = row.get("recipient_host");
-            let recipient_name: String = row.get("recipient_name");
-            let recipient_class: String = row.get("recipient_class");
-            let conversation_id: String = row.get("conversation_id");
-            let content: String = row.get("content");
-            let execution_requested: bool = row.get("execution_requested");
-            self.task_create_delivery(DeliveryTaskRequest {
-                recipient_host: &recipient_host,
-                recipient_peer: &recipient_peer,
-                recipient_name: &recipient_name,
-                recipient_class: &recipient_class,
-                message_id: &message_id,
-                origin_message_id: None,
-                conversation_id: &conversation_id,
-                sender_peer: &sender_peer,
-                sender_name: &sender_name,
-                sender_class: &sender_class,
-                sender_host: &sender_host,
-                content: &content,
-                execution_requested,
-            })
+        loop {
+            let rows = sqlx::query(
+                "SELECT m.id AS message_id, m.idempotency_key, m.conversation_id,
+                        m.sender_id, m.content, m.execution_requested, r.peer_id,
+                        p.name AS recipient_name, p.class AS recipient_class,
+                        p.host_id AS recipient_host
+                 FROM message_recipients r
+                 JOIN messages m ON m.id = r.message_id
+                 JOIN peers p ON p.id = r.peer_id
+                 WHERE p.host_id != ?
+                   AND (r.message_id, r.peer_id) > (?, ?)
+                 ORDER BY r.message_id, r.peer_id
+                 LIMIT ?",
+            )
+            .bind(local_host)
+            .bind(&last_message)
+            .bind(&last_peer)
+            .bind(page_size)
+            .fetch_all(self.pool())
             .await?;
-            repaired += 1;
+            if rows.is_empty() {
+                break;
+            }
+            let Some(page_last) = rows.last() else {
+                // An empty page can only mean the keyset cursor moved
+                // past the data — end the pass instead of panicking.
+                break;
+            };
+            last_message = page_last.get("message_id");
+            last_peer = page_last.get("peer_id");
+
+            // Batched probes for the page: canceled intents grouped by
+            // message, deterministic task ids, and the distinct
+            // senders' details.
+            let mut canceled: std::collections::HashSet<(String, String)> = Default::default();
+            let mut by_message: std::collections::HashMap<String, Vec<String>> = Default::default();
+            for row in &rows {
+                by_message
+                    .entry(row.get::<String, _>("message_id"))
+                    .or_default()
+                    .push(row.get("peer_id"));
+            }
+            for (message_id, peers) in &by_message {
+                let placeholders = vec!["?"; peers.len()].join(", ");
+                let sql = format!(
+                    "SELECT recipient_id FROM execution_intents
+                     WHERE message_id = ? AND state = 'canceled'
+                       AND recipient_id IN ({placeholders})",
+                );
+                let mut query =
+                    sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(message_id);
+                for peer in peers {
+                    query = query.bind(peer);
+                }
+                for peer in query.fetch_all(self.pool()).await? {
+                    canceled.insert((message_id.clone(), peer));
+                }
+            }
+            let task_ids: Vec<String> = rows
+                .iter()
+                .map(|row| {
+                    crate::tasks::delivery_task_id(
+                        &row.get::<String, _>("message_id"),
+                        &row.get::<String, _>("peer_id"),
+                    )
+                })
+                .collect();
+            let mut existing: std::collections::HashSet<String> = Default::default();
+            let sql = format!(
+                "SELECT task_id FROM a2a_tasks WHERE task_id IN ({})",
+                vec!["?"; task_ids.len()].join(", "),
+            );
+            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
+            for task_id in &task_ids {
+                query = query.bind(task_id);
+            }
+            for task_id in query.fetch_all(self.pool()).await? {
+                existing.insert(task_id);
+            }
+            let senders: Vec<String> = {
+                let mut set: std::collections::HashSet<String> = Default::default();
+                for row in &rows {
+                    set.insert(row.get("sender_id"));
+                }
+                set.into_iter().collect()
+            };
+            let mut sender_details: std::collections::HashMap<String, (String, String, String)> =
+                Default::default();
+            let placeholders = vec!["?"; senders.len()].join(", ");
+            let sql =
+                format!("SELECT id, name, class, host_id FROM peers WHERE id IN ({placeholders})",);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for sender in &senders {
+                query = query.bind(sender);
+            }
+            for row in query.fetch_all(self.pool()).await? {
+                sender_details.insert(
+                    row.get("id"),
+                    (row.get("name"), row.get("class"), row.get("host_id")),
+                );
+            }
+
+            for row in &rows {
+                let message_id: String = row.get("message_id");
+                let recipient_peer: String = row.get("peer_id");
+                // An operator-canceled turn must never be re-created by
+                // a repair pass (H-10): the fan-out is the execution
+                // channel, and a canceled intent means the recipient
+                // must not run it.
+                if canceled.contains(&(message_id.clone(), recipient_peer.clone())) {
+                    continue;
+                }
+                let task_id = crate::tasks::delivery_task_id(&message_id, &recipient_peer);
+                if existing.contains(&task_id) {
+                    continue;
+                }
+                let sender_peer: String = row.get("sender_id");
+                let (sender_name, sender_class, sender_host) = sender_details
+                    .get(&sender_peer)
+                    .cloned()
+                    .ok_or_else(|| StoreError::NotFound {
+                        entity: "peer",
+                        id: sender_peer.clone(),
+                    })?;
+                // The sender wire-message identity survives in
+                // `messages.idempotency_key` for node-originated sends (the
+                // A2A acceptance key IS the node's wire message id). A
+                // repaired envelope must carry it so a co-hosted echo maps
+                // back onto the original local row instead of minting a
+                // second message and execution intent — the normal fan-out
+                // forwards it explicitly and the repair must not degrade
+                // to the hub-derived id. Hub-local senders (the operator
+                // UI) have no node-side origin: their key is a fresh
+                // acceptance id, not a wire identity, and must not ride as
+                // the origin.
+                let origin_message_id =
+                    (sender_host != local_host).then(|| row.get::<String, _>("idempotency_key"));
+                let recipient_host: String = row.get("recipient_host");
+                let recipient_name: String = row.get("recipient_name");
+                let recipient_class: String = row.get("recipient_class");
+                let conversation_id: String = row.get("conversation_id");
+                let content: String = row.get("content");
+                let execution_requested: bool = row.get("execution_requested");
+                self.task_create_delivery(DeliveryTaskRequest {
+                    recipient_host: &recipient_host,
+                    recipient_peer: &recipient_peer,
+                    recipient_name: &recipient_name,
+                    recipient_class: &recipient_class,
+                    message_id: &message_id,
+                    origin_message_id: origin_message_id.as_deref(),
+                    conversation_id: &conversation_id,
+                    sender_peer: &sender_peer,
+                    sender_name: &sender_name,
+                    sender_class: &sender_class,
+                    sender_host: &sender_host,
+                    content: &content,
+                    execution_requested,
+                })
+                .await?;
+                repaired += 1;
+            }
         }
         Ok(repaired)
     }
@@ -272,14 +429,12 @@ impl Store {
     /// (message, recipient) pair. A missing intent (a mail-only
     /// message) means "not canceled" — it still delivers.
     ///
-    /// # Arguments
-    ///
     /// * `message_id` — the message.
     /// * `recipient_peer` — the recipient.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn recipient_intent_canceled(
         &self,
         message_id: &str,
@@ -296,12 +451,22 @@ impl Store {
         Ok(state.as_deref() == Some("canceled"))
     }
 
-    /// Lists terminal attempt outcomes that a hub-originated delivery
-    /// has not yet reported back to the hub (the H-10 outcome leg).
+    /// Lists attempt outcomes — terminal states and unknowns — that a
+    /// hub-originated delivery has not yet reported back to the hub
+    /// (the H-10 outcome leg).
     ///
     /// Only attempts whose (message, recipient) pair has a mirrored
     /// delivery-task row qualify — those are hub-originated deliveries;
     /// node-local messages have no such row and are never reported.
+    ///
+    /// The mirrored task is identified through the durable mapping the
+    /// mirror wrote: when a node processes a delivery it records a
+    /// processed marker — a local `a2a_tasks` row under the HUB task
+    /// id whose payload still carries the hub delivery envelope. The
+    /// hub task id is therefore read from that marker, never
+    /// recomputed from the local message id: mirroring allocates a
+    /// fresh local `messages.id`, so a recomputed id would differ from
+    /// the hub's and every outcome would be silently dropped.
     ///
     /// # Returns
     ///
@@ -309,11 +474,57 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn hub_pending_outcomes(&self) -> Result<Vec<AttemptOutcomeReport>> {
+        // The processed markers: one local row per mirrored delivery,
+        // keyed by the hub task id, with the hub envelope still in the
+        // payload. The envelope names the accept key the mirror used —
+        // the origin when the delivery echoed a node-propagated
+        // message (matching the original local `messages.id`), the hub
+        // message id otherwise (matching the local row's
+        // `idempotency_key`).
+        let marker_rows =
+            sqlx::query("SELECT task_id, task_json FROM a2a_tasks WHERE terminal = 1")
+                .fetch_all(self.pool())
+                .await?;
+        let mut mirrored: std::collections::HashMap<(String, String, String), String> =
+            std::collections::HashMap::new();
+        for row in marker_rows {
+            let task_id: String = row.get("task_id");
+            let task_json: String = row.get("task_json");
+            // A corrupt marker is a wedged outcome queue, not an empty
+            // one: warn with the task id so the operator can tell the
+            // difference (neighboring poll legs already warn).
+            let Some(envelope) = crate::tasks::DeliveryEnvelope::from_task_json(&task_json) else {
+                tracing::warn!(%task_id, "hub_pending_outcomes: marker payload is corrupt or lacks the delivery envelope; outcome queue may wedge");
+                continue;
+            };
+            if envelope.kind != "delivery" {
+                tracing::warn!(%task_id, "hub_pending_outcomes: marker payload is not a delivery envelope");
+                continue;
+            }
+            let (hub_message_id, recipient_peer, conversation_id) = (
+                &envelope.message_id,
+                &envelope.recipient_peer,
+                &envelope.conversation_id,
+            );
+            let accept_key = envelope
+                .origin_message_id
+                .as_deref()
+                .unwrap_or(hub_message_id);
+            mirrored.insert(
+                (
+                    conversation_id.to_string(),
+                    accept_key.to_string(),
+                    recipient_peer.to_string(),
+                ),
+                task_id,
+            );
+        }
         let rows = sqlx::query(
             "SELECT a.id AS attempt_id, a.state,
-                    i.message_id, i.recipient_id, m.conversation_id
+                    i.message_id, i.recipient_id,
+                    m.conversation_id, m.idempotency_key
              FROM attempts a
              JOIN execution_intents i ON i.id = a.intent_id
              JOIN messages m ON m.id = i.message_id
@@ -326,24 +537,37 @@ impl Store {
         let mut reports = Vec::with_capacity(rows.len());
         for row in rows {
             let message_id: String = row.get("message_id");
+            let idempotency_key: String = row.get("idempotency_key");
+            let conversation_id: String = row.get("conversation_id");
             let recipient_peer: String = row.get("recipient_id");
-            let task_id = crate::tasks::delivery_task_id(&message_id, &recipient_peer);
-            let mirrored: Option<i64> =
-                sqlx::query_scalar("SELECT 1 FROM a2a_tasks WHERE task_id = ?")
-                    .bind(&task_id)
-                    .fetch_optional(self.pool())
-                    .await?;
-            if mirrored.is_none() {
+            // An echoed delivery replays the ORIGINAL local row (its
+            // id equals the envelope origin); a hub-originated
+            // delivery mirrors under the hub message id, recorded as
+            // the row's idempotency key.
+            let Some(task_id) = mirrored
+                .get(&(
+                    conversation_id.clone(),
+                    message_id.clone(),
+                    recipient_peer.clone(),
+                ))
+                .or_else(|| {
+                    mirrored.get(&(
+                        conversation_id.clone(),
+                        idempotency_key.clone(),
+                        recipient_peer.clone(),
+                    ))
+                })
+            else {
                 // A local message: no hub delivery task exists to
                 // report against.
                 continue;
-            }
+            };
             reports.push(AttemptOutcomeReport {
                 attempt_id: row.get("attempt_id"),
-                task_id,
+                task_id: task_id.clone(),
                 message_id,
                 recipient_peer,
-                conversation_id: row.get("conversation_id"),
+                conversation_id,
                 state: row.get("state"),
             });
         }
@@ -352,14 +576,12 @@ impl Store {
 
     /// Records an attempt outcome as reported to the hub. Idempotent.
     ///
-    /// # Arguments
-    ///
     /// * `attempt_id` — the attempt whose outcome was reported.
     /// * `task_id` — the delivery task the report addressed.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn mark_outcome_reported(&self, attempt_id: &str, task_id: &str) -> Result<()> {
         sqlx::query(
             "INSERT OR IGNORE INTO hub_outcome_reports (attempt_id, task_id, reported_at)
@@ -377,9 +599,17 @@ impl Store {
     /// a re-report refreshes the reason and timestamp but preserves any
     /// queued operator decision.
     ///
+    /// The mirror is OWNED by the (task, host) tuple the reporting node
+    /// presented: a re-report whose attempt id already exists under a
+    /// DIFFERENT task or host is a conflicting ownership claim and is
+    /// rejected without modifying the stored row — a node can never
+    /// overwrite another host's mirror by reusing its attempt id.
+    ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::AlreadyExists`] when the attempt id
+    /// belongs to another task/host, and [`StoreError::Db`] on
+    /// failure.
     pub async fn record_hub_unknown(
         &self,
         attempt_id: &str,
@@ -390,14 +620,16 @@ impl Store {
         stop_reason: &str,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO hub_unknown_attempts
                (attempt_id, task_id, host_id, recipient_id, conversation_id,
                 stop_reason, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(attempt_id) DO UPDATE SET
                 stop_reason = excluded.stop_reason,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at
+             WHERE hub_unknown_attempts.task_id = excluded.task_id
+               AND hub_unknown_attempts.host_id = excluded.host_id",
         )
         .bind(attempt_id)
         .bind(task_id)
@@ -409,6 +641,14 @@ impl Store {
         .bind(&now)
         .execute(self.pool())
         .await?;
+        if result.rows_affected() == 0 {
+            // The conflict's ownership guard rejected the update: this
+            // attempt id exists under another (task, host) tuple.
+            return Err(StoreError::AlreadyExists {
+                entity: "hub unknown attempt",
+                id: attempt_id.to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -416,28 +656,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn hub_unknowns(&self) -> Result<Vec<HubUnknownView>> {
-        let rows = sqlx::query(
-            "SELECT attempt_id, task_id, host_id, recipient_id, conversation_id,
-                    stop_reason, decision, created_at
-             FROM hub_unknown_attempts
-             ORDER BY created_at ASC",
-        )
-        .fetch_all(self.pool())
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| HubUnknownView {
-                attempt_id: row.get("attempt_id"),
-                task_id: row.get("task_id"),
-                host_id: row.get("host_id"),
-                recipient_id: row.get("recipient_id"),
-                conversation_id: row.get("conversation_id"),
-                stop_reason: row.get("stop_reason"),
-                decision: row.get("decision"),
-            })
-            .collect())
+        self.hub_unknown_rows(None).await
     }
 
     /// Mirrored unknowns carrying an operator decision, for one host's
@@ -445,30 +666,41 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
+    /// Returns [`StoreError::Db`] on failure.
     pub async fn hub_pending_reconciliations(&self, host_id: &str) -> Result<Vec<HubUnknownView>> {
-        let rows = sqlx::query(
+        self.hub_unknown_rows(Some(host_id)).await
+    }
+
+    /// The shared mirror read behind
+    /// [`hub_unknowns`](Store::hub_unknowns) and
+    /// [`hub_pending_reconciliations`](Store::hub_pending_reconciliations):
+    /// every mirrored row, or (with a host filter) the rows that host's
+    /// poll loop applies — both read the same eight columns and map
+    /// through the same row mapper, so the two views can never drift.
+    ///
+    /// * `host` — the owning host filter (`None` lists everything).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`] on failure.
+    async fn hub_unknown_rows(&self, host: Option<&str>) -> Result<Vec<HubUnknownView>> {
+        let mut sql = String::from(
             "SELECT attempt_id, task_id, host_id, recipient_id, conversation_id,
                     stop_reason, decision, created_at
-             FROM hub_unknown_attempts
-             WHERE host_id = ? AND decision IS NOT NULL
-             ORDER BY created_at ASC",
-        )
-        .bind(host_id)
-        .fetch_all(self.pool())
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| HubUnknownView {
-                attempt_id: row.get("attempt_id"),
-                task_id: row.get("task_id"),
-                host_id: row.get("host_id"),
-                recipient_id: row.get("recipient_id"),
-                conversation_id: row.get("conversation_id"),
-                stop_reason: row.get("stop_reason"),
-                decision: row.get("decision"),
-            })
-            .collect())
+             FROM hub_unknown_attempts",
+        );
+        if host.is_some() {
+            sql.push_str(" WHERE host_id = ? AND decision IS NOT NULL");
+        }
+        sql.push_str(" ORDER BY created_at ASC");
+        // Only the WHERE clause's presence varies with the filter; the
+        // fragments are literals and the host id stays bound.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        if let Some(host) = host {
+            query = query.bind(host);
+        }
+        let rows = query.fetch_all(self.pool()).await?;
+        Ok(rows.into_iter().map(hub_unknown_view).collect())
     }
 
     /// Queues the operator's reconciliation decision on a mirrored
@@ -477,14 +709,18 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
-    pub async fn set_hub_unknown_decision(&self, attempt_id: &str, decision: &str) -> Result<bool> {
+    /// Returns [`StoreError::Db`] on failure.
+    pub async fn set_hub_unknown_decision(
+        &self,
+        attempt_id: &str,
+        decision: crate::model::Reconciliation,
+    ) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE hub_unknown_attempts
              SET decision = ?, updated_at = ?
              WHERE attempt_id = ?",
         )
-        .bind(decision)
+        .bind(decision.as_str())
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(attempt_id)
         .execute(self.pool())
@@ -495,15 +731,81 @@ impl Store {
     /// Consumes the mirror row once the node reports the final terminal
     /// state (the reconciliation is complete).
     ///
+    /// Scoped to the (attempt, task, host) tuple the node presented
+    /// with its terminal report: a report can only consume the mirror
+    /// owned by its own authorized task and host, never another
+    /// host's unresolved row that happens to reuse the attempt id.
+    ///
+    /// # Returns
+    ///
+    /// `true` when a matching mirror row was consumed.
+    ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`](StoreError::Db) on failure.
-    pub async fn consume_hub_unknown(&self, attempt_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM hub_unknown_attempts WHERE attempt_id = ?")
-            .bind(attempt_id)
-            .execute(self.pool())
+    /// Returns [`StoreError::Db`] on failure.
+    pub async fn consume_hub_unknown(
+        &self,
+        attempt_id: &str,
+        task_id: &str,
+        host_id: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "DELETE FROM hub_unknown_attempts
+             WHERE attempt_id = ? AND task_id = ? AND host_id = ?",
+        )
+        .bind(attempt_id)
+        .bind(task_id)
+        .bind(host_id)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Marks guidance entries delivered ONLY when they belong to the
+    /// validated conversation — the delivery-report guidance ack
+    /// boundary.
+    ///
+    /// The delivery-report route authorizes one delivery (task,
+    /// conversation); a client-supplied guidance id from another
+    /// conversation must never be acknowledged by it. This scoped
+    /// update ignores foreign ids without modifying them: rows outside
+    /// the conversation keep their pending state and claimed attempt.
+    ///
+    /// * `conversation_id` — the validated conversation of the
+    ///   reported task.
+    /// * `ids` — the client-supplied guidance ids to acknowledge.
+    ///
+    /// # Returns
+    ///
+    /// The number of rows actually marked delivered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Db`] on failure.
+    pub async fn mark_guidance_delivered_scoped(
+        &self,
+        conversation_id: &str,
+        ids: &[&str],
+    ) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool().begin().await?;
+        let mut marked = 0;
+        for id in ids {
+            let result = sqlx::query(
+                "UPDATE guidance
+                 SET delivered = 1, claimed_attempt = NULL
+                 WHERE id = ? AND conversation_id = ?",
+            )
+            .bind(id)
+            .bind(conversation_id)
+            .execute(&mut *tx)
             .await?;
-        Ok(())
+            marked += result.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(marked as usize)
     }
 }
 
@@ -524,7 +826,35 @@ pub struct HubUnknownView {
     /// The dispatcher-recorded reason (redacted at the display boundary).
     pub stop_reason: String,
     /// The queued operator decision, when one exists.
-    pub decision: Option<String>,
+    pub decision: Option<crate::model::Reconciliation>,
+}
+
+/// Maps a `hub_unknown_attempts` row onto its view struct — the single
+/// mapper every mirror read shares.
+fn hub_unknown_view(row: sqlx::sqlite::SqliteRow) -> HubUnknownView {
+    let decision: Option<String> = row.get("decision");
+    // Decode the canonical literal at the row boundary; a value
+    // off the list must surface as None plus a loud log, never as a
+    // guess that reaches the poll queue.
+    let decision = match decision.as_deref() {
+        None => None,
+        Some(literal) => match crate::model::Reconciliation::from_literal(literal) {
+            Some(decision) => Some(decision),
+            None => {
+                tracing::warn!(%literal, "unknown reconciliation literal in hub_unknown_attempts");
+                None
+            }
+        },
+    };
+    HubUnknownView {
+        attempt_id: row.get("attempt_id"),
+        task_id: row.get("task_id"),
+        host_id: row.get("host_id"),
+        recipient_id: row.get("recipient_id"),
+        conversation_id: row.get("conversation_id"),
+        stop_reason: row.get("stop_reason"),
+        decision,
+    }
 }
 
 /// A delivery fan-out request: the committed message plus the
@@ -538,7 +868,7 @@ pub struct RemoteFanoutRequest<'a> {
     /// The committed message id.
     pub message_id: &'a str,
     /// The sender's own wire message id (the origin) — see
-    /// [`DeliveryTaskRequest::origin_message_id`](DeliveryTaskRequest::origin_message_id).
+    /// [`DeliveryTaskRequest::origin_message_id`].
     pub origin_message_id: Option<&'a str>,
     /// The enrolled sender.
     pub sender_peer: &'a str,

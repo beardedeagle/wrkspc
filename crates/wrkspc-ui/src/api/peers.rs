@@ -45,7 +45,8 @@ where
 /// # Errors
 ///
 /// Returns 400 for invalid bodies, unknown statuses, or an attempt to
-/// eject the operator peer; 404 for unknown peers.
+/// eject the operator peer; 404 for unknown peers; 409 when a
+/// hub-connected node tries to write the hub-owned alias.
 pub(crate) async fn patch_peer(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -156,15 +157,21 @@ pub(crate) async fn patch_peer(
                     let mut set: std::collections::HashSet<String> =
                         deny.floor.iter().cloned().collect();
                     set.extend(serials);
-                    // The set is rebuilt in full below, so recovering a
-                    // poisoned guard is safe: any partially-mutated
-                    // content is replaced wholesale.
-                    let mut live = deny
-                        .live
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    live.clear();
-                    live.extend(set);
+                    // Whole-value assignment: the finished set is built
+                    // off-lock above, then swapped in ONE step, so no
+                    // code that could panic runs under the write lock
+                    // and no partially-mutated content can ever exist.
+                    {
+                        let mut live = deny
+                            .live
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *live = set;
+                    }
+                    // Self-healing: the re-sync clears a poisoned flag,
+                    // so deny-all (the fail-closed read) ends with the
+                    // next operator action instead of a restart.
+                    deny.live.clear_poison();
                 }
                 Err(error) => {
                     tracing::warn!(%error, "deny-set re-sync failed; the live set may lag the store");
@@ -176,15 +183,14 @@ pub(crate) async fn patch_peer(
     Ok(Json(json!(entry)))
 }
 
-/// `DELETE /api/peers/{id}` — forget an ejected peer: the cohort entry
+/// `DELETE /api/peers/{id}` — forget a peer: the cohort entry
 /// disappears (roster row deleted) while message history, the audit
 /// trail, and certificate revocations are preserved. Forgotten peers
 /// are refused re-enrolment until explicitly restored.
 ///
 /// # Errors
 ///
-/// Returns 400 for the operator peer or a peer that is not ejected
-/// (booted or banned); 404 for unknown peers.
+/// Returns 400 for the operator peer; 404 for unknown peers.
 pub(crate) async fn forget_peer(
     State(state): State<AppState>,
     Path(id): Path<String>,

@@ -9,11 +9,8 @@ use wrkspc_core::Store;
 /// qualify — hub-mirrored deliveries carry a remote sender host and
 /// are never re-sent.
 ///
-/// # Arguments
-///
-/// * `a2a` — the hub A2A client (this node's mTLS identity).
-/// * `store` — the node's local store.
-/// * `host_id` — this node's host id.
+/// `a2a` is the hub A2A client (this node's mTLS identity); `store` is
+/// the node's local store; `host_id` is this node's host id.
 ///
 /// # Returns
 ///
